@@ -145,12 +145,19 @@ def build_game_market_link(
     if not away_tid and len(market.outcomes) >= 2:
         away_tid = market.outcomes[1].token_id
 
-    # Get pre-game prob from home token's last price in discovery
+    # Get pre-game prob from home token's last price in discovery.
+    # Only use if game hasn't started yet (is_live=False).
+    # If discovered mid-game (e.g. system restart), the market price
+    # is already in-play and would poison the anchor → fallback to 0.5.
     pregame_prob = 0.5
-    for o in market.outcomes:
-        if o.token_id == home_tid:
-            pregame_prob = o.last_price
-            break
+    if not game.is_live:
+        for o in market.outcomes:
+            if o.token_id == home_tid and 0.05 < o.last_price < 0.95:
+                pregame_prob = o.last_price
+                break
+        log.info("pre-game anchor for %s: %.3f", game.home_team, pregame_prob)
+    else:
+        log.info("game %s already live — using neutral anchor 0.5", game.home_team)
 
     return GameMarketLink(
         game_id=game.game_id,

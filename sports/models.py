@@ -45,20 +45,20 @@ def _phi(x: float) -> float:
 
 def _inv_phi(p: float) -> float:
     """Inverse normal CDF approximation (Abramowitz & Stegun)."""
-    # Tail approximation for S0 anchor
     p = max(0.0001, min(0.9999, p))
-    sign = 1.0
+    # Exact zero for 50/50 — avoids spurious anchor bias
+    if abs(p - 0.5) < 0.001:
+        return 0.0
     if p < 0.5:
-        sign = -1.0
         t = math.sqrt(-2.0 * math.log(p))
+        num = 2.515517 + 0.802853*t + 0.010328*t*t
+        den = 1.0 + 1.432788*t + 0.189269*t*t + 0.001308*t*t*t
+        return -(t - (num / den))
     else:
-        sign = 1.0
         t = math.sqrt(-2.0 * math.log(1.0 - p))
-    
-    num = 2.515517 + 0.802853*t + 0.010328*t*t
-    den = 1.0 + 1.432788*t + 0.189269*t*t + 0.001308*t*t*t
-    val = t - (num / den)
-    return sign * val
+        num = 2.515517 + 0.802853*t + 0.010328*t*t
+        den = 1.0 + 1.432788*t + 0.189269*t*t + 0.001308*t*t*t
+        return t - (num / den)
 
 
 def _poisson_pmf(lam: float, k: int) -> float:
@@ -106,10 +106,33 @@ def nba_win_probability(
     
     1. Time scaling: use adjusted seconds to derive minutes.
     2. Strength anchor: convert pre-game prob to point-equivalent (S0).
-    3. Dynamic sigma: regime-based volatility (2.10 late, 1.70 early).
+    3. Dynamic sigma: regime-based volatility.
+       - Last 60s:  σ=2.10 (fouling, 3pt heaves → high variance)
+       - Last 180s: σ=1.95 (intentional fouls begin)
+       - Default:   σ=1.70 (calibrated baseline)
     4. S_eff: (H-A) + S0 * (T/48).
     """
-    t_min = max(adj_seconds / 60.0, 0.01)
+    score_diff = home_score - away_score
+
+    # ── Deterministic: game finished ──────────────────────────────
+    if adj_seconds <= 0:
+        if score_diff > 0:
+            return ModelOutput(1.0, 0.0, method="deterministic",
+                             details=f"Home wins by {score_diff}")
+        elif score_diff < 0:
+            return ModelOutput(0.0, 1.0, method="deterministic",
+                             details=f"Away wins by {-score_diff}")
+        else:
+            return ModelOutput(0.5, 0.5, method="tied_end",
+                             details="Tied at end of regulation, OT likely")
+
+    # ── OT handling ───────────────────────────────────────────────
+    # OT is 5 minutes. If period contains "OT", cap T at 5 min.
+    is_ot = "OT" in str(period).upper()
+    if is_ot:
+        adj_seconds = min(adj_seconds, 300.0)  # cap at 5 min
+
+    t_min = adj_seconds / 60.0
     
     # Dynamic Sigma Regime
     if adj_seconds <= 60:
@@ -120,11 +143,11 @@ def nba_win_probability(
         sigma = 1.70
         
     # Strength Anchor (sigma_base=1.70, T_full=48)
-    s0 = 1.70 * math.sqrt(48) * _inv_phi(pregame_home_prob)
+    s0 = 1.70 * math.sqrt(48.0) * _inv_phi(pregame_home_prob)
     strength_adj = s0 * (t_min / 48.0)
     
     # Effective Score and Z-Score
-    s_eff = (home_score - away_score) + strength_adj
+    s_eff = score_diff + strength_adj
     z = s_eff / (sigma * math.sqrt(t_min))
     
     p_home = max(0.001, min(0.999, _phi(z)))

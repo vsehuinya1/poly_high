@@ -258,6 +258,8 @@ class SignalEngine:
         edges = compute_edge(model, home_mid, away_mid, draw_mid)
         
         # Log snapshot with new fields
+        # edge: log the single largest absolute edge for this tick
+        max_edge = max(edges, key=lambda x: abs(x[3]))[0:4] if edges else ("none", 0, 0, 0)
         self.csv.log_snapshot({
             "timestamp": time.time(),
             "game_id": game_state.game_id,
@@ -269,7 +271,7 @@ class SignalEngine:
             "away_p_model": model.p_away,
             "home_p_mkt": home_mid,
             "away_p_mkt": away_mid,
-            "edge": edges[0][3] if edges else 0, # Assuming the first edge is the most relevant for this general field
+            "edge": max_edge[3],
             "adjusted_seconds": adj_seconds,
             "sigma": model.sigma,
             "strength_adjustment": model.strength_adjustment,
@@ -295,6 +297,8 @@ class SignalEngine:
             if not token_id or market_mid <= 0:
                 continue
 
+            # Signal threshold (ENTRY_EDGE_THRESHOLD=0.05) is looser than
+            # trade filter (0.07) — signals are informational, trades are gated tighter
             if abs(edge) >= ENTRY_EDGE_THRESHOLD:
                 direction = "BUY" if edge > 0 else "SELL"
                 signal = EdgeSignal(
