@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+sports_data/
+logs/
+*.csv
+*.log
+.DS_Store
+venv/
+.venv/
+test_integration.py

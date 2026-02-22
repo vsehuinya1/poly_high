@@ -1,0 +1,4 @@
+websockets>=12.0
+aiohttp>=3.9
+pyarrow>=14.0
+python-dotenv>=1.0

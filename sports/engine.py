@@ -1,0 +1,526 @@
+"""
+Signal engine + paper trading.
+Matches game state to Polymarket book state, detects edges,
+runs paper trades, logs everything to CSV, sends Telegram alerts.
+"""
+import asyncio
+import csv
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+from sports.config import (
+    ENTRY_EDGE_THRESHOLD, EXIT_CONVERGENCE,
+    MAX_POSITION_PER_MARKET, MAX_CONCURRENT_POSITIONS, MAX_DAILY_LOSS,
+    DATA_DIR,
+)
+from sports.feeds import GameState, BookState
+from sports.models import (
+    nba_win_probability, football_win_probability,
+    compute_edge, ModelOutput, EdgeSignal,
+)
+from sports.telegram import TelegramNotifier
+
+log = logging.getLogger("sports.engine")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Game-Market Mapping
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class GameMarketLink:
+    """Links a live game to its Polymarket tokens."""
+    game_id: str
+    sport: str
+    league: str
+    home_team: str
+    away_team: str
+    polymarket_event_id: str
+    polymarket_title: str
+    polymarket_slug: str
+    home_token_id: str = ""
+    away_token_id: str = ""
+    draw_token_id: str = ""
+    all_token_ids: list[str] = field(default_factory=list)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Paper Trading Position
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class PaperPosition:
+    """Simulated position in a Polymarket outcome."""
+    position_id: str
+    game_id: str
+    token_id: str
+    outcome: str
+    direction: str
+    entry_price: float
+    entry_edge: float
+    entry_time: float
+    entry_game_state: str
+    market_title: str = ""
+    size_usd: float = 100.0
+    exit_price: Optional[float] = None
+    exit_time: Optional[float] = None
+    exit_reason: str = ""
+    pnl: float = 0.0
+    is_open: bool = True
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  CSV Data Storage
+# ═══════════════════════════════════════════════════════════════════════
+
+class CSVLogger:
+    """Writes structured data to CSV files with auto-rotation."""
+
+    def __init__(self, data_dir: Path):
+        self.data_dir = data_dir
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._files: dict[str, csv.writer] = {}
+        self._handles: dict[str, object] = {}
+
+    def _get_writer(self, name: str, headers: list[str]) -> csv.writer:
+        if name not in self._files:
+            today = time.strftime("%Y%m%d")
+            path = self.data_dir / f"{name}_{today}.csv"
+            write_header = not path.exists()
+            fh = open(path, "a", newline="", buffering=1)
+            writer = csv.writer(fh)
+            if write_header:
+                writer.writerow(headers)
+            self._files[name] = writer
+            self._handles[name] = fh
+        return self._files[name]
+
+    def log_snapshot(self, row: dict):
+        headers = [
+            "timestamp", "game_id", "sport", "league",
+            "home_team", "away_team", "home_score", "away_score",
+            "elapsed_min", "period", "game_status",
+            "token_id", "outcome", "best_bid", "best_ask", "mid", "spread",
+            "last_trade_price",
+            "model_p_home", "model_p_away", "model_p_draw",
+            "edge_home", "edge_away", "edge_draw",
+            "model_method", "model_confidence",
+        ]
+        w = self._get_writer("snapshots", headers)
+        w.writerow([row.get(h, "") for h in headers])
+
+    def log_edge_signal(self, signal: EdgeSignal):
+        headers = [
+            "timestamp", "game_id", "sport", "market_title",
+            "token_id", "outcome", "model_prob", "market_prob",
+            "edge", "confidence", "direction", "game_state",
+        ]
+        w = self._get_writer("signals", headers)
+        w.writerow([
+            signal.timestamp, signal.game_id, signal.sport,
+            signal.market_title, signal.token_id, signal.outcome,
+            f"{signal.model_prob:.4f}", f"{signal.market_prob:.4f}",
+            f"{signal.edge:.4f}", f"{signal.confidence:.4f}",
+            signal.direction, signal.game_state,
+        ])
+
+    def log_trade(self, pos: PaperPosition, event: str):
+        headers = [
+            "timestamp", "event", "position_id", "game_id",
+            "token_id", "outcome", "direction",
+            "entry_price", "exit_price", "entry_edge",
+            "size_usd", "pnl", "exit_reason", "game_state",
+        ]
+        w = self._get_writer("paper_trades", headers)
+        w.writerow([
+            time.time(), event, pos.position_id, pos.game_id,
+            pos.token_id, pos.outcome, pos.direction,
+            f"{pos.entry_price:.4f}",
+            f"{pos.exit_price:.4f}" if pos.exit_price else "",
+            f"{pos.entry_edge:.4f}",
+            f"{pos.size_usd:.2f}",
+            f"{pos.pnl:.2f}" if pos.pnl else "",
+            pos.exit_reason, pos.entry_game_state,
+        ])
+
+    def log_book_update(self, token_id: str, book: BookState):
+        headers = [
+            "timestamp", "token_id", "best_bid", "best_ask",
+            "mid", "spread", "bid_size", "ask_size",
+            "last_trade_price", "last_trade_size",
+        ]
+        w = self._get_writer("book_updates", headers)
+        w.writerow([
+            book.timestamp, token_id,
+            f"{book.best_bid:.4f}", f"{book.best_ask:.4f}",
+            f"{book.mid:.4f}", f"{book.spread:.4f}",
+            f"{book.bid_size:.2f}", f"{book.ask_size:.2f}",
+            f"{book.last_trade_price:.4f}", f"{book.last_trade_size:.2f}",
+        ])
+
+    def close(self):
+        for fh in self._handles.values():
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Signal Engine
+# ═══════════════════════════════════════════════════════════════════════
+
+class SignalEngine:
+    """
+    Core engine: matches game states to market states,
+    computes fair value, detects edges, runs paper trades.
+    """
+
+    def __init__(self, data_dir: Path = DATA_DIR):
+        self.csv = CSVLogger(data_dir)
+        self.tg = TelegramNotifier()
+        self.links: dict[str, GameMarketLink] = {}
+        self.positions: dict[str, PaperPosition] = {}
+        self.daily_pnl: float = 0.0
+        self._position_counter = 0
+        self._killed = False
+        self._signal_count = 0
+        self._finished_games: set[str] = set()
+
+    def register_link(self, link: GameMarketLink):
+        self.links[link.polymarket_event_id] = link
+        log.info("registered link: %s ↔ %s (game_id=%s)",
+                 link.polymarket_title, link.home_team, link.game_id)
+
+    async def process_tick(
+        self,
+        game_state: Optional[GameState],
+        books: dict[str, BookState],
+        link: GameMarketLink,
+    ) -> list[EdgeSignal]:
+        if self._killed:
+            return []
+
+        if game_state is None:
+            return []
+
+        # Handle game-end notifications
+        if game_state.game_id not in self._finished_games:
+            if game_state.status == "finished" or (
+                game_state.sport == "nba" and game_state.elapsed_minutes >= 48
+                and game_state.status not in ("scheduled", "live", "Q1", "Q2", "Q3", "Q4")
+            ):
+                self._finished_games.add(game_state.game_id)
+                await self._handle_game_end(game_state, link)
+                return []
+
+        if not game_state.is_live:
+            return []
+
+        now = time.time()
+
+        # ── Compute model fair value ──────────────────────────────
+        if game_state.sport == "nba":
+            model = nba_win_probability(
+                game_state.home_score, game_state.away_score,
+                game_state.minutes_remaining, game_state.period,
+            )
+        elif game_state.sport == "football":
+            model = football_win_probability(
+                game_state.home_score, game_state.away_score,
+                game_state.minutes_remaining,
+                game_state.home_red_cards, game_state.away_red_cards,
+            )
+        else:
+            return []
+
+        # ── Get market prices ─────────────────────────────────────
+        home_book = books.get(link.home_token_id)
+        away_book = books.get(link.away_token_id)
+        draw_book = books.get(link.draw_token_id) if link.draw_token_id else None
+
+        home_mid = home_book.mid if home_book and home_book.mid > 0 else 0
+        away_mid = away_book.mid if away_book and away_book.mid > 0 else 0
+        draw_mid = draw_book.mid if draw_book and draw_book.mid > 0 else 0
+
+        if home_mid == 0 and away_mid == 0:
+            return []
+
+        # ── Compute edges ─────────────────────────────────────────
+        e_home = model.p_home - home_mid if home_mid > 0 else 0
+        e_away = model.p_away - away_mid if away_mid > 0 else 0
+        e_draw = model.p_draw - draw_mid if draw_mid > 0 else 0
+
+        # ── Log snapshot ──────────────────────────────────────────
+        self.csv.log_snapshot({
+            "timestamp": now,
+            "game_id": game_state.game_id,
+            "sport": game_state.sport,
+            "league": game_state.league,
+            "home_team": game_state.home_team,
+            "away_team": game_state.away_team,
+            "home_score": game_state.home_score,
+            "away_score": game_state.away_score,
+            "elapsed_min": f"{game_state.elapsed_minutes:.1f}",
+            "period": game_state.period,
+            "game_status": game_state.status,
+            "token_id": link.home_token_id,
+            "outcome": "home",
+            "best_bid": f"{home_book.best_bid:.4f}" if home_book else "",
+            "best_ask": f"{home_book.best_ask:.4f}" if home_book else "",
+            "mid": f"{home_mid:.4f}",
+            "spread": f"{home_book.spread:.4f}" if home_book else "",
+            "last_trade_price": f"{home_book.last_trade_price:.4f}" if home_book else "",
+            "model_p_home": f"{model.p_home:.4f}",
+            "model_p_away": f"{model.p_away:.4f}",
+            "model_p_draw": f"{model.p_draw:.4f}",
+            "edge_home": f"{e_home:.4f}",
+            "edge_away": f"{e_away:.4f}",
+            "edge_draw": f"{e_draw:.4f}",
+            "model_method": model.method,
+            "model_confidence": f"{model.confidence:.4f}",
+        })
+
+        # ── Detect edge signals ───────────────────────────────────
+        signals = []
+        game_state_str = (
+            f"{game_state.home_team} {game_state.home_score}-"
+            f"{game_state.away_score} {game_state.away_team} "
+            f"({game_state.elapsed_minutes:.0f}')"
+        )
+
+        for outcome, token_id, model_p, market_mid in [
+            ("home", link.home_token_id, model.p_home, home_mid),
+            ("away", link.away_token_id, model.p_away, away_mid),
+            ("draw", link.draw_token_id, model.p_draw, draw_mid),
+        ]:
+            if not token_id or market_mid <= 0:
+                continue
+
+            edge = model_p - market_mid
+            if abs(edge) >= ENTRY_EDGE_THRESHOLD:
+                direction = "BUY" if edge > 0 else "SELL"
+                signal = EdgeSignal(
+                    timestamp=now,
+                    game_id=game_state.game_id,
+                    sport=game_state.sport,
+                    market_title=link.polymarket_title,
+                    token_id=token_id,
+                    outcome=outcome,
+                    model_prob=model_p,
+                    market_prob=market_mid,
+                    edge=edge,
+                    confidence=model.confidence,
+                    game_state=game_state_str,
+                    direction=direction,
+                )
+                signals.append(signal)
+                self.csv.log_edge_signal(signal)
+                self._signal_count += 1
+                log.info("EDGE: %s %s %.3f (model=%.3f mkt=%.3f) %s",
+                         direction, outcome, edge, model_p, market_mid,
+                         game_state_str)
+
+                # Telegram alert for edge signals
+                await self.tg.notify_edge_signal(
+                    direction, outcome, edge, model_p, market_mid,
+                    game_state_str, link.polymarket_title,
+                )
+
+        # ── Paper trading logic ───────────────────────────────────
+        for sig in signals:
+            await self._evaluate_paper_trade(sig, books, link)
+
+        # ── Check existing positions for exit ─────────────────────
+        await self._check_exits(model, books, link, game_state)
+
+        return signals
+
+    async def _evaluate_paper_trade(self, signal: EdgeSignal,
+                                     books: dict[str, BookState],
+                                     link: GameMarketLink):
+        if self.daily_pnl <= -MAX_DAILY_LOSS:
+            if not self._killed:
+                log.warning("KILL SWITCH: daily PnL %.2f ≤ -%.0f",
+                           self.daily_pnl, MAX_DAILY_LOSS)
+                self._killed = True
+            return
+
+        open_count = sum(1 for p in self.positions.values() if p.is_open)
+        if open_count >= MAX_CONCURRENT_POSITIONS:
+            return
+
+        for p in self.positions.values():
+            if p.is_open and p.token_id == signal.token_id:
+                return
+
+        book = books.get(signal.token_id)
+        if not book:
+            return
+
+        if signal.direction == "BUY":
+            entry_price = book.best_ask if book.best_ask > 0 else signal.market_prob
+        else:
+            entry_price = book.best_bid if book.best_bid > 0 else signal.market_prob
+
+        size = min(MAX_POSITION_PER_MARKET, abs(signal.edge) * 2000)
+        size = max(50.0, size)
+
+        self._position_counter += 1
+        pos = PaperPosition(
+            position_id=f"P{self._position_counter:04d}",
+            game_id=signal.game_id,
+            token_id=signal.token_id,
+            outcome=signal.outcome,
+            direction=signal.direction,
+            entry_price=entry_price,
+            entry_edge=signal.edge,
+            entry_time=signal.timestamp,
+            entry_game_state=signal.game_state,
+            market_title=link.polymarket_title,
+            size_usd=size,
+        )
+
+        self.positions[pos.position_id] = pos
+        self.csv.log_trade(pos, "ENTRY")
+
+        log.info("PAPER ENTRY: %s %s %s @ %.3f ($%.0f) edge=%.3f | %s",
+                 pos.position_id, pos.direction, pos.outcome,
+                 entry_price, size, signal.edge, signal.game_state)
+
+        await self.tg.notify_paper_entry(
+            pos.position_id, pos.direction, pos.outcome,
+            entry_price, size, signal.edge, signal.game_state,
+        )
+
+    async def _check_exits(self, model: ModelOutput, books: dict[str, BookState],
+                           link: GameMarketLink, game_state: GameState):
+        for pos in list(self.positions.values()):
+            if not pos.is_open or pos.game_id != game_state.game_id:
+                continue
+
+            book = books.get(pos.token_id)
+            if not book:
+                continue
+
+            current_mid = book.mid if book.mid > 0 else book.last_trade_price
+            if pos.outcome == "home":
+                model_p = model.p_home
+            elif pos.outcome == "away":
+                model_p = model.p_away
+            else:
+                model_p = model.p_draw
+
+            current_edge = model_p - current_mid
+            if pos.direction == "SELL":
+                current_edge = -current_edge
+
+            exit_reason = ""
+
+            if abs(current_edge) < EXIT_CONVERGENCE:
+                exit_reason = "convergence"
+            if pos.direction == "BUY" and current_edge < -ENTRY_EDGE_THRESHOLD:
+                exit_reason = "edge_flip"
+            elif pos.direction == "SELL" and current_edge > ENTRY_EDGE_THRESHOLD:
+                exit_reason = "edge_flip"
+            if not game_state.is_live:
+                exit_reason = "game_end"
+            if time.time() - pos.entry_time > 900:
+                exit_reason = "timeout"
+
+            if exit_reason:
+                if pos.direction == "BUY":
+                    exit_price = book.best_bid if book.best_bid > 0 else current_mid
+                else:
+                    exit_price = book.best_ask if book.best_ask > 0 else current_mid
+
+                if game_state.status == "finished":
+                    if pos.outcome == "home":
+                        exit_price = 1.0 if game_state.home_score > game_state.away_score else 0.0
+                    elif pos.outcome == "away":
+                        exit_price = 1.0 if game_state.away_score > game_state.home_score else 0.0
+                    elif pos.outcome == "draw":
+                        exit_price = 1.0 if game_state.home_score == game_state.away_score else 0.0
+
+                if pos.direction == "BUY":
+                    pnl = (exit_price - pos.entry_price) * pos.size_usd
+                else:
+                    pnl = (pos.entry_price - exit_price) * pos.size_usd
+
+                pos.exit_price = exit_price
+                pos.exit_time = time.time()
+                pos.exit_reason = exit_reason
+                pos.pnl = pnl
+                pos.is_open = False
+                self.daily_pnl += pnl
+                self.csv.log_trade(pos, "EXIT")
+
+                log.info("PAPER EXIT: %s %s @ %.3f → %.3f PnL=$%.2f (%s) | daily=$%.2f",
+                         pos.position_id, pos.outcome,
+                         pos.entry_price, exit_price, pnl,
+                         exit_reason, self.daily_pnl)
+
+                await self.tg.notify_paper_exit(
+                    pos.position_id, pos.outcome,
+                    pos.entry_price, exit_price, pnl,
+                    exit_reason, self.daily_pnl,
+                )
+
+    async def _handle_game_end(self, game_state: GameState, link: GameMarketLink):
+        """Handle game completion — close positions, send summary."""
+        # Count trades and PnL for this game
+        game_trades = [p for p in self.positions.values()
+                       if p.game_id == game_state.game_id and not p.is_open]
+        game_pnl = sum(p.pnl for p in game_trades)
+        game_signals = self._signal_count  # approximate
+
+        log.info("GAME OVER: %s %d-%d %s | trades=%d pnl=$%.2f",
+                 game_state.home_team, game_state.home_score,
+                 game_state.away_score, game_state.away_team,
+                 len(game_trades), game_pnl)
+
+        await self.tg.notify_game_summary(
+            game_state.home_team, game_state.away_team,
+            game_state.home_score, game_state.away_score,
+            game_state.league, len(game_trades),
+            game_pnl, game_signals,
+        )
+
+    def get_summary(self) -> dict:
+        closed = [p for p in self.positions.values() if not p.is_open]
+        open_pos = [p for p in self.positions.values() if p.is_open]
+
+        if not closed:
+            return {
+                "total_trades": 0,
+                "open_positions": len(open_pos),
+                "daily_pnl": 0.0,
+            }
+
+        wins = [p for p in closed if p.pnl > 0]
+        losses = [p for p in closed if p.pnl <= 0]
+
+        return {
+            "total_trades": len(closed),
+            "open_positions": len(open_pos),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": len(wins) / len(closed) if closed else 0,
+            "total_pnl": sum(p.pnl for p in closed),
+            "avg_pnl": sum(p.pnl for p in closed) / len(closed),
+            "avg_edge_at_entry": sum(abs(p.entry_edge) for p in closed) / len(closed),
+            "best_trade": max(p.pnl for p in closed),
+            "worst_trade": min(p.pnl for p in closed),
+            "daily_pnl": self.daily_pnl,
+        }
+
+    async def close(self):
+        # Send session summary via Telegram
+        summary = self.get_summary()
+        await self.tg.notify_session_summary(summary)
+        await self.tg.close()
+        self.csv.close()
