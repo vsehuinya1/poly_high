@@ -145,6 +145,13 @@ def build_game_market_link(
     if not away_tid and len(market.outcomes) >= 2:
         away_tid = market.outcomes[1].token_id
 
+    # Get pre-game prob from home token's last price in discovery
+    pregame_prob = 0.5
+    for o in market.outcomes:
+        if o.token_id == home_tid:
+            pregame_prob = o.last_price
+            break
+
     return GameMarketLink(
         game_id=game.game_id,
         sport=game.sport,
@@ -158,6 +165,7 @@ def build_game_market_link(
         away_token_id=away_tid,
         draw_token_id=draw_tid,
         all_token_ids=all_tids,
+        pregame_home_prob=pregame_prob,
     )
 
 

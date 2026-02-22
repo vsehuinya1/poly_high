@@ -43,6 +43,24 @@ def _phi(x: float) -> float:
     return 0.5 + sign * (cdf - 0.5)
 
 
+def _inv_phi(p: float) -> float:
+    """Inverse normal CDF approximation (Abramowitz & Stegun)."""
+    # Tail approximation for S0 anchor
+    p = max(0.0001, min(0.9999, p))
+    sign = 1.0
+    if p < 0.5:
+        sign = -1.0
+        t = math.sqrt(-2.0 * math.log(p))
+    else:
+        sign = 1.0
+        t = math.sqrt(-2.0 * math.log(1.0 - p))
+    
+    num = 2.515517 + 0.802853*t + 0.010328*t*t
+    den = 1.0 + 1.432788*t + 0.189269*t*t + 0.001308*t*t*t
+    val = t - (num / den)
+    return sign * val
+
+
 def _poisson_pmf(lam: float, k: int) -> float:
     """Poisson probability mass function."""
     key = (round(lam, 6), k)
@@ -62,75 +80,68 @@ def _poisson_pmf(lam: float, k: int) -> float:
 
 @dataclass
 class ModelOutput:
-    """Fair value from the model."""
-    p_home: float           # probability home wins
-    p_away: float           # probability away wins
-    p_draw: float = 0.0     # football only
-    confidence: float = 1.0 # model confidence (0-1)
-    method: str = ""        # which model was used
-    details: str = ""       # human-readable explanation
+    """Fair value and intermediate metrics for logging."""
+    p_home: float
+    p_away: float
+    p_draw: float = 0.0
+    confidence: float = 1.0
+    method: str = ""
+    details: str = ""
+    # Intermediate metrics for snapshots.csv
+    sigma: float = 0.0
+    strength_adjustment: float = 0.0
+    s_eff: float = 0.0
+    z: float = 0.0
 
 
 def nba_win_probability(
     home_score: int,
     away_score: int,
-    minutes_remaining: float,
+    adj_seconds: float,
     period: str = "",
+    pregame_home_prob: float = 0.5,
 ) -> ModelOutput:
     """
-    NBA in-play win probability using point-spread normal approximation.
-
-    P(home_win) = Φ(S / (σ * √T))
-
-    where S = home_score - away_score, T = minutes remaining, σ ≈ 0.4536
-
-    Special cases:
-    - Game over (T=0): deterministic
-    - Overtime: use OT-specific sigma
-    - Very early (T≈48): revert toward 50/50 with slight home advantage
+    NBA win probability with pre-game anchoring and dynamic sigma.
+    
+    1. Time scaling: use adjusted seconds to derive minutes.
+    2. Strength anchor: convert pre-game prob to point-equivalent (S0).
+    3. Dynamic sigma: regime-based volatility (2.10 late, 1.70 early).
+    4. S_eff: (H-A) + S0 * (T/48).
     """
-    score_diff = home_score - away_score
-    t = max(minutes_remaining, 0.01)
-
-    # Game finished
-    if minutes_remaining <= 0:
-        if score_diff > 0:
-            return ModelOutput(1.0, 0.0, method="deterministic",
-                             details=f"Home wins by {score_diff}")
-        elif score_diff < 0:
-            return ModelOutput(0.0, 1.0, method="deterministic",
-                             details=f"Away wins by {-score_diff}")
-        else:
-            return ModelOutput(0.5, 0.5, method="tied_end",
-                             details="Tied at end of regulation, OT likely")
-
-    # Overtime adjustment: OT is 5 min, higher variance
-    sigma = NBA_SIGMA
-    if "OT" in str(period).upper():
-        sigma = 0.55  # OT has higher variance per minute
-
-    # Core formula
-    z = score_diff / (sigma * math.sqrt(t))
-    p_home = _phi(z)
-
-    # Home court advantage adjustment (fades as time decreases)
-    # ~3.5 point home advantage spread over full game
-    if t > 2.0:  # don't adjust in final 2 minutes
-        home_boost = 0.02 * (t / NBA_TOTAL_MINUTES)  # max ~2% at start
-        p_home = p_home + home_boost * (1.0 - p_home)  # scale to avoid exceeding 1
-
-    p_home = max(0.001, min(0.999, p_home))
+    t_min = max(adj_seconds / 60.0, 0.01)
+    
+    # Dynamic Sigma Regime
+    if adj_seconds <= 60:
+        sigma = 2.10
+    elif adj_seconds <= 180:
+        sigma = 1.95
+    else:
+        sigma = 1.70
+        
+    # Strength Anchor (sigma_base=1.70, T_full=48)
+    s0 = 1.70 * math.sqrt(48) * _inv_phi(pregame_home_prob)
+    strength_adj = s0 * (t_min / 48.0)
+    
+    # Effective Score and Z-Score
+    s_eff = (home_score - away_score) + strength_adj
+    z = s_eff / (sigma * math.sqrt(t_min))
+    
+    p_home = max(0.001, min(0.999, _phi(z)))
     p_away = 1.0 - p_home
-
-    # Confidence: higher when more game has been played
-    pct_complete = 1.0 - (t / NBA_TOTAL_MINUTES)
-    confidence = 0.5 + 0.5 * pct_complete  # 50% at start, 100% at end
-
-    details = (f"S={score_diff:+d}, T={t:.1f}min, z={z:.3f}, "
-               f"P(home)={p_home:.4f}")
-
-    return ModelOutput(p_home, p_away, confidence=confidence,
-                      method="nba_normal_approx", details=details)
+    
+    details = f"S_eff={s_eff:.2f}, adj={strength_adj:.2f}, σ={sigma:.2f}, z={z:.3f}"
+    
+    return ModelOutput(
+        p_home=p_home, p_away=p_away, 
+        confidence=1.0 - (t_min/48.0)*0.5,
+        method="nba_anchor_diffusion",
+        details=details,
+        sigma=sigma,
+        strength_adjustment=strength_adj,
+        s_eff=s_eff,
+        z=z
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -46,6 +46,7 @@ class GameMarketLink:
     away_token_id: str = ""
     draw_token_id: str = ""
     all_token_ids: list[str] = field(default_factory=list)
+    pregame_home_prob: float = 0.5
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -101,17 +102,13 @@ class CSVLogger:
 
     def log_snapshot(self, row: dict):
         headers = [
-            "timestamp", "game_id", "sport", "league",
-            "home_team", "away_team", "home_score", "away_score",
-            "elapsed_min", "period", "game_status",
-            "token_id", "outcome", "best_bid", "best_ask", "mid", "spread",
-            "last_trade_price",
-            "model_p_home", "model_p_away", "model_p_draw",
-            "edge_home", "edge_away", "edge_draw",
-            "model_method", "model_confidence",
+            "timestamp", "game_id", "home_score", "away_score", "period", "elapsed",
+            "home_p_model", "away_p_model", "home_p_mkt", "away_p_mkt", "edge",
+            # New columns
+            "adjusted_seconds", "sigma", "strength_adjustment", "s_eff", "z", "pregame_probability"
         ]
-        w = self._get_writer("snapshots", headers)
-        w.writerow([row.get(h, "") for h in headers])
+        writer = self._get_writer("snapshots", headers)
+        writer.writerow([row.get(h, "") for h in headers])
 
     def log_edge_signal(self, signal: EdgeSignal):
         headers = [
@@ -190,6 +187,7 @@ class SignalEngine:
         self._killed = False
         self._signal_count = 0
         self._finished_games: set[str] = set()
+        self._last_states: dict[str, GameState] = {} # Added to store last game state
 
     def register_link(self, link: GameMarketLink):
         self.links[link.polymarket_event_id] = link
@@ -208,6 +206,8 @@ class SignalEngine:
         if game_state is None:
             return []
 
+        self._last_states[game_state.game_id] = game_state # Store last game state
+
         # Handle game-end notifications
         if game_state.game_id not in self._finished_games:
             if game_state.status == "finished" or (
@@ -225,18 +225,22 @@ class SignalEngine:
 
         # ── Compute model fair value ──────────────────────────────
         if game_state.sport == "nba":
+            # Local clock decay between polls
+            elapsed = time.time() - game_state.timestamp
+            seconds_remaining = (game_state.total_minutes - game_state.elapsed_minutes) * 60.0
+            adj_seconds = max(0, seconds_remaining - elapsed)
+            
             model = nba_win_probability(
                 game_state.home_score, game_state.away_score,
-                game_state.minutes_remaining, game_state.period,
+                adj_seconds, game_state.period, link.pregame_home_prob
             )
-        elif game_state.sport == "football":
+        else:
             model = football_win_probability(
                 game_state.home_score, game_state.away_score,
                 game_state.minutes_remaining,
-                game_state.home_red_cards, game_state.away_red_cards,
+                game_state.home_red_cards, game_state.away_red_cards
             )
-        else:
-            return []
+            adj_seconds = game_state.minutes_remaining * 60.0
 
         # ── Get market prices ─────────────────────────────────────
         home_book = books.get(link.home_token_id)
@@ -251,38 +255,27 @@ class SignalEngine:
             return []
 
         # ── Compute edges ─────────────────────────────────────────
-        e_home = model.p_home - home_mid if home_mid > 0 else 0
-        e_away = model.p_away - away_mid if away_mid > 0 else 0
-        e_draw = model.p_draw - draw_mid if draw_mid > 0 else 0
-
-        # ── Log snapshot ──────────────────────────────────────────
+        edges = compute_edge(model, home_mid, away_mid, draw_mid)
+        
+        # Log snapshot with new fields
         self.csv.log_snapshot({
-            "timestamp": now,
+            "timestamp": time.time(),
             "game_id": game_state.game_id,
-            "sport": game_state.sport,
-            "league": game_state.league,
-            "home_team": game_state.home_team,
-            "away_team": game_state.away_team,
             "home_score": game_state.home_score,
             "away_score": game_state.away_score,
-            "elapsed_min": f"{game_state.elapsed_minutes:.1f}",
             "period": game_state.period,
-            "game_status": game_state.status,
-            "token_id": link.home_token_id,
-            "outcome": "home",
-            "best_bid": f"{home_book.best_bid:.4f}" if home_book else "",
-            "best_ask": f"{home_book.best_ask:.4f}" if home_book else "",
-            "mid": f"{home_mid:.4f}",
-            "spread": f"{home_book.spread:.4f}" if home_book else "",
-            "last_trade_price": f"{home_book.last_trade_price:.4f}" if home_book else "",
-            "model_p_home": f"{model.p_home:.4f}",
-            "model_p_away": f"{model.p_away:.4f}",
-            "model_p_draw": f"{model.p_draw:.4f}",
-            "edge_home": f"{e_home:.4f}",
-            "edge_away": f"{e_away:.4f}",
-            "edge_draw": f"{e_draw:.4f}",
-            "model_method": model.method,
-            "model_confidence": f"{model.confidence:.4f}",
+            "elapsed": game_state.elapsed_minutes,
+            "home_p_model": model.p_home,
+            "away_p_model": model.p_away,
+            "home_p_mkt": home_mid,
+            "away_p_mkt": away_mid,
+            "edge": edges[0][3] if edges else 0, # Assuming the first edge is the most relevant for this general field
+            "adjusted_seconds": adj_seconds,
+            "sigma": model.sigma,
+            "strength_adjustment": model.strength_adjustment,
+            "s_eff": model.s_eff,
+            "z": model.z,
+            "pregame_probability": link.pregame_home_prob
         })
 
         # ── Detect edge signals ───────────────────────────────────
@@ -293,15 +286,15 @@ class SignalEngine:
             f"({game_state.elapsed_minutes:.0f}')"
         )
 
-        for outcome, token_id, model_p, market_mid in [
-            ("home", link.home_token_id, model.p_home, home_mid),
-            ("away", link.away_token_id, model.p_away, away_mid),
-            ("draw", link.draw_token_id, model.p_draw, draw_mid),
-        ]:
+        for outcome, model_p, market_mid, edge in edges:
+            token_id = ""
+            if outcome == "home": token_id = link.home_token_id
+            elif outcome == "away": token_id = link.away_token_id
+            elif outcome == "draw": token_id = link.draw_token_id
+
             if not token_id or market_mid <= 0:
                 continue
 
-            edge = model_p - market_mid
             if abs(edge) >= ENTRY_EDGE_THRESHOLD:
                 direction = "BUY" if edge > 0 else "SELL"
                 signal = EdgeSignal(
@@ -367,13 +360,29 @@ class SignalEngine:
         if not book:
             return
 
+        # ── Trade Filter ──────────────────────────────────────────
+        # 1. Last 10 minutes (600s)
+        # 2. Score diff <= 15
+        # 3. Abs(edge) >= 0.07
+        game_state = self._last_states.get(link.game_id)
+        if not game_state: return
+        
+        elapsed = time.time() - game_state.timestamp
+        adj_sec = max(0, (game_state.total_minutes - game_state.elapsed_minutes) * 60.0 - elapsed)
+        
+        if adj_sec > 600: return
+        if abs(game_state.home_score - game_state.away_score) > 15: return
+        if abs(signal.edge) < 0.07: return
+
         if signal.direction == "BUY":
             entry_price = book.best_ask if book.best_ask > 0 else signal.market_prob
         else:
             entry_price = book.best_bid if book.best_bid > 0 else signal.market_prob
 
-        size = min(MAX_POSITION_PER_MARKET, abs(signal.edge) * 2000)
-        size = max(50.0, size)
+        # ── Size Calculation ──────────────────────────────────────
+        # size = abs(edge) * 1000, clamped [50, 300]
+        size = abs(signal.edge) * 1000
+        size = max(50.0, min(300.0, size))
 
         self._position_counter += 1
         pos = PaperPosition(
