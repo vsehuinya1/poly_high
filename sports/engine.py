@@ -331,6 +331,11 @@ class SignalEngine:
                     game_state_str, link.polymarket_title,
                 )
 
+        # ── Deduplicate signals (only best edge per game) ────────
+        if signals:
+            signals.sort(key=lambda x: abs(x.edge), reverse=True)
+            signals = [signals[0]]
+
         # ── Paper trading logic ───────────────────────────────────
         for sig in signals:
             await self._evaluate_paper_trade(sig, books, link)
@@ -421,15 +426,15 @@ class SignalEngine:
 
             exit_reason = ""
 
+            # Check for convergence or edge flip
             if abs(current_edge) < EXIT_CONVERGENCE:
                 exit_reason = "convergence"
-            if pos.direction == "BUY" and current_edge < -ENTRY_EDGE_THRESHOLD:
+            elif current_edge < -ENTRY_EDGE_THRESHOLD:
                 exit_reason = "edge_flip"
-            elif pos.direction == "SELL" and current_edge > ENTRY_EDGE_THRESHOLD:
-                exit_reason = "edge_flip"
+            
             if not game_state.is_live:
                 exit_reason = "game_end"
-            if time.time() - pos.entry_time > 900:
+            if time.time() - pos.entry_time > 1800: # 30 min timeout
                 exit_reason = "timeout"
 
             if exit_reason:

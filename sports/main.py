@@ -70,7 +70,7 @@ def fuzzy_match_score(a: str, b: str) -> float:
 def match_game_to_market(
     game: GameState,
     markets: list[SportMarket],
-    threshold: float = 0.5,
+    threshold: float = 0.85,
 ) -> SportMarket | None:
     """Find the best matching Polymarket market for a live game."""
     best_match = None
@@ -80,23 +80,16 @@ def match_game_to_market(
         if m.sport != game.sport:
             continue
 
-        # Score based on team name similarity
-        h_score = max(
-            fuzzy_match_score(game.home_team, m.home_team),
-            fuzzy_match_score(game.home_team, m.away_team),
-        )
-        a_score = max(
-            fuzzy_match_score(game.away_team, m.home_team),
-            fuzzy_match_score(game.away_team, m.away_team),
-        )
-        score = (h_score + a_score) / 2.0
-
-        # Also try matching against title
-        title_score = max(
-            fuzzy_match_score(game.home_team, m.title),
-            fuzzy_match_score(game.away_team, m.title),
-        )
-        score = max(score, title_score)
+        # Score based on team name similarity - BOTH teams must match
+        # Try Game(H) vs Market(H) and Game(A) vs Market(A)
+        score1 = (fuzzy_match_score(game.home_team, m.home_team) + 
+                  fuzzy_match_score(game.away_team, m.away_team)) / 2.0
+        
+        # Try Game(H) vs Market(A) and Game(A) vs Market(H)
+        score2 = (fuzzy_match_score(game.home_team, m.away_team) + 
+                  fuzzy_match_score(game.away_team, m.home_team)) / 2.0
+        
+        score = max(score1, score2)
 
         if score > best_score:
             best_score = score
