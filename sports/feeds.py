@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -321,19 +322,40 @@ class PolymarketFeed:
         self.books: dict[str, BookState] = {}  # token_id → BookState
         self.trades: list[dict] = []           # recent trades buffer
         self._token_ids: list[str] = []
+        self._subscribed_set: set[str] = set() # fast membership check
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._connected = False
         self._shutdown = False
         self._message_count = 0
         self._trade_callbacks: list = []
+        # ── Diagnostic counters ──────────────────────────────────
+        self._raw_log_budget = 50           # messages to log raw after connect
+        self._event_type_counts: Counter = Counter()
+        self._unique_asset_ids: set[str] = set()
+        self._mismatch_count = 0
+        self._mismatch_samples: list[str] = []
+        self._last_book_update_ts: float = 0.0
+        self._last_stats_ts: float = 0.0
+        self._connect_count = 0
 
     def set_tokens(self, token_ids: list[str]):
-        """Update the set of token IDs to subscribe to."""
+        """Update the set of token IDs to subscribe to.
+        If WS is already connected, immediately re-subscribe."""
+        old_set = self._subscribed_set
         self._token_ids = token_ids
+        self._subscribed_set = set(token_ids)
         for tid in token_ids:
             if tid not in self.books:
                 self.books[tid] = BookState(token_id=tid)
         log.info("polymarket feed configured for %d tokens", len(token_ids))
+
+        # Re-subscribe immediately if WS is already live
+        if self._connected and self._ws and old_set != self._subscribed_set:
+            diff_new = self._subscribed_set - old_set
+            diff_removed = old_set - self._subscribed_set
+            log.info("token set changed while WS live: +%d new, -%d removed → re-subscribing",
+                     len(diff_new), len(diff_removed))
+            asyncio.ensure_future(self._subscribe())
 
     def on_trade(self, callback):
         """Register callback for trade events."""
@@ -342,6 +364,8 @@ class PolymarketFeed:
     async def _subscribe(self):
         """Subscribe to all configured token IDs."""
         if not self._ws or not self._token_ids:
+            log.warning("_subscribe called but ws=%s, tokens=%d",
+                        bool(self._ws), len(self._token_ids))
             return
 
         # Subscribe in batches to avoid message size limits
@@ -352,20 +376,36 @@ class PolymarketFeed:
                 "type": "market",
                 "assets_ids": batch,
             }
-            await self._ws.send(json.dumps(msg))
+            payload = json.dumps(msg)
+            await self._ws.send(payload)
+
+            # Log first and last batch payloads for verification
+            if i == 0:
+                sample = batch[:3]
+                log.info("SUB payload sample (batch 1): type=market, first_3_tokens=%s", sample)
             log.info("subscribed to tokens %d-%d of %d",
                      i + 1, min(i + batch_size, len(self._token_ids)),
                      len(self._token_ids))
             await asyncio.sleep(0.1)
+
+        log.info("subscription complete — waiting for server ACK/first book message")
 
     async def _handle_message(self, raw: str):
         """Process incoming WS message."""
         self._message_count += 1
         now = time.time()
 
+        # ── Controlled raw logging ───────────────────────────────
+        if self._raw_log_budget > 0:
+            self._raw_log_budget -= 1
+            # Truncate to 500 chars to avoid log flooding
+            snippet = raw[:500]
+            log.info("RAW_WS [%d remaining]: %s", self._raw_log_budget, snippet)
+
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
+            log.warning("WS JSON decode failed: %s", raw[:200])
             return
 
         messages = data if isinstance(data, list) else [data]
@@ -373,6 +413,17 @@ class PolymarketFeed:
         for msg in messages:
             event_type = msg.get("event_type", "")
             asset_id = msg.get("asset_id", "")
+
+            # ── Event type counter ───────────────────────────────
+            self._event_type_counts[event_type or "_no_event_type"] += 1
+
+            # ── Token mismatch detector ──────────────────────────
+            if asset_id:
+                self._unique_asset_ids.add(asset_id)
+                if self._subscribed_set and asset_id not in self._subscribed_set:
+                    self._mismatch_count += 1
+                    if len(self._mismatch_samples) < 5:
+                        self._mismatch_samples.append(asset_id)
 
             if event_type == "book":
                 self._handle_book(msg, asset_id, now)
@@ -382,6 +433,31 @@ class PolymarketFeed:
                 self._handle_last_trade(msg, asset_id, now)
             elif event_type == "price_change":
                 self._handle_price_change(msg, asset_id, now)
+
+        # ── 60-second diagnostic stats ───────────────────────────
+        if now - self._last_stats_ts >= 60.0:
+            self._last_stats_ts = now
+            book_age = now - self._last_book_update_ts if self._last_book_update_ts > 0 else -1
+            log.info(
+                "WS_DIAG | msgs_total=%d | event_types=%s | "
+                "unique_assets=%d | subscribed=%d | "
+                "mismatch=%d | book_age=%.1fs",
+                self._message_count,
+                dict(self._event_type_counts),
+                len(self._unique_asset_ids),
+                len(self._subscribed_set),
+                self._mismatch_count,
+                book_age,
+            )
+            if self._mismatch_samples:
+                log.info("WS_DIAG mismatch samples: %s", self._mismatch_samples[:5])
+            # Check for book staleness
+            if book_age > 120 and self._message_count > 100:
+                log.warning(
+                    "BOOK STALE: no book update in %.0fs despite %d messages — "
+                    "possible schema mismatch or subscription failure",
+                    book_age, self._message_count
+                )
 
     def _handle_book(self, msg: dict, asset_id: str, ts: float):
         """Process book snapshot — update BBO."""
@@ -393,6 +469,7 @@ class PolymarketFeed:
 
         book = self.books[asset_id]
         book.timestamp = ts
+        self._last_book_update_ts = ts  # staleness tracker
 
         if bids:
             best = max(bids, key=lambda x: float(x.get("price", 0)))
@@ -467,11 +544,22 @@ class PolymarketFeed:
                 ) as ws:
                     self._ws = ws
                     self._connected = True
+                    self._connect_count += 1
                     backoff = 1.0
-                    log.info("connected to polymarket WS")
+
+                    # Set raw log budget: 50 on first connect, 10 on reconnect
+                    if self._connect_count == 1:
+                        self._raw_log_budget = 50
+                        log.info("connected to polymarket WS (first connect — logging 50 raw messages)")
+                    else:
+                        self._raw_log_budget = 10
+                        log.info("reconnected to polymarket WS (connect #%d — logging 10 raw messages)",
+                                 self._connect_count)
 
                     if self._token_ids:
                         await self._subscribe()
+                    else:
+                        log.warning("WS connected but NO token IDs to subscribe")
 
                     while not self._shutdown:
                         try:
