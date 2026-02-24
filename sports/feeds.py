@@ -414,6 +414,22 @@ class PolymarketFeed:
             event_type = msg.get("event_type", "")
             asset_id = msg.get("asset_id", "")
 
+            # ── Handle nested price_changes wrapper ──────────────
+            # Some messages arrive as {"market":"...", "price_changes":[...]}
+            # without a top-level event_type. Unpack and process each sub-item.
+            if not event_type and "price_changes" in msg:
+                for pc in msg.get("price_changes", []):
+                    pc_asset = pc.get("asset_id", "")
+                    self._event_type_counts["price_change"] += 1
+                    if pc_asset:
+                        self._unique_asset_ids.add(pc_asset)
+                        if self._subscribed_set and pc_asset not in self._subscribed_set:
+                            self._mismatch_count += 1
+                            if len(self._mismatch_samples) < 5:
+                                self._mismatch_samples.append(pc_asset)
+                    self._handle_price_change(pc, pc_asset, now)
+                continue
+
             # ── Event type counter ───────────────────────────────
             self._event_type_counts[event_type or "_no_event_type"] += 1
 
@@ -471,18 +487,25 @@ class PolymarketFeed:
         book.timestamp = ts
         self._last_book_update_ts = ts  # staleness tracker
 
+        # Reset BOTH sides from the snapshot — if a side is empty,
+        # zero it out so we don't carry stale data from a previous snapshot.
         if bids:
             best = max(bids, key=lambda x: float(x.get("price", 0)))
             book.best_bid = float(best.get("price", 0))
             book.bid_size = float(best.get("size", 0))
+        else:
+            book.best_bid = 0.0
+            book.bid_size = 0.0
+
         if asks:
             best = min(asks, key=lambda x: float(x.get("price", 1)))
             book.best_ask = float(best.get("price", 1))
             book.ask_size = float(best.get("size", 0))
+        else:
+            book.best_ask = 0.0
+            book.ask_size = 0.0
 
-        if book.best_bid > 0 and book.best_ask > 0:
-            book.mid = (book.best_bid + book.best_ask) / 2
-            book.spread = book.best_ask - book.best_bid
+        self._update_mid(book)
 
     async def _handle_tick(self, msg: dict, asset_id: str, ts: float):
         """Process trade tick."""
@@ -522,11 +545,58 @@ class PolymarketFeed:
             self.books[asset_id].timestamp = ts
 
     def _handle_price_change(self, msg: dict, asset_id: str, ts: float):
-        """Process price change notifications."""
+        """Process price change — update BBO from best_bid/best_ask fields.
+
+        price_change events are the PRIMARY live data source (~200x more
+        frequent than book snapshots). Each message contains best_bid/best_ask
+        which must be used to keep BookState current.
+        """
+        if not asset_id:
+            return
+
+        if asset_id not in self.books:
+            self.books[asset_id] = BookState(token_id=asset_id)
+
+        book = self.books[asset_id]
+        book.timestamp = ts
+
         price = msg.get("price")
-        if price is not None and asset_id in self.books:
-            self.books[asset_id].last_trade_price = float(price)
-            self.books[asset_id].timestamp = ts
+        if price is not None:
+            book.last_trade_price = float(price)
+
+        # Update BBO from price_change fields
+        best_bid = msg.get("best_bid")
+        best_ask = msg.get("best_ask")
+        if best_bid is not None:
+            book.best_bid = float(best_bid)
+        if best_ask is not None:
+            book.best_ask = float(best_ask)
+
+        size = msg.get("size")
+        side = msg.get("side", "")
+        if size is not None:
+            if side == "BUY":
+                book.bid_size = float(size)
+            elif side == "SELL":
+                book.ask_size = float(size)
+
+        self._update_mid(book)
+
+    @staticmethod
+    def _update_mid(book: BookState):
+        """Recalculate mid/spread from current BBO."""
+        if book.best_bid > 0 and book.best_ask > 0:
+            book.mid = (book.best_bid + book.best_ask) / 2
+            book.spread = book.best_ask - book.best_bid
+        elif book.best_ask > 0:
+            # One-sided: only asks (team heavily favored). Use ask as ceiling.
+            book.mid = book.best_ask
+            book.spread = 1.0
+        elif book.best_bid > 0:
+            # One-sided: only bids. Use bid as floor.
+            book.mid = book.best_bid
+            book.spread = 1.0
+        # else: both zero, don't update mid
 
     async def run(self):
         """Main WS loop with reconnection."""

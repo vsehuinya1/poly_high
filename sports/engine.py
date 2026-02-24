@@ -280,6 +280,24 @@ class SignalEngine:
             "pregame_probability": link.pregame_home_prob
         })
 
+        # Full state snapshot — one line per tick for debugging
+        hb = home_book
+        book_age = now - hb.timestamp if hb and hb.timestamp > 0 else -1
+        log.info(
+            "SNAP %s %d-%d | adj=%3.0f σ=%.2f seff=%.1f z=%.2f | "
+            "model=%.3f | bid=%.3f ask=%.3f mid=%.3f | "
+            "bsz=%.0f asz=%.0f sprd=%.3f age=%.0fs | edge=%+.4f",
+            game_state.home_team[:3],
+            game_state.home_score, game_state.away_score,
+            adj_seconds, model.sigma, model.s_eff, model.z,
+            model.p_home,
+            hb.best_bid if hb else 0, hb.best_ask if hb else 0,
+            home_mid,
+            hb.bid_size if hb else 0, hb.ask_size if hb else 0,
+            hb.spread if hb else 1, book_age,
+            max_edge[3] if edges else 0,
+        )
+
         # ── Detect edge signals ───────────────────────────────────
         signals = []
         game_state_str = (
