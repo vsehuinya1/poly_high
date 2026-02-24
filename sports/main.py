@@ -277,18 +277,15 @@ class SportsOrchestrator:
 
         log.info("matched %d games to Polymarket markets", len(self.links))
 
-        # Collect all token IDs for WS subscription
+        # Collect token IDs for WS subscription — ONLY matched game tokens.
+        # Do NOT subscribe to all discovered market tokens: non-moneyline
+        # sub-market tokens (spreads, totals, props) cause WS INVALID OPERATION.
         all_tokens = []
         for link in self.links.values():
             all_tokens.extend(link.all_token_ids)
 
-        # Also subscribe to all discovered market tokens (for data collection)
-        for m in self.markets:
-            for o in m.outcomes:
-                if o.token_id not in all_tokens:
-                    all_tokens.append(o.token_id)
-
-        log.info("subscribing to %d token IDs on Polymarket WS", len(all_tokens))
+        log.info("subscribing to %d token IDs for %d matched games on Polymarket WS",
+                 len(all_tokens), len(self.links))
         self.poly_feed.set_tokens(all_tokens)
 
     async def _score_polling_loop(self):

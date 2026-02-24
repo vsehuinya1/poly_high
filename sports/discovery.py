@@ -233,6 +233,9 @@ async def discover_sports_markets(session: aiohttp.ClientSession) -> list[SportM
 
             home_team, away_team = parse_teams_from_title(title)
 
+            # Only use primary moneyline market tokens — sub-market tokens
+            # (spreads, totals, props) don't have valid CLOB orderbooks and
+            # cause WS INVALID OPERATION when subscribed to.
             outcomes = []
             for tid, label, price in extract_token_ids(primary):
                 outcomes.append(MarketOutcome(
@@ -240,16 +243,6 @@ async def discover_sports_markets(session: aiohttp.ClientSession) -> list[SportM
                     outcome_label=label,
                     last_price=price,
                 ))
-
-            # Also grab token IDs from all sub-markets for full WS subscription
-            all_sub_outcomes = []
-            for sm in sub_markets:
-                for tid, label, price in extract_token_ids(sm):
-                    all_sub_outcomes.append(MarketOutcome(
-                        token_id=tid,
-                        outcome_label=label,
-                        last_price=price,
-                    ))
 
             sm = SportMarket(
                 event_id=event_id,
@@ -259,7 +252,7 @@ async def discover_sports_markets(session: aiohttp.ClientSession) -> list[SportM
                 sport=sport,
                 league=league,
                 end_date=event.get("endDate", "")[:10],
-                outcomes=all_sub_outcomes,
+                outcomes=outcomes,
                 volume_24h=float(event.get("volume24hr", 0) or 0),
                 liquidity=float(event.get("liquidity", 0) or 0),
                 spread=float(primary.get("spread", 1) or 1),
