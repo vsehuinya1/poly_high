@@ -8,7 +8,9 @@ import csv
 import logging
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -16,6 +18,11 @@ from sports.config import (
     ENTRY_EDGE_THRESHOLD, EXIT_CONVERGENCE,
     MAX_POSITION_PER_MARKET, MAX_CONCURRENT_POSITIONS, MAX_DAILY_LOSS,
     DATA_DIR,
+    # Execution hygiene (v1.4)
+    PRICE_BAND_LO, PRICE_BAND_HI, MAX_SPREAD, MAX_BOOK_AGE_S, MAX_SCORE_DIFF,
+    GATE_FRESH_THRESHOLD, GATE_STREAK_S, GATE_ROLLING_WINDOW_S, GATE_ROLLING_FRESH_PCT,
+    FREEZE_STALE_THRESHOLD, FREEZE_STALE_DURATION_S, UNFREEZE_STREAK_S,
+    COOLDOWN_S, PER_GAME_STOP,
 )
 from sports.feeds import GameState, BookState
 from sports.models import (
@@ -168,6 +175,138 @@ class CSVLogger:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  Game Trade State — per-game execution hygiene tracking
+# ═══════════════════════════════════════════════════════════════════════
+
+class GameStatus(Enum):
+    INACTIVE = "INACTIVE"   # gate not yet passed
+    ACTIVE   = "ACTIVE"     # gate passed, trading allowed
+    FROZEN   = "FROZEN"     # temporarily frozen (stale book)
+    STOPPED  = "STOPPED"    # per-game stop triggered
+
+
+class GameTradeState:
+    """Per-game execution hygiene state."""
+
+    def __init__(self, game_id: str):
+        self.game_id = game_id
+        self.status = GameStatus.INACTIVE
+        self.pnl: float = 0.0
+        self.trade_count: int = 0
+        self.last_exit_time: float = 0.0
+
+        # Gate tracking
+        self._fresh_streak_start: float = 0.0  # when current fresh streak began
+        self._rolling_ticks: deque = deque()    # (timestamp, is_fresh_20s) pairs
+
+        # Freeze tracking
+        self._stale_streak_start: float = 0.0   # when current stale streak began
+        self._unfreeze_fresh_start: float = 0.0 # when fresh streak began during freeze
+
+    def update_gate(self, book_age: float, now: float) -> str | None:
+        """Update game activation gate. Returns state transition or None."""
+        if self.status == GameStatus.STOPPED:
+            return None
+
+        is_fresh_30 = book_age <= GATE_FRESH_THRESHOLD
+        is_fresh_20 = book_age <= MAX_BOOK_AGE_S
+
+        # Update rolling window
+        self._rolling_ticks.append((now, is_fresh_20))
+        cutoff = now - GATE_ROLLING_WINDOW_S
+        while self._rolling_ticks and self._rolling_ticks[0][0] < cutoff:
+            self._rolling_ticks.popleft()
+
+        # Track fresh streak (age <= 30s)
+        if is_fresh_30:
+            if self._fresh_streak_start == 0:
+                self._fresh_streak_start = now
+        else:
+            self._fresh_streak_start = 0
+
+        fresh_streak_s = (now - self._fresh_streak_start) if self._fresh_streak_start > 0 else 0
+
+        # Rolling fresh %
+        if self._rolling_ticks:
+            fresh_count = sum(1 for _, f in self._rolling_ticks if f)
+            rolling_pct = fresh_count / len(self._rolling_ticks)
+        else:
+            rolling_pct = 0
+
+        # Gate activation check
+        gate_pass = (fresh_streak_s >= GATE_STREAK_S and rolling_pct >= GATE_ROLLING_FRESH_PCT)
+
+        old_status = self.status
+        if self.status == GameStatus.INACTIVE:
+            if gate_pass:
+                self.status = GameStatus.ACTIVE
+                return "GAME_ACTIVATED"
+        elif self.status == GameStatus.ACTIVE:
+            if not gate_pass:
+                self.status = GameStatus.INACTIVE
+                return "GAME_DEACTIVATED"
+
+        return None
+
+    def update_freeze(self, book_age: float, now: float) -> str | None:
+        """Update intra-game freeze state. Returns state transition or None."""
+        if self.status == GameStatus.STOPPED:
+            return None
+
+        is_stale = book_age > FREEZE_STALE_THRESHOLD
+        is_fresh_30 = book_age <= GATE_FRESH_THRESHOLD
+
+        if self.status == GameStatus.ACTIVE:
+            # Check if we should freeze
+            if is_stale:
+                if self._stale_streak_start == 0:
+                    self._stale_streak_start = now
+                elif (now - self._stale_streak_start) >= FREEZE_STALE_DURATION_S:
+                    self.status = GameStatus.FROZEN
+                    self._stale_streak_start = 0
+                    self._unfreeze_fresh_start = 0
+                    return "GAME_FROZEN"
+            else:
+                self._stale_streak_start = 0
+
+        elif self.status == GameStatus.FROZEN:
+            # Check if we should unfreeze
+            if is_fresh_30:
+                if self._unfreeze_fresh_start == 0:
+                    self._unfreeze_fresh_start = now
+                elif (now - self._unfreeze_fresh_start) >= UNFREEZE_STREAK_S:
+                    self.status = GameStatus.ACTIVE
+                    self._stale_streak_start = 0
+                    self._unfreeze_fresh_start = 0
+                    return "GAME_UNFROZEN"
+            else:
+                self._unfreeze_fresh_start = 0
+
+        return None
+
+    def record_exit(self, pnl: float, now: float) -> str | None:
+        """Record a trade exit. Returns 'GAME_STOPPED' if stop triggered."""
+        self.pnl += pnl
+        self.trade_count += 1
+        self.last_exit_time = now
+        if self.pnl <= -PER_GAME_STOP and self.status != GameStatus.STOPPED:
+            self.status = GameStatus.STOPPED
+            return "GAME_STOPPED"
+        return None
+
+    def cooldown_remaining(self, now: float) -> float:
+        """Seconds remaining in cooldown after last exit."""
+        if self.last_exit_time == 0:
+            return 0.0
+        elapsed = now - self.last_exit_time
+        return max(0.0, COOLDOWN_S - elapsed)
+
+    @property
+    def can_trade(self) -> bool:
+        return self.status == GameStatus.ACTIVE
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Signal Engine
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -187,7 +326,13 @@ class SignalEngine:
         self._killed = False
         self._signal_count = 0
         self._finished_games: set[str] = set()
-        self._last_states: dict[str, GameState] = {} # Added to store last game state
+        self._last_states: dict[str, GameState] = {}
+        self._game_states: dict[str, GameTradeState] = {}  # per-game hygiene
+
+    def _get_game_state(self, game_id: str) -> GameTradeState:
+        if game_id not in self._game_states:
+            self._game_states[game_id] = GameTradeState(game_id)
+        return self._game_states[game_id]
 
     def register_link(self, link: GameMarketLink):
         self.links[link.polymarket_event_id] = link
@@ -283,10 +428,27 @@ class SignalEngine:
         # Full state snapshot — one line per tick for debugging
         hb = home_book
         book_age = now - hb.timestamp if hb and hb.timestamp > 0 else -1
+
+        # ── Update game trade state (gate + freeze) ───────────────
+        gts = self._get_game_state(game_state.game_id)
+
+        gate_transition = gts.update_gate(book_age, now)
+        if gate_transition:
+            log.info("%s: %s (game_id=%s)", gate_transition,
+                     link.polymarket_title, game_state.game_id)
+
+        freeze_transition = gts.update_freeze(book_age, now)
+        if freeze_transition:
+            log.info("%s: %s (game_id=%s)", freeze_transition,
+                     link.polymarket_title, game_state.game_id)
+
+        cd_remain = gts.cooldown_remaining(now)
+
         log.info(
             "SNAP %s %d-%d | adj=%3.0f σ=%.2f seff=%.1f z=%.2f | "
             "model=%.3f | bid=%.3f ask=%.3f mid=%.3f | "
-            "bsz=%.0f asz=%.0f sprd=%.3f age=%.0fs | edge=%+.4f",
+            "bsz=%.0f asz=%.0f sprd=%.3f age=%.0fs | edge=%+.4f | "
+            "gs=%s cd=%.0f gpnl=$%.0f",
             game_state.home_team[:3],
             game_state.home_score, game_state.away_score,
             adj_seconds, model.sigma, model.s_eff, model.z,
@@ -296,6 +458,7 @@ class SignalEngine:
             hb.bid_size if hb else 0, hb.ask_size if hb else 0,
             hb.spread if hb else 1, book_age,
             max_edge[3] if edges else 0,
+            gts.status.value, cd_remain, gts.pnl,
         )
 
         # ── Detect edge signals ───────────────────────────────────
@@ -382,19 +545,56 @@ class SignalEngine:
         if not book:
             return
 
-        # ── Trade Filter ──────────────────────────────────────────
-        # 1. Last 10 minutes (600s)
-        # 2. Score diff <= 15
-        # 3. Abs(edge) >= 0.07
+        now = time.time()
         game_state = self._last_states.get(link.game_id)
-        if not game_state: return
-        
-        elapsed = time.time() - game_state.timestamp
+        if not game_state:
+            return
+
+        gts = self._get_game_state(link.game_id)
+
+        # ══════════════════════════════════════════════════════════
+        # EXECUTION HYGIENE — all must pass
+        # ══════════════════════════════════════════════════════════
+
+        elapsed = now - game_state.timestamp
         adj_sec = max(0, (game_state.total_minutes - game_state.elapsed_minutes) * 60.0 - elapsed)
-        
-        if adj_sec > 600: return
-        if abs(game_state.home_score - game_state.away_score) > 15: return
-        if abs(signal.edge) < 0.07: return
+        book_age = now - book.timestamp if book.timestamp > 0 else 9999
+        score_diff = abs(game_state.home_score - game_state.away_score)
+
+        # Original time gate
+        if adj_sec > 600:
+            return
+
+        # Edge threshold
+        if abs(signal.edge) < 0.07:
+            return
+
+        # 1. Hard entry filters
+        if not (PRICE_BAND_LO <= signal.market_prob <= PRICE_BAND_HI):
+            return
+        if book.spread > MAX_SPREAD:
+            return
+        if book_age > MAX_BOOK_AGE_S:
+            return
+        if score_diff > MAX_SCORE_DIFF:
+            return
+
+        # 2. Game must be ACTIVE (gate passed)
+        if not gts.can_trade:
+            return
+
+        # 3. Not frozen
+        if gts.status == GameStatus.FROZEN:
+            return  # covered by can_trade but explicit for clarity
+
+        # 4. Cooldown
+        cd = gts.cooldown_remaining(now)
+        if cd > 0:
+            return
+
+        # 5. Per-game stop
+        if gts.status == GameStatus.STOPPED:
+            return
 
         if signal.direction == "BUY":
             entry_price = book.best_ask if book.best_ask > 0 else signal.market_prob
@@ -493,6 +693,14 @@ class SignalEngine:
                 pos.pnl = pnl
                 pos.is_open = False
                 self.daily_pnl += pnl
+
+                # Per-game PnL + cooldown tracking
+                gts = self._get_game_state(game_state.game_id)
+                stop_transition = gts.record_exit(pnl, time.time())
+                if stop_transition:
+                    log.info("%s: %s (pnl=$%.2f, game_id=%s)",
+                             stop_transition, link.polymarket_title,
+                             gts.pnl, game_state.game_id)
                 self.csv.log_trade(pos, "EXIT")
 
                 log.info("PAPER EXIT: %s %s @ %.3f → %.3f PnL=$%.2f (%s) | daily=$%.2f",
