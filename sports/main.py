@@ -30,6 +30,7 @@ from sports.config import (
 from sports.discovery import discover_sports_markets, SportMarket
 from sports.feeds import FootballFeed, NBAFeed, PolymarketFeed, GameState
 from sports.engine import SignalEngine, GameMarketLink
+from sports.models import invert_1x2_to_lambdas
 
 log = logging.getLogger("sports.main")
 
@@ -149,13 +150,26 @@ def build_game_market_link(
     # Only use if game hasn't started yet (is_live=False).
     # If discovered mid-game (e.g. system restart), the market price
     # is already in-play and would poison the anchor → fallback to 0.5.
-    pregame_prob = 0.5
+    pregame_home = 0.5
+    pregame_draw = 0.0
+    pregame_away = 0.0
+
     if not game.is_live:
+        # Collect prices for all matched outcomes
         for o in market.outcomes:
             if o.token_id == home_tid and 0.05 < o.last_price < 0.95:
-                pregame_prob = o.last_price
-                break
-        log.info("pre-game anchor for %s: %.3f", game.home_team, pregame_prob)
+                pregame_home = o.last_price
+            elif o.token_id == away_tid and 0.05 < o.last_price < 0.95:
+                pregame_away = o.last_price
+            elif o.token_id == draw_tid and 0.05 < o.last_price < 0.95:
+                pregame_draw = o.last_price
+
+        # If draw not explicitly priced, infer it
+        if pregame_draw <= 0 and pregame_home > 0 and pregame_away > 0:
+            pregame_draw = max(0.0, 1.0 - pregame_home - pregame_away)
+
+        log.info("pre-game anchor for %s: H=%.3f D=%.3f A=%.3f",
+                 game.home_team, pregame_home, pregame_draw, pregame_away)
     else:
         log.info("game %s already live — using neutral anchor 0.5", game.home_team)
 
@@ -172,8 +186,66 @@ def build_game_market_link(
         away_token_id=away_tid,
         draw_token_id=draw_tid,
         all_token_ids=all_tids,
-        pregame_home_prob=pregame_prob,
+        pregame_home_prob=pregame_home,
+        pregame_draw_prob=pregame_draw,
+        pregame_away_prob=pregame_away,
     )
+
+
+def prewarm_football_lambdas(links: dict[str, "GameMarketLink"]) -> None:
+    """Pre-warm λ inversion for all football game-market links.
+
+    MUST be called before starting live polling. Runs grid-search
+    inversion (~10s per unique odds triple) and stores results in
+    both the global cache and each link object.
+
+    Fails fast if any inversion produces unacceptable SSE.
+    """
+    football_links = [
+        (gid, link) for gid, link in links.items()
+        if link.sport == "football"
+    ]
+
+    if not football_links:
+        log.info("PREWARM | no football links to pre-warm")
+        return
+
+    log.info("PREWARM | pre-warming λ for %d football games...", len(football_links))
+    warmed = 0
+    sse_warn_threshold = 0.01
+
+    for game_id, link in football_links:
+        p_h = link.pregame_home_prob
+        p_d = link.pregame_draw_prob
+        p_a = link.pregame_away_prob
+
+        # Skip if no valid pre-match probs
+        if p_h <= 0 and p_d <= 0 and p_a <= 0:
+            log.warning(
+                "PREWARM | %s — no pre-match probs, using fallback",
+                link.polymarket_title,
+            )
+            # Still invert with fallback so λ is never None
+            p_h, p_d, p_a = 0.45, 0.28, 0.27  # neutral default
+
+        lam_h, lam_a, sse = invert_1x2_to_lambdas(p_h, p_d, p_a)
+        link.lambda_home = lam_h
+        link.lambda_away = lam_a
+        warmed += 1
+
+        if sse > sse_warn_threshold:
+            log.warning(
+                "PREWARM | %s | λh=%.2f λa=%.2f | SSE=%.6f > %.4f WARN",
+                link.polymarket_title, lam_h, lam_a, sse, sse_warn_threshold,
+            )
+        else:
+            log.info(
+                "INVERSION OK | %s | λh=%.2f λa=%.2f | SSE=%.6f",
+                link.polymarket_title, lam_h, lam_a, sse,
+            )
+
+    log.info("PREWARM | complete — %d/%d football games warmed",
+             warmed, len(football_links))
 
 
 class SportsOrchestrator:
@@ -418,6 +490,7 @@ class SportsOrchestrator:
                 log.info("re-scanning for new markets...")
                 await self.discover()
                 await self.build_links()
+                prewarm_football_lambdas(self.links)
             except Exception as e:
                 log.error("re-discovery error: %s", e)
 
@@ -438,6 +511,10 @@ class SportsOrchestrator:
 
         # Phase 3: Build game-market links
         await self.build_links()
+
+        # Phase 3.5: Pre-warm football λ values (grid search — must
+        # complete before any live polling or signal processing starts)
+        prewarm_football_lambdas(self.links)
 
         if not self.links:
             log.warning("no game-market links found — will continue "

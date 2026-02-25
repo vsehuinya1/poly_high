@@ -54,6 +54,10 @@ class GameMarketLink:
     draw_token_id: str = ""
     all_token_ids: list[str] = field(default_factory=list)
     pregame_home_prob: float = 0.5
+    pregame_draw_prob: float = 0.0
+    pregame_away_prob: float = 0.0
+    lambda_home: Optional[float] = None   # pre-warmed via invert_1x2_to_lambdas
+    lambda_away: Optional[float] = None   # pre-warmed via invert_1x2_to_lambdas
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -380,10 +384,18 @@ class SignalEngine:
                 adj_seconds, game_state.period, link.pregame_home_prob
             )
         else:
+            if link.lambda_home is None or link.lambda_away is None:
+                raise RuntimeError(
+                    f"Football λ not pre-warmed for {link.polymarket_title} "
+                    f"(game_id={link.game_id}). Run prewarm_football_lambdas() "
+                    f"before starting live polling."
+                )
             model = football_win_probability(
                 game_state.home_score, game_state.away_score,
                 game_state.minutes_remaining,
-                game_state.home_red_cards, game_state.away_red_cards
+                game_state.home_red_cards, game_state.away_red_cards,
+                lambda_home_90=link.lambda_home,
+                lambda_away_90=link.lambda_away,
             )
             adj_seconds = game_state.minutes_remaining * 60.0
 
