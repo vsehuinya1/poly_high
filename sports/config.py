@@ -52,8 +52,8 @@ MAX_DAILY_LOSS        = 1000.0   # kill-switch
 
 # ── Execution Hygiene (v1.4) ─────────────────────────────────────────
 # Hard entry filters
-PRICE_BAND_LO         = 0.08     # mid must be >= this
-PRICE_BAND_HI         = 0.92     # mid must be <= this
+PRICE_BAND_LO         = 0.15     # mid must be >= this
+PRICE_BAND_HI         = 0.70     # mid must be <= this
 MAX_SPREAD            = 0.08     # spread must be <= this
 MAX_BOOK_AGE_S        = 20.0     # book_age must be <= this
 MAX_SCORE_DIFF        = 15       # |home - away| must be <= this

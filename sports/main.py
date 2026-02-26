@@ -36,12 +36,14 @@ log = logging.getLogger("sports.main")
 
 
 def setup_logging():
-    """Configure logging to console + file."""
+    """Configure logging to console + rotating file."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     today = time.strftime("%Y%m%d")
 
     fmt = "%(asctime)s [%(name)-18s] %(levelname)-5s  %(message)s"
     datefmt = "%H:%M:%S"
+
+    from logging.handlers import RotatingFileHandler
 
     logging.basicConfig(
         level=logging.INFO,
@@ -49,7 +51,11 @@ def setup_logging():
         datefmt=datefmt,
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler(LOG_DIR / f"sports_{today}.log"),
+            RotatingFileHandler(
+                LOG_DIR / f"sports_{today}.log",
+                maxBytes=10 * 1024 * 1024,  # 10 MB
+                backupCount=5,
+            ),
         ],
     )
     # Quiet some noisy loggers
@@ -464,18 +470,28 @@ class SportsOrchestrator:
                             h_mid, a_mid,
                         )
 
-                # Telegram status every 5 minutes
+                # Band stats every 5 minutes
                 tg_interval += 1
-                if tg_interval >= 5 and (live_football > 0 or live_nba > 0):
-                    tg_interval = 0
-                    await self.engine.tg.notify_status(
-                        live_football, live_nba,
-                        self.poly_feed.is_connected,
-                        self.poly_feed.message_count,
-                        len(self.links),
-                        summary.get("total_trades", 0),
-                        summary.get("daily_pnl", 0.0),
-                    )
+                if tg_interval >= 5:
+                    # Log per-game band rejects
+                    for gid, gts in self.engine._game_states.items():
+                        if gts.band_rejects > 0:
+                            log.info(
+                                "BAND_STATS | %s | rejects=%d | gs=%s | gpnl=$%.0f",
+                                gid, gts.band_rejects,
+                                gts.status.value, gts.pnl,
+                            )
+
+                    if live_football > 0 or live_nba > 0:
+                        tg_interval = 0
+                        await self.engine.tg.notify_status(
+                            live_football, live_nba,
+                            self.poly_feed.is_connected,
+                            self.poly_feed.message_count,
+                            len(self.links),
+                            summary.get("total_trades", 0),
+                            summary.get("daily_pnl", 0.0),
+                        )
 
             except Exception as e:
                 log.error("status printer error: %s", e)

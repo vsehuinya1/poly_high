@@ -198,6 +198,7 @@ class GameTradeState:
         self.pnl: float = 0.0
         self.trade_count: int = 0
         self.last_exit_time: float = 0.0
+        self.band_rejects: int = 0
 
         # Gate tracking
         self._fresh_streak_start: float = 0.0  # when current fresh streak began
@@ -583,6 +584,12 @@ class SignalEngine:
 
         # 1. Hard entry filters
         if not (PRICE_BAND_LO <= signal.market_prob <= PRICE_BAND_HI):
+            gts.band_rejects += 1
+            log.info(
+                "REJECT PRICE_BAND | %s | price=%.3f | model=%.3f | edge=%.3f",
+                signal.game_state, signal.market_prob,
+                signal.model_prob, signal.edge,
+            )
             return
         if book.spread > MAX_SPREAD:
             return
