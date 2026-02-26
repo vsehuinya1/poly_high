@@ -63,10 +63,38 @@ def setup_logging():
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
 
+import unicodedata
+
+# Common name variations between sources
+TEAM_ALIASES = {
+    "red star belgrade": "crvena zvezda",
+    "fk crvena zvezda": "red star belgrade",
+    "crvena zvezda": "red star belgrade",
+}
+
+
+def normalize_name(name: str) -> str:
+    """Remove accents and normalize team names."""
+    # Convert to lowercase and strip
+    name = name.lower().strip()
+    # Remove accents
+    name = "".join(
+        c for c in unicodedata.normalize("NFD", name)
+        if unicodedata.category(c) != "Mn"
+    )
+    # Remove common suffixes
+    for suffix in [" fc", " sc", " bk", " cf", " s.k.", " sk", " tc", " pfc"]:
+        if name.endswith(suffix):
+            name = name[:-len(suffix)].strip()
+    
+    # Check aliases
+    return TEAM_ALIASES.get(name, name)
+
+
 def fuzzy_match_score(a: str, b: str) -> float:
     """Fuzzy match score between two team names (0-1)."""
-    a = a.lower().strip()
-    b = b.lower().strip()
+    a = normalize_name(a)
+    b = normalize_name(b)
     if a == b:
         return 1.0
     if a in b or b in a:
@@ -295,13 +323,22 @@ class SportsOrchestrator:
         return markets
 
     async def fetch_fixtures(self):
-        """Fetch today's football fixtures and pre-load schedule."""
+        """Fetch all game fixtures for today and tomorrow."""
+        # We fetch two days to catch late-night NBA games starting after 00:00 UTC
+        dates = [
+            self.target_date,
+            (datetime.strptime(self.target_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        ]
 
-        log.info("fetching football fixtures for %s...", self.target_date)
         async with aiohttp.ClientSession() as session:
-            await self.football_feed.fetch_todays_fixtures(
-                session, self.target_date
-            )
+            for d in dates:
+                log.info("fetching football fixtures for %s...", d)
+                await self.football_feed.fetch_todays_fixtures(session, d)
+                
+                # Note: NBA feed fetch_live_scores fetches current/upcoming regardless of date
+                # but we call it here to ensure we have data for matching.
+                log.info("fetching NBA scoreboard...")
+                await self.nba_feed.fetch_live_scores(session)
 
 
     async def build_links(self):
