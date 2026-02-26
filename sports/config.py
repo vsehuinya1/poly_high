@@ -11,24 +11,21 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ── API-Football ─────────────────────────────────────────────────────
-API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
-API_FOOTBALL_HOST = "v3.football.api-sports.io"
-API_FOOTBALL_BASE = f"https://{API_FOOTBALL_HOST}"
+# ── ESPN Football ────────────────────────────────────────────────────
+ESPN_FOOTBALL_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer"
 
-# European football league IDs (API-Football)
-FOOTBALL_LEAGUES = {
-    39:  "EPL",
-    40:  "Championship",
-    140: "La Liga",
-    78:  "Bundesliga",
-    135: "Serie A",
-    61:  "Ligue 1",
-    88:  "Eredivisie",
-    2:   "UEFA Champions League",
-    3:   "UEFA Europa League",
-    848: "Conference League",
-}
+ESPN_LEAGUES = [
+    "eng.1",            # EPL
+    "eng.2",            # Championship
+    "esp.1",            # La Liga
+    "ger.1",            # Bundesliga
+    "ita.1",            # Serie A
+    "fra.1",            # Ligue 1
+    "ned.1",            # Eredivisie
+    "uefa.champions",   # UCL
+    "uefa.europa",      # Europa League
+    "uefa.europa.conf", # Conference League
+]
 
 # ── NBA ──────────────────────────────────────────────────────────────
 NBA_SCOREBOARD_URL = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"

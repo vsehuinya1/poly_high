@@ -25,7 +25,7 @@ import aiohttp
 
 from sports.config import (
     DATA_DIR, LOG_DIR, SCORE_POLL_INTERVAL_S, POLYMARKET_SNAPSHOT_S,
-    DISCOVERY_INTERVAL_S, API_FOOTBALL_KEY,
+    DISCOVERY_INTERVAL_S,
 )
 from sports.discovery import discover_sports_markets, SportMarket
 from sports.feeds import FootballFeed, NBAFeed, PolymarketFeed, GameState
@@ -296,9 +296,6 @@ class SportsOrchestrator:
 
     async def fetch_fixtures(self):
         """Fetch today's football fixtures and pre-load schedule."""
-        if not API_FOOTBALL_KEY:
-            log.warning("API_FOOTBALL_KEY not set — football feed disabled")
-            return
 
         log.info("fetching football fixtures for %s...", self.target_date)
         async with aiohttp.ClientSession() as session:
@@ -373,11 +370,10 @@ class SportsOrchestrator:
                 async with aiohttp.ClientSession() as session:
                     while not self._shutdown:
                         # Football
-                        if API_FOOTBALL_KEY:
-                            try:
-                                await self.football_feed.fetch_live_scores(session)
-                            except Exception as e:
-                                log.error("football feed error: %s", e)
+                        try:
+                            await self.football_feed.fetch_live_scores(session)
+                        except Exception as e:
+                            log.error("football feed error: %s", e)
 
                         # NBA
                         try:
@@ -515,7 +511,7 @@ class SportsOrchestrator:
         log.info("=" * 60)
         log.info("  SPORTS MARKET SYSTEM STARTING")
         log.info("  Date: %s", self.target_date)
-        log.info("  API-Football: %s", "CONFIGURED" if API_FOOTBALL_KEY else "MISSING")
+        log.info("  Football source: ESPN (no key required)")
         log.info("  Data dir: %s", DATA_DIR.absolute())
         log.info("=" * 60)
 

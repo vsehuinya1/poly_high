@@ -1,10 +1,11 @@
 """
-Live data feeds — API-Football, NBA scores, and Polymarket WS.
+Live data feeds — ESPN Football, NBA scores, and Polymarket WS.
 All feeds are async and produce structured game state / market state.
 """
 import asyncio
 import json
 import logging
+import re
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -15,10 +16,9 @@ import aiohttp
 import websockets
 
 from sports.config import (
-    API_FOOTBALL_KEY, API_FOOTBALL_HOST, API_FOOTBALL_BASE,
+    ESPN_FOOTBALL_BASE, ESPN_LEAGUES,
     NBA_SCOREBOARD_URL,
     POLYMARKET_WS_URL,
-    FOOTBALL_LEAGUES,
     SCORE_POLL_INTERVAL_S,
 )
 
@@ -93,121 +93,294 @@ class BookState:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  API-Football Feed
+#  ESPN Football Feed
 # ═══════════════════════════════════════════════════════════════════════
 
+# Regex to parse ESPN displayClock like "45'", "90'+5'", "120'+1'"
+_CLOCK_RE = re.compile(r"(\d+)'(?:\+(\d+)')?")
+
+
+def _parse_espn_clock(display_clock: str) -> float:
+    """Convert ESPN displayClock string to elapsed minutes."""
+    m = _CLOCK_RE.search(display_clock)
+    if not m:
+        return 0.0
+    base = int(m.group(1))
+    added = int(m.group(2)) if m.group(2) else 0
+    return float(base + added)
+
+
+def _espn_status_to_internal(status_type: dict, period: int) -> tuple[str, str]:
+    """Map ESPN status to internal (status, period_str).
+
+    Returns (status, period_label) where status is one of:
+    "NS", "1H", "2H", "HT", "ET", "FT", "AET", "PEN"
+    """
+    state = status_type.get("state", "")       # "pre", "in", "post"
+    short = status_type.get("shortDetail", "")  # "FT", "HT", "AET", etc.
+    name = status_type.get("name", "")
+
+    if state == "pre":
+        return "NS", ""
+
+    if state == "post":
+        if "AET" in short:
+            return "FT", "AET"
+        return "FT", "FT"
+
+    # state == "in"
+    if "HT" in short or "Halftime" in short:
+        return "HT", "HT"
+
+    if period <= 1:
+        return "1H", "1H"
+    elif period == 2:
+        return "2H", "2H"
+    else:
+        return "ET", "ET"
+
+
 class FootballFeed:
-    """Polls API-Football for live scores across European leagues."""
+    """Polls ESPN scoreboard for live football scores across configured leagues."""
 
     def __init__(self):
-        self.games: dict[str, GameState] = {}  # fixture_id → GameState
-        self._headers = {
-            "x-apisports-key": API_FOOTBALL_KEY,
-        }
+        self.games: dict[str, GameState] = {}  # event_id → GameState
+        self._last_heartbeat: float = 0.0
+        # Print startup banner
+        log.info("FOOTBALL_SOURCE = ESPN")
+        log.info("LEAGUES_LOADED = %d", len(ESPN_LEAGUES))
+        log.info("FOOTBALL_FEED_READY")
 
-    async def fetch_todays_fixtures(self, session: aiohttp.ClientSession,
-                                     date_str: str) -> list[dict]:
-        """Fetch all fixtures for a given date across configured leagues."""
-        all_fixtures = []
+    async def fetch_todays_fixtures(
+        self, session: aiohttp.ClientSession, date_str: str,
+    ) -> list[dict]:
+        """Fetch all fixtures for a given date across ESPN leagues.
 
-        for league_id, league_name in FOOTBALL_LEAGUES.items():
-            url = f"{API_FOOTBALL_BASE}/fixtures"
-            params = {
-                "league": str(league_id),
-                "season": "2025",  # 2025-2026 season
-                "date": date_str,
-            }
+        Args:
+            session: aiohttp session
+            date_str: "YYYY-MM-DD"
+
+        Returns:
+            List of raw ESPN event dicts (for logging/debug).
+        """
+        # ESPN wants "YYYYMMDD" as dates param
+        date_compact = date_str.replace("-", "")
+        all_events: list[dict] = []
+        total_fixtures = 0
+
+        for league_code in ESPN_LEAGUES:
+            url = f"{ESPN_FOOTBALL_BASE}/{league_code}/scoreboard"
+            params = {"dates": date_compact}
 
             try:
                 async with session.get(
-                    url, headers=self._headers, params=params,
+                    url, params=params,
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if resp.status != 200:
-                        log.warning("API-Football %s returned %d", league_name, resp.status)
+                        log.warning("FOOTBALL_FEED_ERR | %s | HTTP %d", league_code, resp.status)
                         continue
                     data = await resp.json()
-                    fixtures = data.get("response", [])
-                    for f in fixtures:
-                        f["_league_name"] = league_name
-                    all_fixtures.extend(fixtures)
-                    if fixtures:
-                        log.info("%s: %d fixtures on %s", league_name, len(fixtures), date_str)
+
+                events = data.get("events", [])
+                league_name = league_code
+
+                for evt in events:
+                    comps = evt.get("competitions", [])
+                    if not comps:
+                        continue
+                    comp = comps[0]
+                    competitors = comp.get("competitors", [])
+                    if len(competitors) < 2:
+                        continue
+
+                    # Identify home/away
+                    home = away = None
+                    for c in competitors:
+                        if c.get("homeAway") == "home":
+                            home = c
+                        else:
+                            away = c
+                    if not home or not away:
+                        continue
+
+                    event_id = str(evt.get("id", ""))
+                    home_name = home.get("team", {}).get("displayName", "")
+                    away_name = away.get("team", {}).get("displayName", "")
+
+                    gs = GameState(
+                        game_id=event_id,
+                        sport="football",
+                        league=league_name,
+                        status="NS",
+                        home_team=home_name,
+                        away_team=away_name,
+                        home_score=0,
+                        away_score=0,
+                        elapsed_minutes=0.0,
+                        total_minutes=90.0,
+                        period="",
+                        timestamp=time.time(),
+                    )
+                    self.games[event_id] = gs
+                    total_fixtures += 1
+
+                all_events.extend(events)
+
+                if events:
+                    log.info("FOOTBALL_FEED_OK | %s | fixtures=%d", league_code, len(events))
+
             except Exception as e:
-                log.error("API-Football error for %s: %s", league_name, e)
+                log.error("FOOTBALL_FEED_ERR | %s | %s", league_code, e)
 
-            # Rate limit: ~10 requests/min on basic plan
-            await asyncio.sleep(0.5)
+            # Brief pause between leagues to be polite
+            await asyncio.sleep(0.3)
 
-        return all_fixtures
+        log.info("found %d football fixtures across all leagues", total_fixtures)
+        return all_events
 
-    async def fetch_live_scores(self, session: aiohttp.ClientSession) -> dict[str, GameState]:
-        """Fetch all currently live fixtures."""
-        url = f"{API_FOOTBALL_BASE}/fixtures"
-        params = {"live": "all"}
-
-        try:
-            async with session.get(
-                url, headers=self._headers, params=params,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    log.warning("API-Football live returned %d", resp.status)
-                    return self.games
-                data = await resp.json()
-                fixtures = data.get("response", [])
-        except Exception as e:
-            log.error("API-Football live error: %s", e)
-            return self.games
-
+    async def fetch_live_scores(
+        self, session: aiohttp.ClientSession,
+    ) -> dict[str, GameState]:
+        """Fetch live scores from ESPN for all configured leagues."""
         now = time.time()
+        total_live = 0
 
-        for fix in fixtures:
-            league_id = fix.get("league", {}).get("id", 0)
-            if league_id not in FOOTBALL_LEAGUES:
+        for league_code in ESPN_LEAGUES:
+            url = f"{ESPN_FOOTBALL_BASE}/{league_code}/scoreboard"
+
+            try:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        log.warning("FOOTBALL_FEED_ERR | %s | HTTP %d", league_code, resp.status)
+                        continue
+                    data = await resp.json()
+            except Exception as e:
+                log.error("FOOTBALL_FEED_ERR | %s | %s", league_code, e)
                 continue
 
-            fixture_info = fix.get("fixture", {})
-            fixture_id = str(fixture_info.get("id", ""))
-            status_info = fixture_info.get("status", {})
-            status_short = status_info.get("short", "")
-            elapsed = status_info.get("elapsed") or 0
+            events = data.get("events", [])
 
-            teams = fix.get("teams", {})
-            goals = fix.get("goals", {})
-            stats = fix.get("statistics", [])
+            for evt in events:
+                evt_status = evt.get("status", {})
+                status_type = evt_status.get("type", {})
+                state = status_type.get("state", "")
 
-            gs = GameState(
-                game_id=fixture_id,
-                sport="football",
-                league=FOOTBALL_LEAGUES.get(league_id, "Unknown"),
-                status=status_short,
-                home_team=teams.get("home", {}).get("name", ""),
-                away_team=teams.get("away", {}).get("name", ""),
-                home_score=goals.get("home") or 0,
-                away_score=goals.get("away") or 0,
-                elapsed_minutes=float(elapsed),
-                total_minutes=90.0,
-                period=status_short,
-                timestamp=now,
+                # We care about live ("in") and just-finished ("post") games
+                if state not in ("in", "post"):
+                    continue
+
+                comps = evt.get("competitions", [])
+                if not comps:
+                    continue
+                comp = comps[0]
+                competitors = comp.get("competitors", [])
+                if len(competitors) < 2:
+                    continue
+
+                home = away = None
+                home_id = away_id = ""
+                for c in competitors:
+                    if c.get("homeAway") == "home":
+                        home = c
+                        home_id = c.get("id", "")
+                    else:
+                        away = c
+                        away_id = c.get("id", "")
+                if not home or not away:
+                    continue
+
+                event_id = str(evt.get("id", ""))
+                display_clock = evt_status.get("displayClock", "0'")
+                period_num = evt_status.get("period", 1)
+
+                internal_status, period_label = _espn_status_to_internal(
+                    status_type, period_num,
+                )
+
+                # Parse elapsed minutes
+                elapsed = _parse_espn_clock(display_clock)
+
+                # Clamp based on status
+                if internal_status == "HT":
+                    elapsed = 45.0
+                elif internal_status == "FT":
+                    elapsed = 90.0  # or 120 for AET
+                    if period_label == "AET":
+                        elapsed = 120.0
+
+                # Determine total_minutes for model
+                total_mins = 90.0
+                if period_num > 2 or period_label in ("ET", "AET"):
+                    total_mins = 120.0
+
+                # Scores
+                home_score = int(home.get("score", "0") or "0")
+                away_score = int(away.get("score", "0") or "0")
+
+                # Red cards from details
+                home_reds = 0
+                away_reds = 0
+                details = comp.get("details", [])
+                for detail in details:
+                    if detail.get("redCard"):
+                        detail_team_id = detail.get("team", {}).get("id", "")
+                        if detail_team_id == home_id:
+                            home_reds += 1
+                        elif detail_team_id == away_id:
+                            away_reds += 1
+
+                # Last event
+                last_event = ""
+                if details:
+                    last_detail = details[-1]
+                    last_event = last_detail.get("type", {}).get("text", "")
+
+                home_name = home.get("team", {}).get("displayName", "")
+                away_name = away.get("team", {}).get("displayName", "")
+
+                gs = GameState(
+                    game_id=event_id,
+                    sport="football",
+                    league=league_code,
+                    status=internal_status,
+                    home_team=home_name,
+                    away_team=away_name,
+                    home_score=home_score,
+                    away_score=away_score,
+                    elapsed_minutes=elapsed,
+                    total_minutes=total_mins,
+                    period=period_label,
+                    home_red_cards=home_reds,
+                    away_red_cards=away_reds,
+                    timestamp=now,
+                    last_event=last_event,
+                )
+
+                self.games[event_id] = gs
+
+                if state == "in":
+                    total_live += 1
+                    log.info(
+                        "FOOTBALL_LIVE | %s vs %s | min=%d | score=%d-%d | reds=%d-%d",
+                        home_name, away_name, int(elapsed),
+                        home_score, away_score,
+                        home_reds, away_reds,
+                    )
+
+            await asyncio.sleep(0.2)
+
+        # Heartbeat every 5 minutes
+        if now - self._last_heartbeat >= 300:
+            total_tracked = sum(1 for g in self.games.values() if g.status != "FT")
+            log.info(
+                "FOOTBALL_HEARTBEAT | total_live=%d | total_tracked=%d",
+                total_live, total_tracked,
             )
-
-            # Parse events for goals/cards if available
-            events = fix.get("events", [])
-            if events:
-                last_evt = events[-1]
-                gs.last_event = f"{last_evt.get('type', '')}:{last_evt.get('detail', '')}"
-
-                # Count red cards
-                for evt in events:
-                    if evt.get("type") == "Card" and "red" in evt.get("detail", "").lower():
-                        team_name = evt.get("team", {}).get("name", "")
-                        if team_name == gs.home_team:
-                            gs.home_red_cards += 1
-                        else:
-                            gs.away_red_cards += 1
-
-            self.games[fixture_id] = gs
+            self._last_heartbeat = now
 
         return self.games
 
