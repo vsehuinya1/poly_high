@@ -114,7 +114,7 @@ def fuzzy_match_score(a: str, b: str) -> float:
     if a == b:
         return 1.0
     if a in b or b in a:
-        return 0.85
+        return 0.90
     return SequenceMatcher(None, a, b).ratio()
 
 
