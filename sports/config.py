@@ -81,6 +81,7 @@ SPORTS_SLUG_PATTERNS = [
     "epl-", "la-liga", "bundesliga", "serie-a", "ligue-1",
     "eredivisie", "championship-",
     "champions-league", "europa-league", "conference-league",
+    "ucl-", "uel-", "uecl-",
     "fifa-", "world-cup",
     "premier-league",
 ]

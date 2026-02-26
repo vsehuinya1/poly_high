@@ -81,11 +81,11 @@ def classify_market(slug: str, title: str) -> tuple[str, str]:
         return ("football", "Eredivisie")
     if "championship" in s or "championship" in t:
         return ("football", "Championship")
-    if "champions-league" in s or "champions league" in t:
+    if "champions-league" in s or "champions league" in t or "ucl-" in s:
         return ("football", "Champions League")
-    if "europa-league" in s or "europa league" in t:
+    if "europa-league" in s or "europa league" in t or "uel-" in s:
         return ("football", "Europa League")
-    if "conference-league" in s:
+    if "conference-league" in s or "uecl-" in s:
         return ("football", "Conference League")
     if "fifa" in s or "world-cup" in s:
         return ("football", "FIFA World Cup")
