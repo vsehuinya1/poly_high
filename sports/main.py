@@ -299,34 +299,10 @@ class SportsOrchestrator:
 
         log.info("fetching football fixtures for %s...", self.target_date)
         async with aiohttp.ClientSession() as session:
-            fixtures = await self.football_feed.fetch_todays_fixtures(
+            await self.football_feed.fetch_todays_fixtures(
                 session, self.target_date
             )
-        log.info("found %d football fixtures across all leagues", len(fixtures))
 
-        # Pre-create game states for scheduled fixtures
-        for fix in fixtures:
-            fixture_info = fix.get("fixture", {})
-            fixture_id = str(fixture_info.get("id", ""))
-            teams = fix.get("teams", {})
-            league_name = fix.get("_league_name", "Unknown")
-            status = fixture_info.get("status", {}).get("short", "NS")
-
-            gs = GameState(
-                game_id=fixture_id,
-                sport="football",
-                league=league_name,
-                status=status,
-                home_team=teams.get("home", {}).get("name", ""),
-                away_team=teams.get("away", {}).get("name", ""),
-                total_minutes=90.0,
-                timestamp=time.time(),
-            )
-            self.football_feed.games[fixture_id] = gs
-
-            log.info("  [%s] %s vs %s (%s) — fixture #%s",
-                     league_name, gs.home_team, gs.away_team,
-                     status, fixture_id)
 
     async def build_links(self):
         """Match games to Polymarket markets and build monitoring links."""
