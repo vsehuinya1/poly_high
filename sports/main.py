@@ -65,29 +65,45 @@ def setup_logging():
 
 import unicodedata
 
-# Common name variations between sources
+# Common name variations mapped to canonical versions
 TEAM_ALIASES = {
     "red star belgrade": "crvena zvezda",
-    "fk crvena zvezda": "red star belgrade",
-    "crvena zvezda": "red star belgrade",
+    "fk crvena zvezda": "crvena zvezda",
+    "crvena zvezda": "crvena zvezda",
+    "lille osc": "lille",
+    "lille": "lille",
+    "celta de vigo": "celta vigo",
+    "paok salonika": "paok",
+    "ferencvarosi": "ferencvaros",
 }
 
 
 def normalize_name(name: str) -> str:
-    """Remove accents and normalize team names."""
+    """Remove accents, prefixes, suffixes and normalize team names."""
     # Convert to lowercase and strip
     name = name.lower().strip()
+    
     # Remove accents
     name = "".join(
         c for c in unicodedata.normalize("NFD", name)
         if unicodedata.category(c) != "Mn"
     )
+
+    # Check mapping before prefix/suffix stripping
+    if name in TEAM_ALIASES:
+        return TEAM_ALIASES[name]
+
+    # Remove common prefixes
+    for prefix in ["fk ", "as ", "sc ", "afc ", "rc ", "bc ", "ac "]:
+        if name.startswith(prefix):
+            name = name[len(prefix):].strip()
+    
     # Remove common suffixes
-    for suffix in [" fc", " sc", " bk", " cf", " s.k.", " sk", " tc", " pfc"]:
+    for suffix in [" fc", " sc", " bk", " cf", " s.k.", " sk", " tc", " pfc", " osc", " ao", " 1945", " tc"]:
         if name.endswith(suffix):
             name = name[:-len(suffix)].strip()
     
-    # Check aliases
+    # Check mapping again after stripping
     return TEAM_ALIASES.get(name, name)
 
 
