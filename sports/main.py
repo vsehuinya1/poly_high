@@ -572,6 +572,7 @@ class SportsOrchestrator:
         # Phase 4: Start all async loops
         tasks = [
             asyncio.create_task(self.poly_feed.run(), name="polymarket_ws"),
+            asyncio.create_task(self.poly_feed.run_book_polling(), name="book_rest_polling"),
             asyncio.create_task(self._score_polling_loop(), name="score_polling"),
             asyncio.create_task(self._signal_processing_loop(), name="signal_processing"),
             asyncio.create_task(self._status_printer_loop(), name="status_printer"),

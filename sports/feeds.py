@@ -19,7 +19,11 @@ from sports.config import (
     ESPN_FOOTBALL_BASE, ESPN_LEAGUES,
     NBA_SCOREBOARD_URL,
     POLYMARKET_WS_URL,
+    POLYMARKET_CLOB_BOOK_URL,
     SCORE_POLL_INTERVAL_S,
+    BOOK_REST_ENABLED,
+    BOOK_REST_POLL_INTERVAL_S,
+    BOOK_REST_STALE_LOG_S,
 )
 
 log = logging.getLogger("sports.feeds")
@@ -510,6 +514,9 @@ class PolymarketFeed:
         self._last_book_update_ts: float = 0.0
         self._last_stats_ts: float = 0.0
         self._connect_count = 0
+        self._rest_poll_count = 0
+        self._rest_poll_errors = 0
+        self._rest_session: Optional[aiohttp.ClientSession] = None
 
     def set_tokens(self, token_ids: list[str]):
         """Update the set of token IDs to subscribe to.
@@ -627,26 +634,30 @@ class PolymarketFeed:
         if now - self._last_stats_ts >= 60.0:
             self._last_stats_ts = now
             book_age = now - self._last_book_update_ts if self._last_book_update_ts > 0 else -1
+
+            # Per-token staleness summary
+            stale_count = 0
+            for b in self.books.values():
+                token_age = now - b.timestamp if b.timestamp > 0 else 9999
+                if token_age > BOOK_REST_STALE_LOG_S:
+                    stale_count += 1
+
             log.info(
                 "WS_DIAG | msgs_total=%d | event_types=%s | "
                 "unique_assets=%d | subscribed=%d | "
-                "mismatch=%d | book_age=%.1fs",
+                "mismatch=%d | book_age=%.1fs | "
+                "stale_tokens=%d/%d | rest_polls=%d rest_errs=%d",
                 self._message_count,
                 dict(self._event_type_counts),
                 len(self._unique_asset_ids),
                 len(self._subscribed_set),
                 self._mismatch_count,
                 book_age,
+                stale_count, len(self.books),
+                self._rest_poll_count, self._rest_poll_errors,
             )
             if self._mismatch_samples:
                 log.info("WS_DIAG mismatch samples: %s", self._mismatch_samples[:5])
-            # Check for book staleness
-            if book_age > 120 and self._message_count > 100:
-                log.warning(
-                    "BOOK STALE: no book update in %.0fs despite %d messages — "
-                    "possible schema mismatch or subscription failure",
-                    book_age, self._message_count
-                )
 
     def _handle_book(self, msg: dict, asset_id: str, ts: float):
         """Process book snapshot — update BBO."""
@@ -771,6 +782,105 @@ class PolymarketFeed:
             book.spread = 1.0
         # else: both zero, don't update mid
 
+    # ── REST Book Polling (fallback for illiquid markets) ────────
+
+    async def _ensure_rest_session(self):
+        """Lazily create a shared aiohttp session."""
+        if self._rest_session is None or self._rest_session.closed:
+            self._rest_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+        return self._rest_session
+
+    async def _poll_book_rest(self, token_id: str):
+        """Fetch current orderbook for one token via REST and update BookState."""
+        try:
+            session = await self._ensure_rest_session()
+            url = f"{POLYMARKET_CLOB_BOOK_URL}?token_id={token_id}"
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    self._rest_poll_errors += 1
+                    if resp.status == 429:
+                        log.warning("REST_POLL rate-limited (429) — backing off")
+                        await asyncio.sleep(5.0)
+                    return
+
+                data = await resp.json()
+
+            # Parse exactly like _handle_book
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+            now = time.time()
+
+            if token_id not in self.books:
+                self.books[token_id] = BookState(token_id=token_id)
+
+            book = self.books[token_id]
+
+            if bids:
+                best = max(bids, key=lambda x: float(x.get("price", 0)))
+                book.best_bid = float(best.get("price", 0))
+                book.bid_size = float(best.get("size", 0))
+            else:
+                book.best_bid = 0.0
+                book.bid_size = 0.0
+
+            if asks:
+                best = min(asks, key=lambda x: float(x.get("price", 1)))
+                book.best_ask = float(best.get("price", 1))
+                book.ask_size = float(best.get("size", 0))
+            else:
+                book.best_ask = 0.0
+                book.ask_size = 0.0
+
+            book.timestamp = now
+            self._update_mid(book)
+            self._rest_poll_count += 1
+
+        except asyncio.TimeoutError:
+            self._rest_poll_errors += 1
+        except Exception as e:
+            self._rest_poll_errors += 1
+            log.warning("REST_POLL error for %s…: %s", token_id[:20], e)
+
+    async def run_book_polling(self):
+        """Staggered REST polling loop — keeps BBO fresh for illiquid markets.
+
+        Cycles through all subscribed tokens, polling one every
+        (BOOK_REST_POLL_INTERVAL_S / num_tokens) seconds so that each
+        token is refreshed approximately once per BOOK_REST_POLL_INTERVAL_S.
+        """
+        if not BOOK_REST_ENABLED:
+            log.info("REST book polling DISABLED by config")
+            return
+
+        log.info("REST book polling starting (interval=%ds per token)",
+                 BOOK_REST_POLL_INTERVAL_S)
+
+        # Wait for WS to connect and tokens to be set
+        while not self._token_ids and not self._shutdown:
+            await asyncio.sleep(2.0)
+
+        while not self._shutdown:
+            tokens = list(self._token_ids)  # snapshot
+            if not tokens:
+                await asyncio.sleep(5.0)
+                continue
+
+            # Stagger: sleep_per_token ensures full cycle ≈ BOOK_REST_POLL_INTERVAL_S
+            sleep_per_token = max(0.3, BOOK_REST_POLL_INTERVAL_S / len(tokens))
+
+            for token_id in tokens:
+                if self._shutdown:
+                    break
+                await self._poll_book_rest(token_id)
+                await asyncio.sleep(sleep_per_token)
+
+    async def _close_rest_session(self):
+        """Clean up the aiohttp session."""
+        if self._rest_session and not self._rest_session.closed:
+            await self._rest_session.close()
+
     async def run(self):
         """Main WS loop with reconnection."""
         log.info("polymarket WS feed starting")
@@ -832,6 +942,7 @@ class PolymarketFeed:
         self._shutdown = True
         if self._ws:
             await self._ws.close()
+        await self._close_rest_session()
 
     @property
     def is_connected(self) -> bool:

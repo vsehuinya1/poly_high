@@ -40,6 +40,12 @@ SCORE_POLL_INTERVAL_S = 30       # poll live scores every 30s
 POLYMARKET_SNAPSHOT_S = 5        # record Polymarket book state every 5s
 DISCOVERY_INTERVAL_S  = 300      # re-scan for new markets every 5 min
 
+# ── REST Polling Fallback (BBO freshness) ────────────────────────
+BOOK_REST_ENABLED       = True   # enable REST polling for stale books
+BOOK_REST_POLL_INTERVAL_S = 12   # seconds between polls per token (staggered)
+BOOK_REST_STALE_LOG_S   = 60     # log warning when token is stale for this long
+POLYMARKET_CLOB_BOOK_URL = "https://clob.polymarket.com/book"
+
 # ── Paper Trading Parameters ─────────────────────────────────────────
 ENTRY_EDGE_THRESHOLD  = 0.05     # min 5 cent edge to enter
 EXIT_CONVERGENCE      = 0.01     # exit when edge < 1 cent
