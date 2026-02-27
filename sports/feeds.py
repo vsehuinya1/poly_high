@@ -810,8 +810,7 @@ class PolymarketFeed:
                             await self._handle_message(raw)
                         except asyncio.TimeoutError:
                             try:
-                                pong = await ws.ping()
-                                await asyncio.wait_for(pong, timeout=10)
+                                await asyncio.wait_for(ws.ping(), timeout=10)
                             except Exception:
                                 log.warning("ping failed, reconnecting")
                                 break
