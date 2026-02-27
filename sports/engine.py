@@ -516,11 +516,11 @@ class SignalEngine:
                          direction, outcome, edge, model_p, market_mid,
                          game_state_str)
 
-                # Telegram alert for edge signals
-                await self.tg.notify_edge_signal(
-                    direction, outcome, edge, model_p, market_mid,
-                    game_state_str, link.polymarket_title,
-                )
+                # Telegram alert for edge signals — DISABLED due to spam/rate limits
+                # await self.tg.notify_edge_signal(
+                #     direction, outcome, edge, model_p, market_mid,
+                #     game_state_str, link.polymarket_title,
+                # )
 
         # ── Deduplicate signals (only best edge per game) ────────
         if signals:
