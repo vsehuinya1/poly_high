@@ -18,8 +18,9 @@ from sports.config import (
     ENTRY_EDGE_THRESHOLD, EXIT_CONVERGENCE,
     MAX_POSITION_PER_MARKET, MAX_CONCURRENT_POSITIONS, MAX_DAILY_LOSS,
     DATA_DIR,
-    # Execution hygiene (v1.4)
+    # Execution hygiene (v3.3 — audit-derived)
     PRICE_BAND_LO, PRICE_BAND_HI, MAX_SPREAD, MAX_BOOK_AGE_S, MAX_SCORE_DIFF,
+    MAX_ELAPSED_PCT, MAX_POS_PER_GAME,
     GATE_FRESH_THRESHOLD, GATE_STREAK_S, GATE_ROLLING_WINDOW_S, GATE_ROLLING_FRESH_PCT,
     FREEZE_STALE_THRESHOLD, FREEZE_STALE_DURATION_S, UNFREEZE_STREAK_S,
     COOLDOWN_S, PER_GAME_STOP,
@@ -554,6 +555,12 @@ class SignalEngine:
             if p.is_open and p.token_id == signal.token_id:
                 return
 
+        # ── Per-game position limit (v3.3) ────────────────────────
+        game_open = sum(1 for p in self.positions.values()
+                        if p.is_open and p.game_id == signal.game_id)
+        if game_open >= MAX_POS_PER_GAME:
+            return
+
         book = books.get(signal.token_id)
         if not book:
             return
@@ -578,11 +585,22 @@ class SignalEngine:
         if adj_sec > 600:
             return
 
-        # Edge threshold
-        if abs(signal.edge) < 0.07:
+        # Time gate v3.3: block entries past MAX_ELAPSED_PCT of game
+        elapsed_pct = game_state.elapsed_minutes / game_state.total_minutes if game_state.total_minutes > 0 else 1.0
+        if elapsed_pct > MAX_ELAPSED_PCT:
+            log.info(
+                "REJECT TIME_GATE | %s | elapsed=%.0f/%.0fmin (%.0f%%) > %.0f%%",
+                signal.game_state, game_state.elapsed_minutes,
+                game_state.total_minutes, elapsed_pct * 100,
+                MAX_ELAPSED_PCT * 100,
+            )
             return
 
-        # 1. Hard entry filters
+        # Edge threshold (raised from 0.07 → 0.10 in v3.3)
+        if abs(signal.edge) < 0.10:
+            return
+
+        # 1. Hard entry filters — on MARKET MID
         if not (PRICE_BAND_LO <= signal.market_prob <= PRICE_BAND_HI):
             gts.band_rejects += 1
             log.info(
@@ -619,6 +637,15 @@ class SignalEngine:
             entry_price = book.best_ask if book.best_ask > 0 else signal.market_prob
         else:
             entry_price = book.best_bid if book.best_bid > 0 else signal.market_prob
+
+        # Entry price gate v3.3: gate on ACTUAL execution price, not mid
+        if not (PRICE_BAND_LO <= entry_price <= PRICE_BAND_HI):
+            log.info(
+                "REJECT ENTRY_PRICE | %s | entry=%.3f mid=%.3f | band=[%.2f,%.2f]",
+                signal.game_state, entry_price, signal.market_prob,
+                PRICE_BAND_LO, PRICE_BAND_HI,
+            )
+            return
 
         # ── Size Calculation ──────────────────────────────────────
         # size = abs(edge) * 1000, clamped [50, 300]

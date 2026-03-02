@@ -53,13 +53,15 @@ MAX_POSITION_PER_MARKET = 500.0  # max $500 per market
 MAX_CONCURRENT_POSITIONS = 10
 MAX_DAILY_LOSS        = 1000.0   # kill-switch
 
-# ── Execution Hygiene (v1.4) ─────────────────────────────────────────
+# ── Execution Hygiene (v3.3 — audit-derived) ────────────────────────
 # Hard entry filters
-PRICE_BAND_LO         = 0.15     # mid must be >= this
-PRICE_BAND_HI         = 0.70     # mid must be <= this
-MAX_SPREAD            = 0.08     # spread must be <= this
+PRICE_BAND_LO         = 0.20     # entry price must be >= this (was 0.15)
+PRICE_BAND_HI         = 0.65     # entry price must be <= this (was 0.70)
+MAX_SPREAD            = 0.06     # spread must be <= this (was 0.08)
 MAX_BOOK_AGE_S        = 20.0     # book_age must be <= this
 MAX_SCORE_DIFF        = 15       # |home - away| must be <= this
+MAX_ELAPSED_PCT       = 0.75     # block entries past 75% of game (min 36 NBA, min 67 football)
+MAX_POS_PER_GAME      = 1        # max 1 open position per game at any time
 
 # Game activation gate
 GATE_FRESH_THRESHOLD  = 30.0     # book_age <= this to count as "fresh" for gate
