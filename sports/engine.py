@@ -18,9 +18,11 @@ from sports.config import (
     ENTRY_EDGE_THRESHOLD, EXIT_CONVERGENCE,
     MAX_POSITION_PER_MARKET, MAX_CONCURRENT_POSITIONS, MAX_DAILY_LOSS,
     DATA_DIR,
-    # Execution hygiene (v3.3 — audit-derived)
+    # Execution hygiene (v3.4 — controlled participation)
     PRICE_BAND_LO, PRICE_BAND_HI, MAX_SPREAD, MAX_BOOK_AGE_S, MAX_SCORE_DIFF,
-    MAX_ELAPSED_PCT, MAX_POS_PER_GAME,
+    EDGE_TRADE_THRESHOLD, MAX_ELAPSED_PCT,
+    LATE_GAME_HARD_STOP_NBA, LATE_GAME_HARD_STOP_FB,
+    MAX_POS_PER_DIRECTION,
     GATE_FRESH_THRESHOLD, GATE_STREAK_S, GATE_ROLLING_WINDOW_S, GATE_ROLLING_FRESH_PCT,
     FREEZE_STALE_THRESHOLD, FREEZE_STALE_DURATION_S, UNFREEZE_STREAK_S,
     COOLDOWN_S, PER_GAME_STOP,
@@ -201,6 +203,9 @@ class GameTradeState:
         self.last_exit_time: float = 0.0
         self.band_rejects: int = 0
 
+        # Per-direction tracking (v3.4)
+        self._last_exit_time_by_dir: dict[str, float] = {}  # {"BUY": ts, "SELL": ts}
+
         # Gate tracking
         self._fresh_streak_start: float = 0.0  # when current fresh streak began
         self._rolling_ticks: deque = deque()    # (timestamp, is_fresh_20s) pairs
@@ -208,6 +213,17 @@ class GameTradeState:
         # Freeze tracking
         self._stale_streak_start: float = 0.0   # when current stale streak began
         self._unfreeze_fresh_start: float = 0.0 # when fresh streak began during freeze
+
+    def record_direction_exit(self, direction: str, now: float):
+        """Record exit time for a specific direction (for per-direction cooldown)."""
+        self._last_exit_time_by_dir[direction] = now
+
+    def direction_cooldown_remaining(self, direction: str, now: float) -> float:
+        """Seconds remaining on cooldown for a specific direction."""
+        last = self._last_exit_time_by_dir.get(direction, 0)
+        if last == 0:
+            return 0
+        return max(0, COOLDOWN_S - (now - last))
 
     def update_gate(self, book_age: float, now: float) -> str | None:
         """Update game activation gate. Returns state transition or None."""
@@ -335,10 +351,53 @@ class SignalEngine:
         self._last_states: dict[str, GameState] = {}
         self._game_states: dict[str, GameTradeState] = {}  # per-game hygiene
 
+        # Block counters (v3.4 — daily summary stats)
+        self._blocks = {
+            "BLOCK_PRICE": 0,
+            "BLOCK_EDGE": 0,
+            "BLOCK_SPREAD": 0,
+            "BLOCK_TIME": 0,
+            "BLOCK_POSITION_LIMIT": 0,
+            "BLOCK_COOLDOWN": 0,
+            "BLOCK_BOOK_AGE": 0,
+            "BLOCK_SCORE_DIFF": 0,
+        }
+        self._trades_taken = 0
+        self._last_summary_ts = 0.0
+
     def _get_game_state(self, game_id: str) -> GameTradeState:
         if game_id not in self._game_states:
             self._game_states[game_id] = GameTradeState(game_id)
         return self._game_states[game_id]
+
+    def log_daily_summary(self):
+        """Log daily block/trade summary stats."""
+        now = time.time()
+        if now - self._last_summary_ts < 300:  # every 5 min
+            return
+        self._last_summary_ts = now
+        total_blocked = sum(self._blocks.values())
+        if total_blocked == 0 and self._trades_taken == 0:
+            return
+
+        # Per-game trade counts
+        game_trades = {}
+        for p in self.positions.values():
+            game_trades[p.game_id] = game_trades.get(p.game_id, 0) + 1
+
+        # Avg entry price and edge of taken trades
+        taken = [p for p in self.positions.values()]
+        avg_price = sum(p.entry_price for p in taken) / len(taken) if taken else 0
+        avg_edge = sum(abs(p.entry_edge) for p in taken) / len(taken) if taken else 0
+
+        log.info(
+            "DAILY_SUMMARY | taken=%d | blocked=%d | %s | "
+            "games=%s | avg_price=%.3f avg_edge=%.3f",
+            self._trades_taken, total_blocked,
+            " ".join(f"{k}={v}" for k, v in self._blocks.items() if v > 0),
+            dict(game_trades) if game_trades else "{}",
+            avg_price, avg_edge,
+        )
 
     def register_link(self, link: GameMarketLink):
         self.links[link.polymarket_event_id] = link
@@ -551,15 +610,10 @@ class SignalEngine:
         if open_count >= MAX_CONCURRENT_POSITIONS:
             return
 
+        # Duplicate token check
         for p in self.positions.values():
             if p.is_open and p.token_id == signal.token_id:
                 return
-
-        # ── Per-game position limit (v3.3) ────────────────────────
-        game_open = sum(1 for p in self.positions.values()
-                        if p.is_open and p.game_id == signal.game_id)
-        if game_open >= MAX_POS_PER_GAME:
-            return
 
         book = books.get(signal.token_id)
         if not book:
@@ -571,9 +625,11 @@ class SignalEngine:
             return
 
         gts = self._get_game_state(link.game_id)
+        gs_str = signal.game_state  # for log messages
 
         # ══════════════════════════════════════════════════════════
-        # EXECUTION HYGIENE — all must pass
+        # CONTROLLED PARTICIPATION GATES (v3.4)
+        # Each gate logs its block reason for daily summary.
         # ══════════════════════════════════════════════════════════
 
         elapsed = now - game_state.timestamp
@@ -581,71 +637,96 @@ class SignalEngine:
         book_age = now - book.timestamp if book.timestamp > 0 else 9999
         score_diff = abs(game_state.home_score - game_state.away_score)
 
-        # Original time gate
+        # 0. Game must have started (adj_sec < 600 = within 10min of last update)
         if adj_sec > 600:
             return
 
-        # Time gate v3.3: block entries past MAX_ELAPSED_PCT of game
+        # 1. BLOCK_TIME — late-game hard stop + percentage gate
+        hard_stop = LATE_GAME_HARD_STOP_NBA if game_state.sport == "nba" else LATE_GAME_HARD_STOP_FB
+        if game_state.elapsed_minutes > hard_stop:
+            self._blocks["BLOCK_TIME"] += 1
+            log.info("BLOCK_TIME | %s | min=%.0f > hard_stop=%.0f",
+                     gs_str, game_state.elapsed_minutes, hard_stop)
+            return
         elapsed_pct = game_state.elapsed_minutes / game_state.total_minutes if game_state.total_minutes > 0 else 1.0
         if elapsed_pct > MAX_ELAPSED_PCT:
-            log.info(
-                "REJECT TIME_GATE | %s | elapsed=%.0f/%.0fmin (%.0f%%) > %.0f%%",
-                signal.game_state, game_state.elapsed_minutes,
-                game_state.total_minutes, elapsed_pct * 100,
-                MAX_ELAPSED_PCT * 100,
-            )
+            self._blocks["BLOCK_TIME"] += 1
+            log.info("BLOCK_TIME | %s | elapsed=%.0f%% > %.0f%%",
+                     gs_str, elapsed_pct * 100, MAX_ELAPSED_PCT * 100)
             return
 
-        # Edge threshold (raised from 0.07 → 0.10 in v3.3)
-        if abs(signal.edge) < 0.10:
+        # 2. BLOCK_EDGE
+        if abs(signal.edge) < EDGE_TRADE_THRESHOLD:
+            self._blocks["BLOCK_EDGE"] += 1
             return
 
-        # 1. Hard entry filters — on MARKET MID
+        # 3. BLOCK_PRICE — on market mid
         if not (PRICE_BAND_LO <= signal.market_prob <= PRICE_BAND_HI):
-            gts.band_rejects += 1
-            log.info(
-                "REJECT PRICE_BAND | %s | price=%.3f | model=%.3f | edge=%.3f",
-                signal.game_state, signal.market_prob,
-                signal.model_prob, signal.edge,
-            )
-            return
-        if book.spread > MAX_SPREAD:
-            return
-        if book_age > MAX_BOOK_AGE_S:
-            return
-        if score_diff > MAX_SCORE_DIFF:
+            self._blocks["BLOCK_PRICE"] += 1
+            log.info("BLOCK_PRICE | %s | mid=%.3f | band=[%.2f,%.2f]",
+                     gs_str, signal.market_prob, PRICE_BAND_LO, PRICE_BAND_HI)
             return
 
-        # 2. Game must be ACTIVE (gate passed)
+        # 4. BLOCK_SPREAD
+        if book.spread > MAX_SPREAD:
+            self._blocks["BLOCK_SPREAD"] += 1
+            log.info("BLOCK_SPREAD | %s | spread=%.3f > %.3f",
+                     gs_str, book.spread, MAX_SPREAD)
+            return
+
+        # 5. BLOCK_BOOK_AGE
+        if book_age > MAX_BOOK_AGE_S:
+            self._blocks["BLOCK_BOOK_AGE"] += 1
+            return
+
+        # 6. BLOCK_SCORE_DIFF
+        if score_diff > MAX_SCORE_DIFF:
+            self._blocks["BLOCK_SCORE_DIFF"] += 1
+            return
+
+        # 7. Game must be ACTIVE (gate passed)
         if not gts.can_trade:
             return
-
-        # 3. Not frozen
         if gts.status == GameStatus.FROZEN:
-            return  # covered by can_trade but explicit for clarity
-
-        # 4. Cooldown
-        cd = gts.cooldown_remaining(now)
-        if cd > 0:
             return
 
-        # 5. Per-game stop
+        # 8. BLOCK_POSITION_LIMIT — 1 per direction per game
+        dir_open = sum(1 for p in self.positions.values()
+                       if p.is_open and p.game_id == signal.game_id
+                       and p.direction == signal.direction)
+        if dir_open >= MAX_POS_PER_DIRECTION:
+            self._blocks["BLOCK_POSITION_LIMIT"] += 1
+            log.info("BLOCK_POSITION_LIMIT | %s | %s already open in game %s",
+                     gs_str, signal.direction, signal.game_id)
+            return
+
+        # 9. BLOCK_COOLDOWN — per-direction cooldown after close
+        dir_cd = gts.direction_cooldown_remaining(signal.direction, now)
+        if dir_cd > 0:
+            self._blocks["BLOCK_COOLDOWN"] += 1
+            log.info("BLOCK_COOLDOWN | %s | %s cooldown %.0fs remaining",
+                     gs_str, signal.direction, dir_cd)
+            return
+
+        # 10. Per-game stop
         if gts.status == GameStatus.STOPPED:
             return
 
+        # ── Determine execution price ─────────────────────────────
         if signal.direction == "BUY":
             entry_price = book.best_ask if book.best_ask > 0 else signal.market_prob
         else:
             entry_price = book.best_bid if book.best_bid > 0 else signal.market_prob
 
-        # Entry price gate v3.3: gate on ACTUAL execution price, not mid
+        # 11. BLOCK_PRICE on ACTUAL execution price
         if not (PRICE_BAND_LO <= entry_price <= PRICE_BAND_HI):
-            log.info(
-                "REJECT ENTRY_PRICE | %s | entry=%.3f mid=%.3f | band=[%.2f,%.2f]",
-                signal.game_state, entry_price, signal.market_prob,
-                PRICE_BAND_LO, PRICE_BAND_HI,
-            )
+            self._blocks["BLOCK_PRICE"] += 1
+            log.info("BLOCK_PRICE | %s | entry=%.3f (actual) outside [%.2f,%.2f]",
+                     gs_str, entry_price, PRICE_BAND_LO, PRICE_BAND_HI)
             return
+
+        # ── Log daily summary periodically ────────────────────────
+        self.log_daily_summary()
 
         # ── Size Calculation ──────────────────────────────────────
         # size = abs(edge) * 1000, clamped [50, 300]
@@ -669,6 +750,7 @@ class SignalEngine:
 
         self.positions[pos.position_id] = pos
         self.csv.log_trade(pos, "ENTRY")
+        self._trades_taken += 1
 
         log.info("PAPER ENTRY: %s %s %s @ %.3f ($%.0f) edge=%.3f | %s",
                  pos.position_id, pos.direction, pos.outcome,
@@ -743,6 +825,7 @@ class SignalEngine:
                 # Per-game PnL + cooldown tracking
                 gts = self._get_game_state(game_state.game_id)
                 stop_transition = gts.record_exit(pnl, time.time())
+                gts.record_direction_exit(pos.direction, time.time())  # v3.4 per-direction cooldown
                 if stop_transition:
                     log.info("%s: %s (pnl=$%.2f, game_id=%s)",
                              stop_transition, link.polymarket_title,
