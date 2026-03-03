@@ -1,0 +1,191 @@
+"""
+Strategy B — Inflection Sniping for Tennis.
+
+Two structural triggers that exploit market microstructure inefficiencies
+during high-leverage tennis moments:
+    Trigger 1: Panic Discount — break point with favorite serving
+    Trigger 2: Set Mean Reversion — favorite down 0-1 in sets
+
+No ML. Pure structural signals based on Markov fair value vs market.
+"""
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+from tennis.state import TennisState, TennisModelOutput, compute_momentum_delta
+from tennis.model import get_win_prob
+
+log = logging.getLogger("tennis.strategy")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Signal Object
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class TennisSignal:
+    """Detected edge signal from a Strategy B trigger."""
+    timestamp: float
+    match_id: str
+    trigger_type: str              # "PANIC_DISCOUNT" | "SET_MEAN_REVERSION"
+    edge: float                    # fair_price - market_price (positive = underpriced)
+    fair_price: float
+    market_price: float
+    state_snapshot: TennisState
+    model_output: TennisModelOutput
+    momentum_delta: float = 0.0
+
+    def __str__(self) -> str:
+        return (
+            f"TENNIS_SIGNAL {self.trigger_type} | "
+            f"edge={self.edge:+.4f} fair={self.fair_price:.4f} "
+            f"mkt={self.market_price:.4f} | "
+            f"{self.state_snapshot}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Strategy B Engine
+# ═══════════════════════════════════════════════════════════════════════
+
+class InflectionStrategy:
+    """Scans TennisState for Strategy B inflection triggers.
+
+    Stateless — does not track positions or execution.
+    Only produces signals; execution gating is handled separately.
+
+    Args:
+        panic_edge_threshold:     Minimum edge for Trigger 1.
+        reversion_edge_threshold: Minimum edge for Trigger 2.
+    """
+
+    def __init__(self, panic_edge_threshold: float = 0.06,
+                 reversion_edge_threshold: float = 0.05):
+        self.panic_edge = panic_edge_threshold
+        self.reversion_edge = reversion_edge_threshold
+
+    def evaluate(self, state: TennisState,
+                 market_price: float) -> Optional[TennisSignal]:
+        """Evaluate both triggers against current state.
+
+        Args:
+            state:        Current match state snapshot.
+            market_price: Current Polymarket price for the pre-game favorite.
+
+        Returns:
+            TennisSignal if a trigger fires, else None.
+        """
+        if market_price <= 0 or market_price >= 1:
+            return None
+
+        model = get_win_prob(state)
+
+        # Determine fair price for the pre-game favorite
+        if state.pregame_favorite_id == state.player_a_id:
+            fair_fav = model.p_a
+        else:
+            fair_fav = model.p_b
+
+        momentum = compute_momentum_delta(state)
+
+        # ── Trigger 1: Panic Discount ─────────────────────────────
+        sig = self._check_panic_discount(state, fair_fav, market_price,
+                                          model, momentum)
+        if sig is not None:
+            return sig
+
+        # ── Trigger 2: Set Mean Reversion ─────────────────────────
+        sig = self._check_set_mean_reversion(state, fair_fav, market_price,
+                                              model, momentum)
+        if sig is not None:
+            return sig
+
+        return None
+
+    def _check_panic_discount(self, state: TennisState,
+                               fair_fav: float, market_price: float,
+                               model: TennisModelOutput,
+                               momentum: float) -> Optional[TennisSignal]:
+        """Trigger 1: Panic Discount.
+
+        Fires when:
+            1. It's a break point (returner can win the game).
+            2. The server IS the pre-game favorite.
+            3. The market underprices the favorite beyond threshold.
+
+        Reasoning:
+            Markets over-react to break points against favorites.
+            The structural probability of holding serve from break point
+            is still substantial (~36% even at 30-40), and the match-win
+            impact is less than the market typically prices.
+        """
+        if not state.is_break_point:
+            return None
+
+        if not state.favorite_is_serving:
+            return None
+
+        edge = fair_fav - market_price
+        if edge < self.panic_edge:
+            return None
+
+        log.info("PANIC_DISCOUNT triggered | edge=%.4f fair=%.4f mkt=%.4f | %s",
+                 edge, fair_fav, market_price, state)
+
+        return TennisSignal(
+            timestamp=time.time(),
+            match_id=state.match_id,
+            trigger_type="PANIC_DISCOUNT",
+            edge=edge,
+            fair_price=fair_fav,
+            market_price=market_price,
+            state_snapshot=state,
+            model_output=model,
+            momentum_delta=momentum,
+        )
+
+    def _check_set_mean_reversion(self, state: TennisState,
+                                   fair_fav: float, market_price: float,
+                                   model: TennisModelOutput,
+                                   momentum: float) -> Optional[TennisSignal]:
+        """Trigger 2: Set Mean Reversion.
+
+        Fires when:
+            1. The pre-game favorite is down 0-1 in sets.
+            2. Not currently in a tiebreak.
+            3. Fair value > market price by threshold.
+
+        Reasoning:
+            Losing the first set often causes >15% market drop for the
+            favorite, but structural match-win probability for a strong
+            server is typically only ~8-12% lower after losing set 1.
+            The market over-adjusts.
+        """
+        if state.is_tiebreak:
+            return None
+
+        # Favorite must be down exactly 0-1
+        if state.favorite_sets != 0 or state.underdog_sets != 1:
+            return None
+
+        edge = fair_fav - market_price
+        if edge < self.reversion_edge:
+            return None
+
+        log.info("SET_MEAN_REVERSION triggered | edge=%.4f fair=%.4f mkt=%.4f | %s",
+                 edge, fair_fav, market_price, state)
+
+        return TennisSignal(
+            timestamp=time.time(),
+            match_id=state.match_id,
+            trigger_type="SET_MEAN_REVERSION",
+            edge=edge,
+            fair_price=fair_fav,
+            market_price=market_price,
+            state_snapshot=state,
+            model_output=model,
+            momentum_delta=momentum,
+        )

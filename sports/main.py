@@ -2,7 +2,7 @@
 """
 Sports Market Orchestrator — main entry point.
 
-Connects game feeds (API-Football, NBA) with Polymarket WebSocket,
+Connects game feeds (API-Football, NBA, Tennis) with Polymarket WebSocket,
 runs fair value models in real-time, detects edges, paper trades.
 
 Usage:
@@ -31,6 +31,19 @@ from sports.discovery import discover_sports_markets, SportMarket
 from sports.feeds import FootballFeed, NBAFeed, PolymarketFeed, GameState
 from sports.engine import SignalEngine, GameMarketLink
 from sports.models import invert_1x2_to_lambdas
+
+# Tennis engine imports
+from tennis.state import TennisState, PointScore, update_from_point, compute_momentum_delta
+from tennis.model import get_win_prob as tennis_get_win_prob
+from tennis.strategy import InflectionStrategy, TennisSignal
+from tennis.execution import TennisExecutionGuard
+from tennis.logger import TennisCSVLogger
+from tennis.feeds import FlashscoreFeed
+from sports.config import (
+    TENNIS_PANIC_EDGE, TENNIS_REVERSION_EDGE,
+    TENNIS_PRICE_CAP, TENNIS_STALENESS_S, TENNIS_COOLDOWN_S,
+    TENNIS_FEED_POLL_S,
+)
 
 log = logging.getLogger("sports.main")
 
@@ -312,6 +325,22 @@ class SportsOrchestrator:
         self._shutdown = False
         self._session: aiohttp.ClientSession | None = None
 
+        # ── Tennis Engine ─────────────────────────────────────────
+        self.tennis_strategy = InflectionStrategy(
+            panic_edge_threshold=TENNIS_PANIC_EDGE,
+            reversion_edge_threshold=TENNIS_REVERSION_EDGE,
+        )
+        self.tennis_guard = TennisExecutionGuard(
+            price_cap=TENNIS_PRICE_CAP,
+            staleness_s=TENNIS_STALENESS_S,
+            cooldown_s=TENNIS_COOLDOWN_S,
+        )
+        self.tennis_logger = TennisCSVLogger(DATA_DIR)
+        self.tennis_feed = FlashscoreFeed(poll_interval_s=TENNIS_FEED_POLL_S)
+        self.tennis_markets: list[SportMarket] = []  # discovered tennis markets
+        self.tennis_links: dict[str, GameMarketLink] = {}  # match_id → link
+        self.tennis_states: dict[str, TennisState] = {}  # match_id → latest state
+
     async def discover(self) -> list[SportMarket]:
         """Discover active sports markets on Polymarket."""
         log.info("discovering sports markets on Polymarket...")
@@ -379,7 +408,61 @@ class SportsOrchestrator:
                 self.links[game_id] = link
                 self.engine.register_link(link)
 
-        log.info("matched %d games to Polymarket markets", len(self.links))
+        # ── Tennis market links ───────────────────────────────────
+        self.tennis_markets = [m for m in self.markets if m.sport == "tennis"]
+        for tm in self.tennis_markets:
+            if tm.event_id in self.tennis_links:
+                continue  # already linked
+            # For tennis, home_team = player A, away_team = player B
+            home_tid = ""
+            away_tid = ""
+            all_tids = []
+            for o in tm.outcomes:
+                all_tids.append(o.token_id)
+                if not home_tid:
+                    home_tid = o.token_id
+                elif not away_tid:
+                    away_tid = o.token_id
+
+            # Extract pre-game probs
+            pregame_a = tm.outcomes[0].last_price if tm.outcomes else 0.5
+            pregame_b = tm.outcomes[1].last_price if len(tm.outcomes) > 1 else 0.5
+
+            link = GameMarketLink(
+                game_id=tm.event_id,
+                sport="tennis",
+                league=tm.league,
+                home_team=tm.home_team or (tm.outcomes[0].outcome_label if tm.outcomes else "Player A"),
+                away_team=tm.away_team or (tm.outcomes[1].outcome_label if len(tm.outcomes) > 1 else "Player B"),
+                polymarket_event_id=tm.event_id,
+                polymarket_title=tm.title,
+                polymarket_slug=tm.slug,
+                home_token_id=home_tid,
+                away_token_id=away_tid,
+                all_token_ids=all_tids,
+                pregame_home_prob=pregame_a,
+                pregame_away_prob=pregame_b,
+            )
+            self.tennis_links[tm.event_id] = link
+
+            # Initialize TennisState for this match
+            fav_id = "player_a" if pregame_a >= pregame_b else "player_b"
+            self.tennis_states[tm.event_id] = TennisState(
+                match_id=tm.event_id,
+                player_a_id="player_a",
+                player_b_id="player_b",
+                server_id="player_a",  # default, updated by feed
+                receiver_id="player_b",
+                pregame_favorite_id=fav_id,
+                timestamp=time.time(),
+            )
+
+            log.info("TENNIS LINK: %s | %s vs %s | pre=%.3f/%.3f | tokens=%d",
+                     tm.title, link.home_team, link.away_team,
+                     pregame_a, pregame_b, len(all_tids))
+
+        log.info("matched %d games + %d tennis matches to Polymarket markets",
+                 len(self.links), len(self.tennis_links))
 
         # Collect token IDs for WS subscription — ONLY matched game tokens.
         # Do NOT subscribe to all discovered market tokens: non-moneyline
@@ -387,9 +470,12 @@ class SportsOrchestrator:
         all_tokens = []
         for link in self.links.values():
             all_tokens.extend(link.all_token_ids)
+        # Tennis tokens too
+        for link in self.tennis_links.values():
+            all_tokens.extend(link.all_token_ids)
 
         log.info("subscribing to %d token IDs for %d matched games on Polymarket WS",
-                 len(all_tokens), len(self.links))
+                 len(all_tokens), len(self.links) + len(self.tennis_links))
         self.poly_feed.set_tokens(all_tokens)
 
     async def _score_polling_loop(self):
@@ -451,6 +537,62 @@ class SportsOrchestrator:
 
             await asyncio.sleep(POLYMARKET_SNAPSHOT_S)
 
+    async def _tennis_signal_loop(self):
+        """Tennis Strategy B signal processing — runs on every tick."""
+        while not self._shutdown:
+            try:
+                for match_id, link in list(self.tennis_links.items()):
+                    state = self.tennis_states.get(match_id)
+                    if not state:
+                        continue
+
+                    # Get current market price for the favorite
+                    fav_token = link.home_token_id if state.pregame_favorite_id == "player_a" else link.away_token_id
+                    fav_book = self.poly_feed.books.get(fav_token)
+                    if not fav_book or fav_book.mid <= 0:
+                        continue
+
+                    market_price = fav_book.mid
+
+                    # Run Strategy B evaluation
+                    signal = self.tennis_strategy.evaluate(state, market_price)
+                    if signal is None:
+                        continue
+
+                    # Log signal
+                    self.tennis_logger.log_signal(signal)
+                    log.info("TENNIS %s", signal)
+
+                    # Check execution guards
+                    decision = self.tennis_guard.can_execute(signal, state)
+                    if not decision.can_execute:
+                        log.info("TENNIS %s | %s", decision.reason, match_id)
+                        continue
+
+                    # Paper trade: log entry
+                    self.tennis_guard.record_entry(match_id)
+                    self.tennis_logger.log_trade_entry(signal, market_price_at_bp=market_price)
+                    log.info("TENNIS PAPER ENTRY | %s | edge=%.4f | mkt=%.4f | %s",
+                             signal.trigger_type, signal.edge, market_price, state)
+
+                    # Telegram alert
+                    try:
+                        await self.engine.tg.send(
+                            f"🎾 <b>Tennis Signal</b>\n"
+                            f"Trigger: {signal.trigger_type}\n"
+                            f"Edge: {signal.edge:+.4f}\n"
+                            f"Fair: {signal.fair_price:.4f} | Mkt: {market_price:.4f}\n"
+                            f"Match: {link.polymarket_title}\n"
+                            f"Score: {state}"
+                        )
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                log.error("tennis signal loop error: %s", e)
+
+            await asyncio.sleep(POLYMARKET_SNAPSHOT_S)
+
     async def _status_printer_loop(self):
         """Periodically print system status + Telegram updates."""
         tg_interval = 0  # send Telegram every 5th iteration (5 min)
@@ -462,17 +604,18 @@ class SportsOrchestrator:
                 live_nba = sum(
                     1 for g in self.nba_feed.games.values() if g.is_live
                 )
+                live_tennis = len(self.tennis_links)
 
                 summary = self.engine.get_summary()
 
                 log.info(
-                    "STATUS | Football: %d live | NBA: %d live | "
+                    "STATUS | Football: %d live | NBA: %d live | Tennis: %d mkts | "
                     "WS: %s (msgs=%d) | Links: %d | "
                     "Trades: %d (wins=%d, PnL=$%.2f)",
-                    live_football, live_nba,
+                    live_football, live_nba, live_tennis,
                     "OK" if self.poly_feed.is_connected else "DOWN",
                     self.poly_feed.message_count,
-                    len(self.links),
+                    len(self.links) + len(self.tennis_links),
                     summary.get("total_trades", 0),
                     summary.get("wins", 0),
                     summary.get("daily_pnl", 0.0),
@@ -577,6 +720,8 @@ class SportsOrchestrator:
             asyncio.create_task(self._signal_processing_loop(), name="signal_processing"),
             asyncio.create_task(self._status_printer_loop(), name="status_printer"),
             asyncio.create_task(self._rematching_loop(), name="rematching"),
+            # Tennis
+            asyncio.create_task(self._tennis_signal_loop(), name="tennis_signals"),
         ]
 
         # Graceful shutdown handler
@@ -596,6 +741,8 @@ class SportsOrchestrator:
         log.info("shutting down...")
         self._shutdown = True
         await self.poly_feed.shutdown()
+        await self.tennis_feed.shutdown()
+        self.tennis_logger.close()
 
         # Print final summary
         summary = self.engine.get_summary()
@@ -607,6 +754,7 @@ class SportsOrchestrator:
                 log.info("  %s: %.4f", k, v)
             else:
                 log.info("  %s: %s", k, v)
+        log.info("  Tennis markets monitored: %d", len(self.tennis_links))
         log.info("=" * 60)
 
         await self.engine.close()

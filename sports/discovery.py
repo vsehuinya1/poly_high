@@ -66,6 +66,22 @@ def classify_market(slug: str, title: str) -> tuple[str, str]:
     if "mlb" in s:
         return ("mlb", "MLB")
 
+    # Tennis tours and Grand Slams
+    if "atp-" in s or "atp " in t or "atp tour" in t:
+        return ("tennis", "ATP")
+    if "wta-" in s or "wta " in t or "wta tour" in t:
+        return ("tennis", "WTA")
+    if "australian-open" in s or "australian open" in t:
+        return ("tennis", "Australian Open")
+    if "french-open" in s or "roland garros" in t or "french open" in t:
+        return ("tennis", "French Open")
+    if "wimbledon" in s or "wimbledon" in t:
+        return ("tennis", "Wimbledon")
+    if "us-open" in s and ("tennis" in s or "tennis" in t):
+        return ("tennis", "US Open")
+    if "tennis" in s or "tennis" in t:
+        return ("tennis", "Tennis")
+
     # Football leagues
     if "epl-" in s or "premier-league" in s or "premier league" in t:
         return ("football", "EPL")

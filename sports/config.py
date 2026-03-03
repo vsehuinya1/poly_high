@@ -82,6 +82,17 @@ UNFREEZE_STREAK_S     = 60.0     # fresh streak needed to unfreeze
 COOLDOWN_S            = 300.0    # 5-minute cooldown per game after exit
 PER_GAME_STOP         = 200.0    # max loss per game before stopping
 
+# ── Tennis (Strategy B — Inflection Sniping) ─────────────────────────
+TENNIS_SERVE_WIN_P    = 0.64      # ATP average service point win rate
+TENNIS_PANIC_EDGE     = 0.06      # min edge for panic discount trigger
+TENNIS_REVERSION_EDGE = 0.05      # min edge for set mean reversion trigger
+TENNIS_PRICE_CAP      = 0.85      # no entries above this market price
+TENNIS_STALENESS_S    = 3.0       # max state age for execution
+TENNIS_COOLDOWN_S     = 120.0     # cooldown after position exit (seconds)
+TENNIS_FEED_POLL_S    = 3.0       # feed poll interval (seconds)
+TENNIS_FEED_STALL_S   = 60.0      # feed stall detection threshold
+TENNIS_FEED_HEALTH_S  = 60.0      # feed health log interval
+
 # ── Data Storage ─────────────────────────────────────────────────────
 DATA_DIR = Path(os.getenv("SPORTS_DATA_DIR", "sports_data"))
 LOG_DIR  = Path(os.getenv("LOG_DIR", "logs"))
@@ -96,6 +107,9 @@ SPORTS_SLUG_PATTERNS = [
     "ucl-", "uel-", "uecl-",
     "fifa-", "world-cup",
     "premier-league",
+    # Tennis
+    "tennis", "atp-", "wta-",
+    "australian-open", "french-open", "wimbledon", "us-open",
 ]
 
 # Polymarket slug team abbreviation → full name mapping
