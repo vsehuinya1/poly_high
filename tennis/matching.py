@@ -298,6 +298,23 @@ def extract_players_from_title(title: str) -> tuple[str, str]:
     # Remove "More Markets" suffix
     t = re.sub(r"\s*-?\s*More Markets\s*$", "", t, flags=re.IGNORECASE)
 
+    # Strip tournament prefix: "Brasilia: Player A vs Player B" → "Player A vs Player B"
+    # Only strip if the colon appears BEFORE "vs"
+    vs_pos = re.search(r"\bvs\.?\b|\bv\b", t, flags=re.IGNORECASE)
+    if vs_pos and ":" in t[:vs_pos.start()]:
+        last_colon = t[:vs_pos.start()].rfind(":")
+        t = t[last_colon + 1:].strip()
+
+    # Also strip "Qualification:" or similar sub-prefixes
+    if ":" in t:
+        colon_pos = t.find(":")
+        # Only strip if what's before the colon looks like a tournament/round name
+        before = t[:colon_pos].strip().lower()
+        round_keywords = ["qualification", "qualifying", "round", "final", "semifinal",
+                          "quarterfinal", "r1", "r2", "r3", "r4", "q1", "q2", "q3"]
+        if any(kw in before for kw in round_keywords):
+            t = t[colon_pos + 1:].strip()
+
     # Split on "vs.", "vs", "v."
     parts = re.split(r"\s+vs\.?\s+|\s+v\s+|\s+v\.\s+", t, maxsplit=1,
                       flags=re.IGNORECASE)
