@@ -235,7 +235,7 @@ async def discover_sports_markets(session: aiohttp.ClientSession) -> list[SportM
                 continue
 
             sport, league = classify_market(slug, title)
-            if sport not in ("nba", "football"):
+            if sport not in ("nba", "football", "tennis"):
                 continue
 
             # Process sub-markets within the event

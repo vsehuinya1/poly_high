@@ -39,6 +39,10 @@ from tennis.strategy import InflectionStrategy, TennisSignal
 from tennis.execution import TennisExecutionGuard
 from tennis.logger import TennisCSVLogger
 from tennis.feeds import FlashscoreFeed
+from tennis.matching import (
+    extract_players_from_title, identify_favorite_from_outcomes,
+    normalize_tennis_name, tennis_name_match_score,
+)
 from sports.config import (
     TENNIS_PANIC_EDGE, TENNIS_REVERSION_EDGE,
     TENNIS_PRICE_CAP, TENNIS_STALENESS_S, TENNIS_COOLDOWN_S,
@@ -413,53 +417,61 @@ class SportsOrchestrator:
         for tm in self.tennis_markets:
             if tm.event_id in self.tennis_links:
                 continue  # already linked
-            # For tennis, home_team = player A, away_team = player B
-            home_tid = ""
-            away_tid = ""
-            all_tids = []
-            for o in tm.outcomes:
-                all_tids.append(o.token_id)
-                if not home_tid:
-                    home_tid = o.token_id
-                elif not away_tid:
-                    away_tid = o.token_id
 
-            # Extract pre-game probs
-            pregame_a = tm.outcomes[0].last_price if tm.outcomes else 0.5
-            pregame_b = tm.outcomes[1].last_price if len(tm.outcomes) > 1 else 0.5
+            # Extract player names from Polymarket title
+            player_a_name, player_b_name = extract_players_from_title(tm.title)
+            if not player_a_name or not player_b_name:
+                log.warning("TENNIS SKIP: could not extract players from '%s'", tm.title)
+                continue
+
+            # Match outcomes to players using name matching
+            all_tids = [o.token_id for o in tm.outcomes]
+            if len(tm.outcomes) >= 2:
+                a_tid, b_tid, price_a, price_b = identify_favorite_from_outcomes(
+                    tm.outcomes, player_a_name, player_b_name
+                )
+            elif len(tm.outcomes) == 1:
+                a_tid = tm.outcomes[0].token_id
+                b_tid = ""
+                price_a = tm.outcomes[0].last_price
+                price_b = 1.0 - price_a
+            else:
+                continue
 
             link = GameMarketLink(
                 game_id=tm.event_id,
                 sport="tennis",
                 league=tm.league,
-                home_team=tm.home_team or (tm.outcomes[0].outcome_label if tm.outcomes else "Player A"),
-                away_team=tm.away_team or (tm.outcomes[1].outcome_label if len(tm.outcomes) > 1 else "Player B"),
+                home_team=player_a_name,
+                away_team=player_b_name,
                 polymarket_event_id=tm.event_id,
                 polymarket_title=tm.title,
                 polymarket_slug=tm.slug,
-                home_token_id=home_tid,
-                away_token_id=away_tid,
+                home_token_id=a_tid,
+                away_token_id=b_tid,
                 all_token_ids=all_tids,
-                pregame_home_prob=pregame_a,
-                pregame_away_prob=pregame_b,
+                pregame_home_prob=price_a,
+                pregame_away_prob=price_b,
             )
             self.tennis_links[tm.event_id] = link
 
-            # Initialize TennisState for this match
-            fav_id = "player_a" if pregame_a >= pregame_b else "player_b"
+            # Determine who is the pre-game favorite
+            fav_id = player_a_name if price_a >= price_b else player_b_name
+
+            # Initialize TennisState with real player names
             self.tennis_states[tm.event_id] = TennisState(
                 match_id=tm.event_id,
-                player_a_id="player_a",
-                player_b_id="player_b",
-                server_id="player_a",  # default, updated by feed
-                receiver_id="player_b",
+                player_a_id=player_a_name,
+                player_b_id=player_b_name,
+                server_id=player_a_name,  # default, updated by feed
+                receiver_id=player_b_name,
                 pregame_favorite_id=fav_id,
                 timestamp=time.time(),
             )
 
-            log.info("TENNIS LINK: %s | %s vs %s | pre=%.3f/%.3f | tokens=%d",
-                     tm.title, link.home_team, link.away_team,
-                     pregame_a, pregame_b, len(all_tids))
+            log.info("TENNIS LINK: %s | %s vs %s | pre=%.3f/%.3f | fav=%s | tokens=%d",
+                     tm.title, player_a_name, player_b_name,
+                     price_a, price_b, fav_id, len(all_tids))
 
         log.info("matched %d games + %d tennis matches to Polymarket markets",
                  len(self.links), len(self.tennis_links))
