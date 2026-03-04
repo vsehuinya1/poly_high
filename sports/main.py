@@ -38,7 +38,7 @@ from tennis.model import get_win_prob as tennis_get_win_prob
 from tennis.strategy import InflectionStrategy, TennisSignal
 from tennis.execution import TennisExecutionGuard
 from tennis.logger import TennisCSVLogger
-from tennis.feeds import FlashscoreFeed
+from tennis.livefeed import TennisScoreFeed, FlashscoreMatch
 from tennis.matching import (
     extract_players_from_title, identify_favorite_from_outcomes,
     normalize_tennis_name, tennis_name_match_score,
@@ -340,10 +340,11 @@ class SportsOrchestrator:
             cooldown_s=TENNIS_COOLDOWN_S,
         )
         self.tennis_logger = TennisCSVLogger(DATA_DIR)
-        self.tennis_feed = FlashscoreFeed(poll_interval_s=TENNIS_FEED_POLL_S)
+        self.tennis_score_feed = TennisScoreFeed(poll_interval_s=TENNIS_FEED_POLL_S)
         self.tennis_markets: list[SportMarket] = []  # discovered tennis markets
         self.tennis_links: dict[str, GameMarketLink] = {}  # match_id → link
         self.tennis_states: dict[str, TennisState] = {}  # match_id → latest state
+        self._tennis_fs_map: dict[str, str] = {}  # poly_event_id → flashscore_match_id
 
     async def discover(self) -> list[SportMarket]:
         """Discover active sports markets on Polymarket."""
@@ -549,6 +550,115 @@ class SportsOrchestrator:
 
             await asyncio.sleep(POLYMARKET_SNAPSHOT_S)
 
+    async def _tennis_score_polling_loop(self):
+        """Poll Flashscore for live tennis scores and update TennisState."""
+        # Wait for initial discovery + link building
+        await asyncio.sleep(5)
+        await self.tennis_score_feed.start()
+        log.info("Tennis score polling started")
+
+        while not self._shutdown:
+            try:
+                count = await self.tennis_score_feed.poll_once()
+
+                # For each Polymarket tennis link, find matching Flashscore match
+                for poly_id, link in list(self.tennis_links.items()):
+                    # Try cached mapping first
+                    fs_id = self._tennis_fs_map.get(poly_id)
+                    fs_match = None
+
+                    if fs_id:
+                        fs_match = self.tennis_score_feed._matches.get(fs_id)
+                    
+                    if not fs_match:
+                        # Fuzzy search by player names
+                        fs_match = self.tennis_score_feed.find_match_by_players(
+                            link.home_team, link.away_team
+                        )
+                        if fs_match:
+                            self._tennis_fs_map[poly_id] = fs_match.match_id
+                            log.info("TENNIS MAP: %s → FS:%s (%s vs %s)",
+                                     link.polymarket_title[:40], fs_match.match_id,
+                                     fs_match.player_a, fs_match.player_b)
+
+                    if not fs_match or not fs_match.is_live:
+                        continue
+
+                    # Update TennisState from Flashscore data
+                    old_state = self.tennis_states.get(poly_id)
+                    if not old_state:
+                        continue
+
+                    # Determine which Flashscore player maps to which Poly player
+                    from tennis.matching import tennis_name_match_score
+                    score_direct = tennis_name_match_score(link.home_team, fs_match.player_a)
+                    score_reversed = tennis_name_match_score(link.home_team, fs_match.player_b)
+                    
+                    if score_direct >= score_reversed:
+                        # Poly A = FS home, Poly B = FS away
+                        sets_a, sets_b = fs_match.sets_a, fs_match.sets_b
+                        games_a, games_b = fs_match.games_a, fs_match.games_b
+                        point_a_raw, point_b_raw = fs_match.point_a, fs_match.point_b
+                        server_id = link.home_team if fs_match.serving == "a" else link.away_team
+                    else:
+                        # Poly A = FS away, Poly B = FS home
+                        sets_a, sets_b = fs_match.sets_b, fs_match.sets_a
+                        games_a, games_b = fs_match.games_b, fs_match.games_a
+                        point_a_raw, point_b_raw = fs_match.point_b, fs_match.point_a
+                        server_id = link.home_team if fs_match.serving == "b" else link.away_team
+
+                    # Map point strings to PointScore enum values
+                    point_map = {"0": PointScore.ZERO, "15": PointScore.FIFTEEN,
+                                 "30": PointScore.THIRTY, "40": PointScore.FORTY,
+                                 "A": PointScore.AD, "AD": PointScore.AD,
+                                 "50": PointScore.AD}
+                    try:
+                        pt_a = point_map.get(str(point_a_raw), PointScore.ZERO)
+                        pt_b = point_map.get(str(point_b_raw), PointScore.ZERO)
+                    except Exception:
+                        pt_a, pt_b = PointScore.ZERO, PointScore.ZERO
+
+                    # Detect tiebreak (both at 6 games)
+                    is_tiebreak = (games_a == 6 and games_b == 6)
+
+                    receiver_id = link.away_team if server_id == link.home_team else link.home_team
+
+                    new_state = TennisState(
+                        match_id=poly_id,
+                        sets_a=sets_a,
+                        sets_b=sets_b,
+                        games_a=games_a,
+                        games_b=games_b,
+                        point_a=pt_a,
+                        point_b=pt_b,
+                        is_tiebreak=is_tiebreak,
+                        player_a_id=old_state.player_a_id,
+                        player_b_id=old_state.player_b_id,
+                        server_id=server_id,
+                        receiver_id=receiver_id,
+                        pregame_favorite_id=old_state.pregame_favorite_id,
+                        timestamp=time.time(),
+                    )
+
+                    # Only log state changes
+                    if (new_state.sets_a != old_state.sets_a or
+                        new_state.sets_b != old_state.sets_b or
+                        new_state.games_a != old_state.games_a or
+                        new_state.games_b != old_state.games_b or
+                        new_state.point_a != old_state.point_a or
+                        new_state.point_b != old_state.point_b):
+                        log.info("TENNIS SCORE: %s | %s [%d-%d] %d-%d (%s-%s) srv=%s",
+                                 link.home_team[:15], link.away_team[:15],
+                                 sets_a, sets_b, games_a, games_b,
+                                 pt_a.value, pt_b.value, server_id[:10])
+
+                    self.tennis_states[poly_id] = new_state
+
+            except Exception as e:
+                log.error("tennis score poll error: %s", e)
+
+            await asyncio.sleep(TENNIS_FEED_POLL_S)
+
     async def _tennis_signal_loop(self):
         """Tennis Strategy B signal processing — runs on every tick."""
         while not self._shutdown:
@@ -558,8 +668,13 @@ class SportsOrchestrator:
                     if not state:
                         continue
 
+                    # Only process live matches (state updated by score feed)
+                    if state.sets_a == 0 and state.sets_b == 0 and state.games_a == 0 and state.games_b == 0:
+                        # State never updated — match not live yet
+                        continue
+
                     # Get current market price for the favorite
-                    fav_token = link.home_token_id if state.pregame_favorite_id == "player_a" else link.away_token_id
+                    fav_token = link.home_token_id if state.pregame_favorite_id == link.home_team else link.away_token_id
                     fav_book = self.poly_feed.books.get(fav_token)
                     if not fav_book or fav_book.mid <= 0:
                         continue
@@ -573,19 +688,22 @@ class SportsOrchestrator:
 
                     # Log signal
                     self.tennis_logger.log_signal(signal)
-                    log.info("TENNIS %s", signal)
+                    log.info("TENNIS SIGNAL | %s | edge=%+.4f | fair=%.4f | mkt=%.4f",
+                             signal.trigger_type, signal.edge, signal.fair_price, market_price)
 
                     # Check execution guards
                     decision = self.tennis_guard.can_execute(signal, state)
                     if not decision.can_execute:
-                        log.info("TENNIS %s | %s", decision.reason, match_id)
+                        log.info("TENNIS BLOCKED | %s | %s", decision.reason, match_id)
                         continue
 
                     # Paper trade: log entry
                     self.tennis_guard.record_entry(match_id)
                     self.tennis_logger.log_trade_entry(signal, market_price_at_bp=market_price)
-                    log.info("TENNIS PAPER ENTRY | %s | edge=%.4f | mkt=%.4f | %s",
-                             signal.trigger_type, signal.edge, market_price, state)
+                    log.info("TENNIS PAPER ENTRY | %s | edge=%.4f | mkt=%.4f | %s %d-%d %d-%d",
+                             signal.trigger_type, signal.edge, market_price,
+                             link.polymarket_title[:30],
+                             state.sets_a, state.sets_b, state.games_a, state.games_b)
 
                     # Telegram alert
                     try:
@@ -595,7 +713,7 @@ class SportsOrchestrator:
                             f"Edge: {signal.edge:+.4f}\n"
                             f"Fair: {signal.fair_price:.4f} | Mkt: {market_price:.4f}\n"
                             f"Match: {link.polymarket_title}\n"
-                            f"Score: {state}"
+                            f"Score: {state.sets_a}-{state.sets_b} | {state.games_a}-{state.games_b} | {state.point_a.value}-{state.point_b.value}"
                         )
                     except Exception:
                         pass
@@ -732,7 +850,8 @@ class SportsOrchestrator:
             asyncio.create_task(self._signal_processing_loop(), name="signal_processing"),
             asyncio.create_task(self._status_printer_loop(), name="status_printer"),
             asyncio.create_task(self._rematching_loop(), name="rematching"),
-            # Tennis
+            # Tennis — score polling + signal processing
+            asyncio.create_task(self._tennis_score_polling_loop(), name="tennis_scores"),
             asyncio.create_task(self._tennis_signal_loop(), name="tennis_signals"),
         ]
 
@@ -753,7 +872,7 @@ class SportsOrchestrator:
         log.info("shutting down...")
         self._shutdown = True
         await self.poly_feed.shutdown()
-        await self.tennis_feed.shutdown()
+        await self.tennis_score_feed.shutdown()
         self.tennis_logger.close()
 
         # Print final summary
