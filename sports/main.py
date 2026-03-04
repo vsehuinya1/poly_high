@@ -608,15 +608,15 @@ class SportsOrchestrator:
                         server_id = link.home_team if fs_match.serving == "b" else link.away_team
 
                     # Map point strings to PointScore enum values
-                    point_map = {"0": PointScore.ZERO, "15": PointScore.FIFTEEN,
-                                 "30": PointScore.THIRTY, "40": PointScore.FORTY,
+                    point_map = {"0": PointScore.LOVE, "15": PointScore.P15,
+                                 "30": PointScore.P30, "40": PointScore.P40,
                                  "A": PointScore.AD, "AD": PointScore.AD,
                                  "50": PointScore.AD}
                     try:
-                        pt_a = point_map.get(str(point_a_raw), PointScore.ZERO)
-                        pt_b = point_map.get(str(point_b_raw), PointScore.ZERO)
+                        pt_a = point_map.get(str(point_a_raw), PointScore.LOVE)
+                        pt_b = point_map.get(str(point_b_raw), PointScore.LOVE)
                     except Exception:
-                        pt_a, pt_b = PointScore.ZERO, PointScore.ZERO
+                        pt_a, pt_b = PointScore.LOVE, PointScore.LOVE
 
                     # Detect tiebreak (both at 6 games)
                     is_tiebreak = (games_a == 6 and games_b == 6)
