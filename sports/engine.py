@@ -22,7 +22,7 @@ from sports.config import (
     PRICE_BAND_LO, PRICE_BAND_HI, MAX_SPREAD, MAX_BOOK_AGE_S, MAX_SCORE_DIFF,
     EDGE_TRADE_THRESHOLD, MAX_ELAPSED_PCT,
     LATE_GAME_HARD_STOP_NBA, LATE_GAME_HARD_STOP_FB,
-    MAX_POS_PER_DIRECTION,
+    MAX_POS_PER_DIRECTION, SELL_ONLY_MODE,
     GATE_FRESH_THRESHOLD, GATE_STREAK_S, GATE_ROLLING_WINDOW_S, GATE_ROLLING_FRESH_PCT,
     FREEZE_STALE_THRESHOLD, FREEZE_STALE_DURATION_S, UNFREEZE_STREAK_S,
     COOLDOWN_S, PER_GAME_STOP,
@@ -361,6 +361,7 @@ class SignalEngine:
             "BLOCK_COOLDOWN": 0,
             "BLOCK_BOOK_AGE": 0,
             "BLOCK_SCORE_DIFF": 0,
+            "BLOCK_DIRECTION": 0,
         }
         self._trades_taken = 0
         self._last_summary_ts = 0.0
@@ -658,6 +659,11 @@ class SignalEngine:
         # 2. BLOCK_EDGE
         if abs(signal.edge) < EDGE_TRADE_THRESHOLD:
             self._blocks["BLOCK_EDGE"] += 1
+            return
+
+        # 2b. BLOCK_DIRECTION — SELL-only mode (v3.5)
+        if SELL_ONLY_MODE and signal.direction == "BUY":
+            self._blocks["BLOCK_DIRECTION"] += 1
             return
 
         # 3. BLOCK_PRICE — on market mid

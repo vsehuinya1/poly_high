@@ -66,6 +66,7 @@ LATE_GAME_HARD_STOP_NBA = 36.0   # absolute minute cutoff for NBA entries
 LATE_GAME_HARD_STOP_FB  = 67.0   # absolute minute cutoff for football entries
 # Position control
 MAX_POS_PER_DIRECTION  = 1        # max 1 open position per direction per game
+SELL_ONLY_MODE         = True     # v3.5: disable BUY entries (25% WR vs SELL 50%)
 
 # Game activation gate
 GATE_FRESH_THRESHOLD  = 30.0     # book_age <= this to count as "fresh" for gate
