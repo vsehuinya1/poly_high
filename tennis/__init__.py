@@ -24,6 +24,7 @@ from tennis.state import (
 from tennis.model import TennisMarkovModel, get_win_prob
 from tennis.strategy import InflectionStrategy, TennisSignal
 from tennis.execution import TennisExecutionGuard, ExecutionDecision, TennisHealthStats
+from tennis.exit_manager import TennisExitManager
 from tennis.logger import TennisCSVLogger
 from tennis.feeds import TennisDataFeed, FlashscoreFeed
 
@@ -42,6 +43,7 @@ __all__ = [
     "TennisExecutionGuard",
     "ExecutionDecision",
     "TennisHealthStats",
+    "TennisExitManager",
     "TennisCSVLogger",
     "TennisDataFeed",
     "FlashscoreFeed",

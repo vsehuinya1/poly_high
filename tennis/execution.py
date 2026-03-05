@@ -53,6 +53,13 @@ class TennisHealthStats:
         self.trades_executed: int = 0
         self.ws_reconnects: int = 0
         self.max_staleness_ms: float = 0.0
+        # Exit lifecycle counters (fed by ExitManager)
+        self.trades_opened: int = 0
+        self.trades_closed: int = 0
+        self.exit_convergence: int = 0
+        self.exit_match_end: int = 0
+        self.exit_timeout: int = 0
+        self.avg_R_multiple: float = 0.0
         self._start_time: float = time.time()
 
     def log_summary(self) -> None:
@@ -75,6 +82,13 @@ class TennisHealthStats:
         log.info("  Trades executed:         %d", self.trades_executed)
         log.info("  WS reconnects:           %d", self.ws_reconnects)
         log.info("  Max staleness (ms):      %.0f", self.max_staleness_ms)
+        log.info("  --- Exit Lifecycle ---")
+        log.info("  Trades opened:           %d", self.trades_opened)
+        log.info("  Trades closed:           %d", self.trades_closed)
+        log.info("  Exit convergence:        %d", self.exit_convergence)
+        log.info("  Exit match end:          %d", self.exit_match_end)
+        log.info("  Exit timeout:            %d", self.exit_timeout)
+        log.info("  Avg R-multiple:          %+.4f", self.avg_R_multiple)
         log.info("=" * 60)
 
     def as_dict(self) -> dict:
@@ -93,7 +107,22 @@ class TennisHealthStats:
             "trades_executed": self.trades_executed,
             "ws_reconnects": self.ws_reconnects,
             "max_staleness_ms": self.max_staleness_ms,
+            "trades_opened": self.trades_opened,
+            "trades_closed": self.trades_closed,
+            "exit_convergence": self.exit_convergence,
+            "exit_match_end": self.exit_match_end,
+            "exit_timeout": self.exit_timeout,
+            "avg_R_multiple": self.avg_R_multiple,
         }
+
+    def merge_exit_stats(self, exit_stats: dict) -> None:
+        """Merge stats from TennisExitManager into health counters."""
+        self.trades_opened = exit_stats.get("trades_opened", 0)
+        self.trades_closed = exit_stats.get("trades_closed", 0)
+        self.exit_convergence = exit_stats.get("exit_convergence", 0)
+        self.exit_match_end = exit_stats.get("exit_match_end", 0)
+        self.exit_timeout = exit_stats.get("exit_timeout", 0)
+        self.avg_R_multiple = exit_stats.get("avg_R_multiple", 0.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════

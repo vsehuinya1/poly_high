@@ -1,0 +1,283 @@
+"""
+Tennis Exit Manager — lifecycle tracking for paper trades.
+
+Tracks open paper trades, detects exit conditions, captures
+post-entry price snapshots, and logs complete lifecycle to CSV.
+
+v1.0 — 2026-03-05
+"""
+import csv
+import logging
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+log = logging.getLogger("tennis.exit_manager")
+
+
+@dataclass
+class TennisPaperTrade:
+    """A single tennis paper trade with full lifecycle data."""
+    match_id: str
+    selection_id: str        # Polymarket token_id
+    player: str              # player name (favorite usually)
+    trigger_type: str        # SET_MEAN_REVERSION or PANIC_DISCOUNT
+    entry_price: float
+    fair_value_entry: float
+    edge_entry: float
+    entry_timestamp: float
+    entry_score: str         # e.g. "0-1 2-0"
+    # Post-entry snapshots
+    price_t5: Optional[float] = None
+    price_t15: Optional[float] = None
+    price_t30: Optional[float] = None
+    _snapshot_5_done: bool = field(default=False, repr=False)
+    _snapshot_15_done: bool = field(default=False, repr=False)
+    _snapshot_30_done: bool = field(default=False, repr=False)
+    # Exit data
+    exit_price: Optional[float] = None
+    exit_timestamp: Optional[float] = None
+    exit_score: Optional[str] = None
+    exit_reason: Optional[str] = None
+    R_multiple: Optional[float] = None
+    is_open: bool = True
+
+    @property
+    def duration_seconds(self) -> float:
+        if self.exit_timestamp and self.entry_timestamp:
+            return self.exit_timestamp - self.entry_timestamp
+        return time.time() - self.entry_timestamp
+
+    @property
+    def age_minutes(self) -> float:
+        return (time.time() - self.entry_timestamp) / 60.0
+
+
+class TennisExitManager:
+    """Manages tennis paper trade lifecycle: snapshots, exits, CSV logging.
+
+    Non-blocking — designed to run inside the existing async polling loop.
+    Call check_all() on every tick.
+    """
+
+    CONVERGENCE_THRESHOLD = 0.01   # exit when abs(fair - mkt) < this
+    TIMEOUT_S = 7200.0             # 2 hours
+    SNAPSHOT_TIMES = [
+        (5 * 60,  "price_t5",  "_snapshot_5_done"),
+        (15 * 60, "price_t15", "_snapshot_15_done"),
+        (30 * 60, "price_t30", "_snapshot_30_done"),
+    ]
+
+    def __init__(self, data_dir: Path):
+        self.open_trades: dict[str, TennisPaperTrade] = {}  # match_id → trade
+        self.closed_trades: list[TennisPaperTrade] = []
+        self._data_dir = data_dir
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        self._csv_writer = None
+        self._csv_fh = None
+        self._csv_initialized = False
+
+    # ── Trade Registration ──────────────────────────────────────
+
+    def register_trade(
+        self,
+        match_id: str,
+        selection_id: str,
+        player: str,
+        trigger_type: str,
+        entry_price: float,
+        fair_value: float,
+        edge: float,
+        entry_score: str,
+    ) -> TennisPaperTrade:
+        """Register a new paper trade after a signal is accepted."""
+        trade = TennisPaperTrade(
+            match_id=match_id,
+            selection_id=selection_id,
+            player=player,
+            trigger_type=trigger_type,
+            entry_price=entry_price,
+            fair_value_entry=fair_value,
+            edge_entry=edge,
+            entry_timestamp=time.time(),
+            entry_score=entry_score,
+        )
+
+        # If there's already an open trade for this match, close it first
+        if match_id in self.open_trades:
+            self._close_trade(
+                self.open_trades[match_id],
+                exit_price=entry_price,
+                exit_reason="REPLACED",
+                exit_score=entry_score,
+            )
+
+        self.open_trades[match_id] = trade
+        log.info("EXIT_MGR OPEN | %s | %s | entry=%.4f fair=%.4f edge=%+.4f | %s",
+                 match_id, trigger_type, entry_price, fair_value, edge, entry_score)
+        return trade
+
+    # ── Tick Processing ─────────────────────────────────────────
+
+    def check_all(
+        self,
+        get_market_price: callable,
+        get_fair_value: callable,
+        get_score: callable,
+        is_match_finished: callable,
+    ):
+        """Check all open trades for snapshots and exit conditions.
+
+        Args:
+            get_market_price: fn(match_id, selection_id) → float or None
+            get_fair_value: fn(match_id) → float or None
+            get_score: fn(match_id) → str or None
+            is_match_finished: fn(match_id) → bool
+        """
+        now = time.time()
+
+        for match_id in list(self.open_trades.keys()):
+            trade = self.open_trades[match_id]
+
+            mkt = get_market_price(match_id, trade.selection_id)
+            if mkt is None or mkt <= 0:
+                continue
+
+            fair = get_fair_value(match_id)
+            score = get_score(match_id)
+            elapsed = now - trade.entry_timestamp
+
+            # ── Post-entry snapshots ───────────────────────────
+            for delay_s, attr, flag_attr in self.SNAPSHOT_TIMES:
+                if not getattr(trade, flag_attr) and elapsed >= delay_s:
+                    setattr(trade, attr, mkt)
+                    setattr(trade, flag_attr, True)
+                    log.info("EXIT_MGR SNAP | %s | %s=%.4f (T+%dm)",
+                             match_id, attr, mkt, delay_s // 60)
+
+            # ── Exit conditions ────────────────────────────────
+
+            # 1. Edge convergence
+            if fair is not None and abs(fair - mkt) < self.CONVERGENCE_THRESHOLD:
+                self._close_trade(trade, exit_price=mkt,
+                                  exit_reason="EXIT_CONVERGENCE",
+                                  exit_score=score)
+                continue
+
+            # 2. Match end
+            if is_match_finished(match_id):
+                self._close_trade(trade, exit_price=mkt,
+                                  exit_reason="EXIT_MATCH_END",
+                                  exit_score=score)
+                continue
+
+            # 3. Timeout (2 hours)
+            if elapsed >= self.TIMEOUT_S:
+                self._close_trade(trade, exit_price=mkt,
+                                  exit_reason="EXIT_TIMEOUT",
+                                  exit_score=score)
+                continue
+
+    # ── Internal ────────────────────────────────────────────────
+
+    def _close_trade(self, trade: TennisPaperTrade, exit_price: float,
+                     exit_reason: str, exit_score: Optional[str]):
+        """Close a trade, compute R, log to CSV, move to closed list."""
+        trade.exit_price = exit_price
+        trade.exit_timestamp = time.time()
+        trade.exit_reason = exit_reason
+        trade.exit_score = exit_score or ""
+        trade.is_open = False
+
+        # R_multiple: positive = profitable
+        if trade.entry_price > 0:
+            trade.R_multiple = (exit_price - trade.entry_price) / trade.entry_price
+        else:
+            trade.R_multiple = 0.0
+
+        # Move from open to closed
+        self.open_trades.pop(trade.match_id, None)
+        self.closed_trades.append(trade)
+
+        log.info(
+            "EXIT_MGR CLOSE | %s | %s | entry=%.4f → exit=%.4f | R=%+.4f | %s | %.0fs",
+            trade.match_id, trade.exit_reason,
+            trade.entry_price, exit_price,
+            trade.R_multiple, trade.exit_score,
+            trade.duration_seconds,
+        )
+
+        self._write_lifecycle_row(trade)
+
+    def _ensure_csv(self):
+        """Lazily create CSV writer."""
+        if self._csv_initialized:
+            return
+        today = time.strftime("%Y%m%d")
+        path = self._data_dir / f"tennis_trade_lifecycle_{today}.csv"
+        write_header = not path.exists()
+        self._csv_fh = open(path, "a", newline="", buffering=1)
+        self._csv_writer = csv.writer(self._csv_fh)
+        if write_header:
+            self._csv_writer.writerow([
+                "match_id", "player", "trigger", "entry_price", "fair_entry",
+                "edge_entry", "price_t5", "price_t15", "price_t30",
+                "exit_price", "exit_reason", "R_multiple",
+                "entry_score", "exit_score", "duration_seconds",
+                "timestamp_entry", "timestamp_exit",
+            ])
+        self._csv_initialized = True
+
+    def _write_lifecycle_row(self, t: TennisPaperTrade):
+        """Write one complete lifecycle row to CSV."""
+        self._ensure_csv()
+        self._csv_writer.writerow([
+            t.match_id,
+            t.player,
+            t.trigger_type,
+            f"{t.entry_price:.4f}",
+            f"{t.fair_value_entry:.4f}",
+            f"{t.edge_entry:+.4f}",
+            f"{t.price_t5:.4f}" if t.price_t5 is not None else "",
+            f"{t.price_t15:.4f}" if t.price_t15 is not None else "",
+            f"{t.price_t30:.4f}" if t.price_t30 is not None else "",
+            f"{t.exit_price:.4f}" if t.exit_price is not None else "",
+            t.exit_reason or "",
+            f"{t.R_multiple:+.4f}" if t.R_multiple is not None else "",
+            t.entry_score,
+            t.exit_score or "",
+            f"{t.duration_seconds:.0f}",
+            f"{t.entry_timestamp:.3f}",
+            f"{t.exit_timestamp:.3f}" if t.exit_timestamp else "",
+        ])
+
+    def close(self):
+        """Flush and close CSV file handle."""
+        if self._csv_fh:
+            try:
+                self._csv_fh.close()
+            except Exception:
+                pass
+
+    # ── Stats ───────────────────────────────────────────────────
+
+    @property
+    def stats(self) -> dict:
+        """Return exit stats for health dashboard integration."""
+        closed = self.closed_trades
+        convergence = sum(1 for t in closed if t.exit_reason == "EXIT_CONVERGENCE")
+        match_end = sum(1 for t in closed if t.exit_reason == "EXIT_MATCH_END")
+        timeout = sum(1 for t in closed if t.exit_reason == "EXIT_TIMEOUT")
+        r_values = [t.R_multiple for t in closed if t.R_multiple is not None]
+        avg_r = sum(r_values) / len(r_values) if r_values else 0.0
+
+        return {
+            "trades_opened": len(self.open_trades) + len(closed),
+            "trades_closed": len(closed),
+            "trades_open": len(self.open_trades),
+            "exit_convergence": convergence,
+            "exit_match_end": match_end,
+            "exit_timeout": timeout,
+            "avg_R_multiple": avg_r,
+        }

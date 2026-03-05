@@ -365,11 +365,26 @@ class SignalEngine:
         }
         self._trades_taken = 0
         self._last_summary_ts = 0.0
+        # Rate-limited gate logging: {(game_id, gate): last_log_ts}
+        self._gate_log_times: dict[tuple, float] = {}
 
     def _get_game_state(self, game_id: str) -> GameTradeState:
         if game_id not in self._game_states:
             self._game_states[game_id] = GameTradeState(game_id)
         return self._game_states[game_id]
+
+    def _log_gate_block(self, game_id: str, gate: str, signal,
+                        gs_str: str, detail: str):
+        """Rate-limited gate block logging — once per match per gate per 60s."""
+        now = time.time()
+        key = (game_id, gate)
+        last = self._gate_log_times.get(key, 0)
+        if now - last < 60.0:
+            return
+        self._gate_log_times[key] = now
+        log.info("GATE_BLOCK | %s | %s %s | edge=%.3f mkt=%.3f | %s",
+                 gate, signal.direction, signal.outcome,
+                 signal.edge, signal.market_prob, detail)
 
     def log_daily_summary(self):
         """Log daily block/trade summary stats."""
@@ -583,10 +598,17 @@ class SignalEngine:
                 #     game_state_str, link.polymarket_title,
                 # )
 
-        # ── Deduplicate signals (only best edge per game) ────────
+        # ── Deduplicate signals — keep best per direction ────────
+        # v3.6: direction-aware dedup. Previously kept only 1 signal
+        # (highest abs edge), which discarded the SELL signal when
+        # BUY had the same magnitude — then SELL_ONLY_MODE killed
+        # the BUY → zero trades. Now we keep best BUY + best SELL.
         if signals:
-            signals.sort(key=lambda x: abs(x.edge), reverse=True)
-            signals = [signals[0]]
+            best_by_dir: dict[str, EdgeSignal] = {}
+            for s in signals:
+                if s.direction not in best_by_dir or abs(s.edge) > abs(best_by_dir[s.direction].edge):
+                    best_by_dir[s.direction] = s
+            signals = list(best_by_dir.values())
 
         # ── Paper trading logic ───────────────────────────────────
         for sig in signals:
@@ -659,11 +681,15 @@ class SignalEngine:
         # 2. BLOCK_EDGE
         if abs(signal.edge) < EDGE_TRADE_THRESHOLD:
             self._blocks["BLOCK_EDGE"] += 1
+            self._log_gate_block(link.game_id, "BLOCK_EDGE", signal, gs_str,
+                                 f"edge={abs(signal.edge):.3f} < {EDGE_TRADE_THRESHOLD}")
             return
 
         # 2b. BLOCK_DIRECTION — SELL-only mode (v3.5)
         if SELL_ONLY_MODE and signal.direction == "BUY":
             self._blocks["BLOCK_DIRECTION"] += 1
+            self._log_gate_block(link.game_id, "BLOCK_DIRECTION", signal, gs_str,
+                                 "SELL_ONLY_MODE blocks BUY")
             return
 
         # 3. BLOCK_PRICE — on market mid
@@ -683,6 +709,8 @@ class SignalEngine:
         # 5. BLOCK_BOOK_AGE
         if book_age > MAX_BOOK_AGE_S:
             self._blocks["BLOCK_BOOK_AGE"] += 1
+            self._log_gate_block(link.game_id, "BLOCK_BOOK_AGE", signal, gs_str,
+                                 f"age={book_age:.0f}s > {MAX_BOOK_AGE_S}s")
             return
 
         # 6. BLOCK_SCORE_DIFF
@@ -692,8 +720,12 @@ class SignalEngine:
 
         # 7. Game must be ACTIVE (gate passed)
         if not gts.can_trade:
+            self._log_gate_block(link.game_id, "BLOCK_GAME_STATE", signal, gs_str,
+                                 f"gs={gts.status.value} (need ACTIVE)")
             return
         if gts.status == GameStatus.FROZEN:
+            self._log_gate_block(link.game_id, "BLOCK_GAME_STATE", signal, gs_str,
+                                 "gs=FROZEN")
             return
 
         # 8. BLOCK_POSITION_LIMIT — 1 per direction per game

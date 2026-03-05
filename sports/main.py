@@ -37,6 +37,7 @@ from tennis.state import TennisState, PointScore, update_from_point, compute_mom
 from tennis.model import get_win_prob as tennis_get_win_prob
 from tennis.strategy import InflectionStrategy, TennisSignal
 from tennis.execution import TennisExecutionGuard
+from tennis.exit_manager import TennisExitManager
 from tennis.logger import TennisCSVLogger
 from tennis.livefeed import TennisScoreFeed, FlashscoreMatch
 from tennis.matching import (
@@ -346,6 +347,7 @@ class SportsOrchestrator:
             stale_disable_s=TENNIS_STALE_DISABLE_S,
         )
         self.tennis_logger = TennisCSVLogger(DATA_DIR)
+        self.tennis_exit_mgr = TennisExitManager(DATA_DIR)
         self.tennis_score_feed = TennisScoreFeed(poll_interval_s=TENNIS_FEED_POLL_S)
         self.tennis_markets: list[SportMarket] = []  # discovered tennis markets
         self.tennis_links: dict[str, GameMarketLink] = {}  # match_id → link
@@ -726,6 +728,21 @@ class SportsOrchestrator:
                         match_id, state_key=state_key, edge=signal.edge
                     )
                     self.tennis_logger.log_trade_entry(signal, market_price_at_bp=market_price)
+
+                    # Register with ExitManager for lifecycle tracking
+                    score_str = f"{state.sets_a}-{state.sets_b} {state.games_a}-{state.games_b}"
+                    fav_name = state.pregame_favorite_id or link.home_team
+                    self.tennis_exit_mgr.register_trade(
+                        match_id=match_id,
+                        selection_id=fav_token,
+                        player=fav_name,
+                        trigger_type=signal.trigger_type,
+                        entry_price=market_price,
+                        fair_value=signal.fair_price,
+                        edge=signal.edge,
+                        entry_score=score_str,
+                    )
+
                     log.info("TENNIS PAPER ENTRY | %s | edge=%.4f | mkt=%.4f | %s %d-%d %d-%d",
                              signal.trigger_type, signal.edge, market_price,
                              link.polymarket_title[:30],
@@ -744,8 +761,12 @@ class SportsOrchestrator:
                     except Exception:
                         pass
 
+                # ── Exit Manager: check all open trades ───────────
+                self._tennis_check_exits()
+
                 # ── Track WS reconnects + hourly health summary ───
                 self.tennis_guard.stats.ws_reconnects = self.poly_feed.reconnect_count
+                self.tennis_guard.stats.merge_exit_stats(self.tennis_exit_mgr.stats)
                 now = time.time()
                 if now - last_health_log >= 3600:
                     self.tennis_guard.stats.log_summary()
@@ -755,6 +776,50 @@ class SportsOrchestrator:
                 log.error("tennis signal loop error: %s", e)
 
             await asyncio.sleep(POLYMARKET_SNAPSHOT_S)
+
+    def _tennis_check_exits(self):
+        """Run ExitManager check_all with accessor lambdas."""
+
+        def _get_mkt(match_id: str, selection_id: str):
+            book = self.poly_feed.books.get(selection_id)
+            if book and book.mid > 0:
+                return book.mid
+            return None
+
+        def _get_fair(match_id: str):
+            state = self.tennis_states.get(match_id)
+            if not state:
+                return None
+            try:
+                from tennis.model import get_win_prob
+                out = get_win_prob(state)
+                if state.pregame_favorite_id == state.player_a_id:
+                    return out.p_a
+                return out.p_b
+            except Exception:
+                return None
+
+        def _get_score(match_id: str):
+            state = self.tennis_states.get(match_id)
+            if not state:
+                return None
+            return f"{state.sets_a}-{state.sets_b} {state.games_a}-{state.games_b}"
+
+        def _is_finished(match_id: str):
+            # Check Flashscore for match completion
+            fs_id = self._tennis_fs_map.get(match_id)
+            if fs_id:
+                fs_match = self.tennis_score_feed._matches.get(fs_id)
+                if fs_match and not fs_match.is_live:
+                    return True
+            return False
+
+        self.tennis_exit_mgr.check_all(
+            get_market_price=_get_mkt,
+            get_fair_value=_get_fair,
+            get_score=_get_score,
+            is_match_finished=_is_finished,
+        )
 
     async def _status_printer_loop(self):
         """Periodically print system status + Telegram updates."""
