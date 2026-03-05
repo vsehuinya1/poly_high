@@ -23,7 +23,7 @@ from tennis.state import (
 )
 from tennis.model import TennisMarkovModel, get_win_prob
 from tennis.strategy import InflectionStrategy, TennisSignal
-from tennis.execution import TennisExecutionGuard, ExecutionDecision
+from tennis.execution import TennisExecutionGuard, ExecutionDecision, TennisHealthStats
 from tennis.logger import TennisCSVLogger
 from tennis.feeds import TennisDataFeed, FlashscoreFeed
 
@@ -41,6 +41,7 @@ __all__ = [
     "TennisSignal",
     "TennisExecutionGuard",
     "ExecutionDecision",
+    "TennisHealthStats",
     "TennisCSVLogger",
     "TennisDataFeed",
     "FlashscoreFeed",

@@ -94,6 +94,12 @@ TENNIS_FEED_POLL_S    = 3.0       # feed poll interval (seconds)
 TENNIS_FEED_STALL_S   = 60.0      # feed stall detection threshold
 TENNIS_FEED_HEALTH_S  = 60.0      # feed health log interval
 
+# Tennis execution hardening (v2.0)
+TENNIS_PRICE_FLOOR         = 0.05   # min market price — below this = dead book
+TENNIS_MAX_SIGNALS_HR      = 10     # max signals per match per rolling hour
+TENNIS_STALE_DISABLE_COUNT = 5      # consecutive stale events before auto-disable
+TENNIS_STALE_DISABLE_S     = 300    # auto-disable duration (5 minutes)
+
 # ── Data Storage ─────────────────────────────────────────────────────
 DATA_DIR = Path(os.getenv("SPORTS_DATA_DIR", "sports_data"))
 LOG_DIR  = Path(os.getenv("LOG_DIR", "logs"))

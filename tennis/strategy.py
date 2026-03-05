@@ -7,6 +7,10 @@ during high-leverage tennis moments:
     Trigger 2: Set Mean Reversion — favorite down 0-1 in sets
 
 No ML. Pure structural signals based on Markov fair value vs market.
+
+v2.0 — added pre-evaluation guards:
+    - Hard market price floor (dead market filter)
+    - State dedup via composite key (prevents signal spam)
 """
 from __future__ import annotations
 
@@ -54,33 +58,89 @@ class TennisSignal:
 class InflectionStrategy:
     """Scans TennisState for Strategy B inflection triggers.
 
-    Stateless — does not track positions or execution.
+    Guards (pre-evaluation):
+        - Dead market filter: market_price < price_floor → suppress.
+        - State dedup: identical state key → suppress.
+
+    Triggers:
+        - Panic Discount: break point with favorite serving, market underprice.
+        - Set Mean Reversion: favorite down 0-1, market over-adjusts.
+
     Only produces signals; execution gating is handled separately.
 
     Args:
         panic_edge_threshold:     Minimum edge for Trigger 1.
         reversion_edge_threshold: Minimum edge for Trigger 2.
+        price_floor:              Minimum market price to evaluate (default 0.05).
     """
 
     def __init__(self, panic_edge_threshold: float = 0.06,
-                 reversion_edge_threshold: float = 0.05):
+                 reversion_edge_threshold: float = 0.05,
+                 price_floor: float = 0.05):
         self.panic_edge = panic_edge_threshold
         self.reversion_edge = reversion_edge_threshold
+        self.price_floor = price_floor
+
+        # ── State dedup tracking ──────────────────────────────────
+        # key: (match_id, selection_key) → last state_key that produced a signal
+        self._last_signal_state: dict[str, str] = {}
+
+        # ── Dead market logging (log-once-per-match) ──────────────
+        self._dead_market_logged: set[str] = set()
+
+    # ── State Key ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _state_key(state: TennisState, selection_id: str = "") -> str:
+        """Composite key for state dedup. Includes selection_id to prevent
+        cross-runner contamination."""
+        return (
+            f"{state.match_id}:{selection_id}:"
+            f"{state.sets_a}-{state.sets_b}:"
+            f"{state.games_a}-{state.games_b}:"
+            f"{state.point_a.value}-{state.point_b.value}:"
+            f"{state.server_id}"
+        )
+
+    # ── Main Evaluation ───────────────────────────────────────────
 
     def evaluate(self, state: TennisState,
-                 market_price: float) -> Optional[TennisSignal]:
+                 market_price: float,
+                 selection_id: str = "") -> Optional[TennisSignal]:
         """Evaluate both triggers against current state.
 
+        Pre-evaluation guards are applied BEFORE the Markov model call:
+            1. Market price floor (dead book filter).
+            2. State dedup (identical state suppression).
+
         Args:
-            state:        Current match state snapshot.
-            market_price: Current Polymarket price for the pre-game favorite.
+            state:         Current match state snapshot.
+            market_price:  Current Polymarket price for the pre-game favorite.
+            selection_id:  Optional runner/selection ID for cross-runner safety.
 
         Returns:
             TennisSignal if a trigger fires, else None.
         """
+        # ── Guard 0: Invalid price ────────────────────────────────
         if market_price <= 0 or market_price >= 1:
             return None
 
+        # ── Guard 1: Dead market / penny book (BEFORE edge calc) ──
+        if market_price < self.price_floor:
+            if state.match_id not in self._dead_market_logged:
+                log.info("DEAD_MARKET | match=%s mkt=%.4f < floor=%.2f — suppressed",
+                         state.match_id, market_price, self.price_floor)
+                self._dead_market_logged.add(state.match_id)
+            return None
+
+        # ── Guard 2: State dedup ──────────────────────────────────
+        key = self._state_key(state, selection_id)
+        dedup_key = f"{state.match_id}:{selection_id}"
+        if self._last_signal_state.get(dedup_key) == key:
+            # Identical state — suppress (no model call, no log spam)
+            return None
+
+        # ── Markov model call ─────────────────────────────────────
         model = get_win_prob(state)
 
         # Determine fair price for the pre-game favorite
@@ -95,14 +155,19 @@ class InflectionStrategy:
         sig = self._check_panic_discount(state, fair_fav, market_price,
                                           model, momentum)
         if sig is not None:
+            self._last_signal_state[dedup_key] = key
             return sig
 
         # ── Trigger 2: Set Mean Reversion ─────────────────────────
         sig = self._check_set_mean_reversion(state, fair_fav, market_price,
                                               model, momentum)
         if sig is not None:
+            self._last_signal_state[dedup_key] = key
             return sig
 
+        # No trigger but state was new — update dedup to avoid
+        # re-running the model on the same state next tick
+        self._last_signal_state[dedup_key] = key
         return None
 
     def _check_panic_discount(self, state: TennisState,

@@ -585,7 +585,7 @@ class PolymarketFeed:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            log.warning("WS JSON decode failed: %s", raw[:200])
+            log.debug("WS JSON decode failed: %s", raw[:200])
             return
 
         messages = data if isinstance(data, list) else [data]
@@ -934,9 +934,9 @@ class PolymarketFeed:
                 self._ws = None
 
             if not self._shutdown:
-                log.info("reconnecting in %.1fs", backoff)
+                log.info("reconnecting in %.1fs (connect #%d)", backoff, self._connect_count)
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60.0)
+                backoff = min(backoff * 2, 30.0)
 
     async def shutdown(self):
         self._shutdown = True
@@ -951,3 +951,7 @@ class PolymarketFeed:
     @property
     def message_count(self) -> int:
         return self._message_count
+
+    @property
+    def reconnect_count(self) -> int:
+        return max(0, self._connect_count - 1)

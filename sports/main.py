@@ -47,6 +47,8 @@ from sports.config import (
     TENNIS_PANIC_EDGE, TENNIS_REVERSION_EDGE,
     TENNIS_PRICE_CAP, TENNIS_STALENESS_S, TENNIS_COOLDOWN_S,
     TENNIS_FEED_POLL_S,
+    TENNIS_PRICE_FLOOR, TENNIS_MAX_SIGNALS_HR,
+    TENNIS_STALE_DISABLE_COUNT, TENNIS_STALE_DISABLE_S,
 )
 
 log = logging.getLogger("sports.main")
@@ -333,11 +335,15 @@ class SportsOrchestrator:
         self.tennis_strategy = InflectionStrategy(
             panic_edge_threshold=TENNIS_PANIC_EDGE,
             reversion_edge_threshold=TENNIS_REVERSION_EDGE,
+            price_floor=TENNIS_PRICE_FLOOR,
         )
         self.tennis_guard = TennisExecutionGuard(
             price_cap=TENNIS_PRICE_CAP,
             staleness_s=TENNIS_STALENESS_S,
             cooldown_s=TENNIS_COOLDOWN_S,
+            max_signals_per_hour=TENNIS_MAX_SIGNALS_HR,
+            stale_disable_count=TENNIS_STALE_DISABLE_COUNT,
+            stale_disable_s=TENNIS_STALE_DISABLE_S,
         )
         self.tennis_logger = TennisCSVLogger(DATA_DIR)
         self.tennis_score_feed = TennisScoreFeed(poll_interval_s=TENNIS_FEED_POLL_S)
@@ -660,7 +666,14 @@ class SportsOrchestrator:
             await asyncio.sleep(TENNIS_FEED_POLL_S)
 
     async def _tennis_signal_loop(self):
-        """Tennis Strategy B signal processing — runs on every tick."""
+        """Tennis Strategy B signal processing — runs on every tick.
+
+        v2.0: Integrates should_evaluate() pre-check, state dedup via
+        selection_id, position loop breaker, and health stats.
+        """
+        # Log health summary every hour
+        last_health_log = time.time()
+
         while not self._shutdown:
             try:
                 for match_id, link in list(self.tennis_links.items()):
@@ -681,8 +694,19 @@ class SportsOrchestrator:
 
                     market_price = fav_book.mid
 
-                    # Run Strategy B evaluation
-                    signal = self.tennis_strategy.evaluate(state, market_price)
+                    # ── Pre-check: should we even evaluate? ───────
+                    # Compute state key for position loop breaker
+                    state_key = self.tennis_strategy._state_key(state, fav_token)
+
+                    if not self.tennis_guard.should_evaluate(
+                        match_id, state_key=state_key, edge=0.0
+                    ):
+                        continue
+
+                    # Run Strategy B evaluation (with price floor + dedup built in)
+                    signal = self.tennis_strategy.evaluate(
+                        state, market_price, selection_id=fav_token
+                    )
                     if signal is None:
                         continue
 
@@ -697,8 +721,10 @@ class SportsOrchestrator:
                         log.info("TENNIS BLOCKED | %s | %s", decision.reason, match_id)
                         continue
 
-                    # Paper trade: log entry
-                    self.tennis_guard.record_entry(match_id)
+                    # Paper trade: log entry (pass state_key + edge for loop breaker)
+                    self.tennis_guard.record_entry(
+                        match_id, state_key=state_key, edge=signal.edge
+                    )
                     self.tennis_logger.log_trade_entry(signal, market_price_at_bp=market_price)
                     log.info("TENNIS PAPER ENTRY | %s | edge=%.4f | mkt=%.4f | %s %d-%d %d-%d",
                              signal.trigger_type, signal.edge, market_price,
@@ -717,6 +743,13 @@ class SportsOrchestrator:
                         )
                     except Exception:
                         pass
+
+                # ── Track WS reconnects + hourly health summary ───
+                self.tennis_guard.stats.ws_reconnects = self.poly_feed.reconnect_count
+                now = time.time()
+                if now - last_health_log >= 3600:
+                    self.tennis_guard.stats.log_summary()
+                    last_health_log = now
 
             except Exception as e:
                 log.error("tennis signal loop error: %s", e)
