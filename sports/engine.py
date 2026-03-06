@@ -663,8 +663,9 @@ class SignalEngine:
 
         # 0. Trade window gate
         if game_state.sport == "nba":
-            # NBA: only trade when 1800 < adj_sec <= 2160 (minute 18→36)
-            if not (NBA_TRADE_WINDOW_START < adj_sec <= NBA_TRADE_WINDOW_END):
+            # NBA: trade only between minute 18 and minute 36 elapsed
+            # adj_sec is seconds REMAINING: 720 (12min left) ≤ adj_sec < 1800 (30min left)
+            if not (NBA_TRADE_WINDOW_START <= adj_sec < NBA_TRADE_WINDOW_END):
                 return
         else:
             # Football: original gate — within 10min of game end

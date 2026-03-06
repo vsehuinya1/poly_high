@@ -64,8 +64,8 @@ EDGE_TRADE_THRESHOLD  = 0.10     # min edge to open a trade (separate from signa
 MAX_ELAPSED_PCT       = 0.75     # block entries past 75% of game
 LATE_GAME_HARD_STOP_NBA = 36.0   # absolute minute cutoff for NBA entries
 LATE_GAME_HARD_STOP_FB  = 67.0   # absolute minute cutoff for football entries
-NBA_TRADE_WINDOW_START = 1800    # adj_sec must be > this (= minute 18+)
-NBA_TRADE_WINDOW_END   = 2160    # adj_sec must be <= this (= minute 36-)
+NBA_TRADE_WINDOW_START = 720     # adj_sec >= this (36min elapsed → 12min remaining)
+NBA_TRADE_WINDOW_END   = 1800    # adj_sec < this  (18min elapsed → 30min remaining)
 # Position control
 MAX_POS_PER_DIRECTION  = 1        # max 1 open position per direction per game
 SELL_ONLY_MODE         = True     # v3.5: disable BUY entries (25% WR vs SELL 50%)
