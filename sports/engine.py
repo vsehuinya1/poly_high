@@ -22,6 +22,7 @@ from sports.config import (
     PRICE_BAND_LO, PRICE_BAND_HI, MAX_SPREAD, MAX_BOOK_AGE_S, MAX_SCORE_DIFF,
     EDGE_TRADE_THRESHOLD, MAX_ELAPSED_PCT,
     LATE_GAME_HARD_STOP_NBA, LATE_GAME_HARD_STOP_FB,
+    NBA_TRADE_WINDOW_START, NBA_TRADE_WINDOW_END,
     MAX_POS_PER_DIRECTION, SELL_ONLY_MODE,
     GATE_FRESH_THRESHOLD, GATE_STREAK_S, GATE_ROLLING_WINDOW_S, GATE_ROLLING_FRESH_PCT,
     FREEZE_STALE_THRESHOLD, FREEZE_STALE_DURATION_S, UNFREEZE_STREAK_S,
@@ -660,9 +661,15 @@ class SignalEngine:
         book_age = now - book.timestamp if book.timestamp > 0 else 9999
         score_diff = abs(game_state.home_score - game_state.away_score)
 
-        # 0. Game must have started (adj_sec < 600 = within 10min of last update)
-        if adj_sec > 600:
-            return
+        # 0. Trade window gate
+        if game_state.sport == "nba":
+            # NBA: only trade when 1800 < adj_sec <= 2160 (minute 18→36)
+            if not (NBA_TRADE_WINDOW_START < adj_sec <= NBA_TRADE_WINDOW_END):
+                return
+        else:
+            # Football: original gate — within 10min of game end
+            if adj_sec > 600:
+                return
 
         # 1. BLOCK_TIME — late-game hard stop + percentage gate
         hard_stop = LATE_GAME_HARD_STOP_NBA if game_state.sport == "nba" else LATE_GAME_HARD_STOP_FB
