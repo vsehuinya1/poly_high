@@ -59,7 +59,11 @@ class TennisHealthStats:
         self.exit_convergence: int = 0
         self.exit_match_end: int = 0
         self.exit_timeout: int = 0
+        self.exit_runner_trail: int = 0
+        self.spread_capture_entries: int = 0
+        self.runner_mode_trades: int = 0
         self.avg_R_multiple: float = 0.0
+        self.avg_runner_R: float = 0.0
         self._start_time: float = time.time()
 
     def log_summary(self) -> None:
@@ -88,7 +92,11 @@ class TennisHealthStats:
         log.info("  Exit convergence:        %d", self.exit_convergence)
         log.info("  Exit match end:          %d", self.exit_match_end)
         log.info("  Exit timeout:            %d", self.exit_timeout)
+        log.info("  Exit runner trail:       %d", self.exit_runner_trail)
+        log.info("  Spread capture entries:  %d", self.spread_capture_entries)
+        log.info("  Runner mode trades:      %d", self.runner_mode_trades)
         log.info("  Avg R-multiple:          %+.4f", self.avg_R_multiple)
+        log.info("  Avg runner R:            %+.4f", self.avg_runner_R)
         log.info("=" * 60)
 
     def as_dict(self) -> dict:
@@ -112,7 +120,11 @@ class TennisHealthStats:
             "exit_convergence": self.exit_convergence,
             "exit_match_end": self.exit_match_end,
             "exit_timeout": self.exit_timeout,
+            "exit_runner_trail": self.exit_runner_trail,
+            "spread_capture_entries": self.spread_capture_entries,
+            "runner_mode_trades": self.runner_mode_trades,
             "avg_R_multiple": self.avg_R_multiple,
+            "avg_runner_R": self.avg_runner_R,
         }
 
     def merge_exit_stats(self, exit_stats: dict) -> None:
@@ -122,7 +134,11 @@ class TennisHealthStats:
         self.exit_convergence = exit_stats.get("exit_convergence", 0)
         self.exit_match_end = exit_stats.get("exit_match_end", 0)
         self.exit_timeout = exit_stats.get("exit_timeout", 0)
+        self.exit_runner_trail = exit_stats.get("exit_runner_trail", 0)
+        self.spread_capture_entries = exit_stats.get("spread_capture_entries", 0)
+        self.runner_mode_trades = exit_stats.get("runner_mode_trades", 0)
         self.avg_R_multiple = exit_stats.get("avg_R_multiple", 0.0)
+        self.avg_runner_R = exit_stats.get("avg_runner_R", 0.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -732,6 +732,7 @@ class SportsOrchestrator:
                     # Register with ExitManager for lifecycle tracking
                     score_str = f"{state.sets_a}-{state.sets_b} {state.games_a}-{state.games_b}"
                     fav_name = state.pregame_favorite_id or link.home_team
+                    current_spread = fav_book.spread if fav_book else 0.0
                     self.tennis_exit_mgr.register_trade(
                         match_id=match_id,
                         selection_id=fav_token,
@@ -741,6 +742,7 @@ class SportsOrchestrator:
                         fair_value=signal.fair_price,
                         edge=signal.edge,
                         entry_score=score_str,
+                        spread=current_spread,
                     )
 
                     log.info("TENNIS PAPER ENTRY | %s | edge=%.4f | mkt=%.4f | %s %d-%d %d-%d",
