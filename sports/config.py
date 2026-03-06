@@ -66,6 +66,8 @@ LATE_GAME_HARD_STOP_NBA = 36.0   # absolute minute cutoff for NBA entries
 LATE_GAME_HARD_STOP_FB  = 67.0   # absolute minute cutoff for football entries
 NBA_TRADE_WINDOW_START = 720     # adj_sec >= this (36min elapsed → 12min remaining)
 NBA_TRADE_WINDOW_END   = 1800    # adj_sec < this  (18min elapsed → 30min remaining)
+FB_TRADE_WINDOW_START  = 1200    # adj_sec >= this (70min elapsed → 20min remaining)
+FB_TRADE_WINDOW_END    = 4500    # adj_sec < this  (15min elapsed → 75min remaining)
 # Position control
 MAX_POS_PER_DIRECTION  = 1        # max 1 open position per direction per game
 SELL_ONLY_MODE         = True     # v3.5: disable BUY entries (25% WR vs SELL 50%)

@@ -23,6 +23,7 @@ from sports.config import (
     EDGE_TRADE_THRESHOLD, MAX_ELAPSED_PCT,
     LATE_GAME_HARD_STOP_NBA, LATE_GAME_HARD_STOP_FB,
     NBA_TRADE_WINDOW_START, NBA_TRADE_WINDOW_END,
+    FB_TRADE_WINDOW_START, FB_TRADE_WINDOW_END,
     MAX_POS_PER_DIRECTION, SELL_ONLY_MODE,
     GATE_FRESH_THRESHOLD, GATE_STREAK_S, GATE_ROLLING_WINDOW_S, GATE_ROLLING_FRESH_PCT,
     FREEZE_STALE_THRESHOLD, FREEZE_STALE_DURATION_S, UNFREEZE_STREAK_S,
@@ -667,8 +668,13 @@ class SignalEngine:
             # adj_sec is seconds REMAINING: 720 (12min left) ≤ adj_sec < 1800 (30min left)
             if not (NBA_TRADE_WINDOW_START <= adj_sec < NBA_TRADE_WINDOW_END):
                 return
+        elif game_state.sport == "football":
+            # Football: trade only between minute 15 and minute 70 elapsed
+            # adj_sec is seconds REMAINING: 1200 (20min left) ≤ adj_sec < 4500 (75min left)
+            if not (FB_TRADE_WINDOW_START <= adj_sec < FB_TRADE_WINDOW_END):
+                return
         else:
-            # Football: original gate — within 10min of game end
+            # Other sports: original fallback
             if adj_sec > 600:
                 return
 
