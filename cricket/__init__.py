@@ -27,6 +27,7 @@ from cricket.execution import (
     CricketHealthStats,
     CricketMatchState,
 )
+from cricket.feeds import CricketFeed, CricketCSVLogger
 
 __all__ = [
     "CricketState",
@@ -41,4 +42,6 @@ __all__ = [
     "CricketExecutionDecision",
     "CricketHealthStats",
     "CricketMatchState",
+    "CricketFeed",
+    "CricketCSVLogger",
 ]
