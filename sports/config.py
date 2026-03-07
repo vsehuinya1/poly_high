@@ -109,6 +109,16 @@ TENNIS_MAX_SIGNALS_HR      = 10     # max signals per match per rolling hour
 TENNIS_STALE_DISABLE_COUNT = 5      # consecutive stale events before auto-disable
 TENNIS_STALE_DISABLE_S     = 300    # auto-disable duration (5 minutes)
 
+# ── Cricket (Paper-Only Research Mode) ───────────────────────────────
+CRICKET_PAPER_ONLY         = True   # NEVER allow live execution
+CRICKET_TRADE_SIZE         = 200.0  # paper trade size ($)
+CRICKET_MAX_SPREAD         = 0.02   # abort if spread > this
+CRICKET_MOMENTUM_RR_THRESH = 2.0    # rolling RR must exceed RRR by this
+CRICKET_MOMENTUM_EDGE      = 0.08   # min edge for momentum signal
+CRICKET_WICKET_EDGE        = 0.10   # min edge for wicket overreaction
+CRICKET_LATENCY_THRESH_MS  = 2000.0 # min latency for snipe logging
+CRICKET_COOLDOWN_S         = 120.0  # cooldown between trades
+
 # ── Data Storage ─────────────────────────────────────────────────────
 DATA_DIR = Path(os.getenv("SPORTS_DATA_DIR", "sports_data"))
 LOG_DIR  = Path(os.getenv("LOG_DIR", "logs"))
@@ -134,6 +144,8 @@ SPORTS_SLUG_PATTERNS = [
     # Tennis
     "tennis", "atp-", "wta-",
     "australian-open", "french-open", "wimbledon", "us-open",
+    # Cricket
+    "icc-", "t20-", "odi-", "cricket",
 ]
 
 # Polymarket slug team abbreviation → full name mapping

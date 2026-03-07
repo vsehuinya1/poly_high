@@ -122,6 +122,12 @@ def classify_market(slug: str, title: str) -> tuple[str, str]:
     if s.startswith("chm-"):
         return ("football", "Championship")
 
+    # Cricket
+    if "icc-" in s or "t20-" in s or "odi-" in s:
+        return ("cricket", "ICC")
+    if "cricket" in s or "cricket" in t:
+        return ("cricket", "Cricket")
+
     return ("unknown", "Unknown")
 
 
