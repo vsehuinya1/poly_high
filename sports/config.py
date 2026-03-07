@@ -123,6 +123,14 @@ SPORTS_SLUG_PATTERNS = [
     "ucl-", "uel-", "uecl-",
     "fifa-", "world-cup",
     "premier-league",
+    # Polymarket shorthand football codes (v3.8)
+    "lal-",   # La Liga
+    "efa-",   # English Football (EPL / FA Cup)
+    "bun-",   # Bundesliga
+    "fl1-",   # Ligue 1
+    "sa-",    # Serie A
+    "ere-",   # Eredivisie
+    "chm-",   # Championship
     # Tennis
     "tennis", "atp-", "wta-",
     "australian-open", "french-open", "wimbledon", "us-open",

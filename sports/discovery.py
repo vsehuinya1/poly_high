@@ -106,6 +106,22 @@ def classify_market(slug: str, title: str) -> tuple[str, str]:
     if "fifa" in s or "world-cup" in s:
         return ("football", "FIFA World Cup")
 
+    # Polymarket shorthand football codes (v3.8)
+    if s.startswith("lal-"):
+        return ("football", "La Liga")
+    if s.startswith("efa-"):
+        return ("football", "EPL")
+    if s.startswith("bun-"):
+        return ("football", "Bundesliga")
+    if s.startswith("fl1-"):
+        return ("football", "Ligue 1")
+    if s.startswith("sa-"):
+        return ("football", "Serie A")
+    if s.startswith("ere-"):
+        return ("football", "Eredivisie")
+    if s.startswith("chm-"):
+        return ("football", "Championship")
+
     return ("unknown", "Unknown")
 
 
