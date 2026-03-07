@@ -20,6 +20,7 @@ from sports.config import (
     DATA_DIR,
     # Execution hygiene (v3.4 — controlled participation)
     PRICE_BAND_LO, PRICE_BAND_HI, MAX_SPREAD, MAX_BOOK_AGE_S, MAX_SCORE_DIFF,
+    SELL_PRICE_BAND_LO, SELL_PRICE_BAND_HI, BUY_PRICE_BAND_LO, BUY_PRICE_BAND_HI,
     EDGE_TRADE_THRESHOLD, MAX_ELAPSED_PCT,
     LATE_GAME_HARD_STOP_NBA, LATE_GAME_HARD_STOP_FB,
     NBA_TRADE_WINDOW_START, NBA_TRADE_WINDOW_END,
@@ -369,6 +370,8 @@ class SignalEngine:
         self._last_summary_ts = 0.0
         # Rate-limited gate logging: {(game_id, gate): last_log_ts}
         self._gate_log_times: dict[tuple, float] = {}
+        # Rate-limited BLOCK_TIME logging (v3.8): {key: last_log_ts}
+        self._block_time_log: dict[str, float] = {}
 
     def _get_game_state(self, game_id: str) -> GameTradeState:
         if game_id not in self._game_states:
@@ -682,14 +685,23 @@ class SignalEngine:
         hard_stop = LATE_GAME_HARD_STOP_NBA if game_state.sport == "nba" else LATE_GAME_HARD_STOP_FB
         if game_state.elapsed_minutes > hard_stop:
             self._blocks["BLOCK_TIME"] += 1
-            log.info("BLOCK_TIME | %s | min=%.0f > hard_stop=%.0f",
-                     gs_str, game_state.elapsed_minutes, hard_stop)
+            # Rate-limit log: 1 per game per 60s (v3.8)
+            bt_key = f"bt_{signal.game_id}"
+            bt_last = self._block_time_log.get(bt_key, 0)
+            if now - bt_last >= 60:
+                log.info("BLOCK_TIME | %s | min=%.0f > hard_stop=%.0f",
+                         gs_str, game_state.elapsed_minutes, hard_stop)
+                self._block_time_log[bt_key] = now
             return
         elapsed_pct = game_state.elapsed_minutes / game_state.total_minutes if game_state.total_minutes > 0 else 1.0
         if elapsed_pct > MAX_ELAPSED_PCT:
             self._blocks["BLOCK_TIME"] += 1
-            log.info("BLOCK_TIME | %s | elapsed=%.0f%% > %.0f%%",
-                     gs_str, elapsed_pct * 100, MAX_ELAPSED_PCT * 100)
+            bt_key = f"bt_pct_{signal.game_id}"
+            bt_last = self._block_time_log.get(bt_key, 0)
+            if now - bt_last >= 60:
+                log.info("BLOCK_TIME | %s | elapsed=%.0f%% > %.0f%%",
+                         gs_str, elapsed_pct * 100, MAX_ELAPSED_PCT * 100)
+                self._block_time_log[bt_key] = now
             return
 
         # 2. BLOCK_EDGE
@@ -706,11 +718,15 @@ class SignalEngine:
                                  "SELL_ONLY_MODE blocks BUY")
             return
 
-        # 3. BLOCK_PRICE — on market mid
-        if not (PRICE_BAND_LO <= signal.market_prob <= PRICE_BAND_HI):
+        # 3. BLOCK_PRICE — on market mid (v3.8: direction-specific bands)
+        if signal.direction == "SELL":
+            band_lo, band_hi = SELL_PRICE_BAND_LO, SELL_PRICE_BAND_HI
+        else:
+            band_lo, band_hi = BUY_PRICE_BAND_LO, BUY_PRICE_BAND_HI
+        if not (band_lo <= signal.market_prob <= band_hi):
             self._blocks["BLOCK_PRICE"] += 1
-            log.info("BLOCK_PRICE | %s | mid=%.3f | band=[%.2f,%.2f]",
-                     gs_str, signal.market_prob, PRICE_BAND_LO, PRICE_BAND_HI)
+            log.info("BLOCK_PRICE | %s | %s mid=%.3f | band=[%.2f,%.2f]",
+                     gs_str, signal.direction, signal.market_prob, band_lo, band_hi)
             return
 
         # 4. BLOCK_SPREAD
@@ -733,14 +749,16 @@ class SignalEngine:
             return
 
         # 7. Game must be ACTIVE (gate passed)
-        if not gts.can_trade:
-            self._log_gate_block(link.game_id, "BLOCK_GAME_STATE", signal, gs_str,
-                                 f"gs={gts.status.value} (need ACTIVE)")
-            return
-        if gts.status == GameStatus.FROZEN:
-            self._log_gate_block(link.game_id, "BLOCK_GAME_STATE", signal, gs_str,
-                                 "gs=FROZEN")
-            return
+        #    v3.8: NBA bypasses activation gate — window gate is sufficient
+        if game_state.sport != "nba":
+            if not gts.can_trade:
+                self._log_gate_block(link.game_id, "BLOCK_GAME_STATE", signal, gs_str,
+                                     f"gs={gts.status.value} (need ACTIVE)")
+                return
+            if gts.status == GameStatus.FROZEN:
+                self._log_gate_block(link.game_id, "BLOCK_GAME_STATE", signal, gs_str,
+                                     "gs=FROZEN")
+                return
 
         # 8. BLOCK_POSITION_LIMIT — 1 per direction per game
         dir_open = sum(1 for p in self.positions.values()
@@ -770,11 +788,11 @@ class SignalEngine:
         else:
             entry_price = book.best_bid if book.best_bid > 0 else signal.market_prob
 
-        # 11. BLOCK_PRICE on ACTUAL execution price
-        if not (PRICE_BAND_LO <= entry_price <= PRICE_BAND_HI):
+        # 11. BLOCK_PRICE on ACTUAL execution price (v3.8: direction-specific)
+        if not (band_lo <= entry_price <= band_hi):
             self._blocks["BLOCK_PRICE"] += 1
-            log.info("BLOCK_PRICE | %s | entry=%.3f (actual) outside [%.2f,%.2f]",
-                     gs_str, entry_price, PRICE_BAND_LO, PRICE_BAND_HI)
+            log.info("BLOCK_PRICE | %s | %s entry=%.3f (actual) outside [%.2f,%.2f]",
+                     gs_str, signal.direction, entry_price, band_lo, band_hi)
             return
 
         # ── Log daily summary periodically ────────────────────────
