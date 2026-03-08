@@ -362,6 +362,7 @@ class SportsOrchestrator:
         self.tennis_exit_mgr = TennisExitManager(DATA_DIR)
         self.tennis_score_feed = TennisScoreFeed(poll_interval_s=TENNIS_FEED_POLL_S)
         self.tennis_markets: list[SportMarket] = []  # discovered tennis markets
+        self.tennis_links: dict[str, GameMarketLink] = {}  # match_id → link
         self.tennis_states: dict[str, TennisState] = {}  # match_id → latest state
         self._tennis_fs_map: dict[str, str] = {}  # poly_event_id → flashscore_match_id
 
