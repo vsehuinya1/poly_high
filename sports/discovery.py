@@ -16,6 +16,40 @@ from sports.config import GAMMA_API_URL, SPORTS_SLUG_PATTERNS
 log = logging.getLogger("sports.discovery")
 
 
+# ── Cricket team-based heuristic detection ────────────────────────────
+CRICKET_NATIONS = {
+    "india", "new zealand", "australia", "england", "pakistan",
+    "south africa", "sri lanka", "bangladesh", "west indies",
+    "afghanistan", "netherlands", "zimbabwe", "ireland",
+    "scotland", "namibia", "nepal", "usa", "uae", "oman",
+    "canada", "papua new guinea", "cayman islands",
+    "argentina", "suriname", "mexico", "bermuda", "hong kong",
+    "kenya", "qatar", "bahrain", "botswana", "lesotho",
+}
+
+
+def _is_cricket_match(title: str) -> bool:
+    """Check if a market title contains two cricket nations (Team A vs Team B)."""
+    t = title.lower()
+    # Strip common suffixes that might confuse matching
+    for suffix in ["(final)", "(semi-final)", "(qualifier)",
+                   "(group a)", "(group b)", "(group c)", "(group d)",
+                   "(1st t20i)", "(2nd t20i)", "(3rd t20i)",
+                   "(1st odi)", "(2nd odi)", "(3rd odi)",
+                   "(1st test)", "(2nd test)", "(3rd test)"]:
+        t = t.replace(suffix, "")
+    t = t.strip()
+    # Extract teams from "A vs. B", "A vs B", "A v B"
+    for sep in [" vs. ", " vs ", " v "]:
+        if sep in t:
+            a, b = t.split(sep, 1)
+            a, b = a.strip(), b.strip()
+            if a in CRICKET_NATIONS and b in CRICKET_NATIONS:
+                log.info("DISCOVERY | cricket candidate: %s", title)
+                return True
+    return False
+
+
 @dataclass
 class MarketOutcome:
     """Single outcome within a Polymarket sports market."""
@@ -122,11 +156,14 @@ def classify_market(slug: str, title: str) -> tuple[str, str]:
     if s.startswith("chm-"):
         return ("football", "Championship")
 
-    # Cricket
+    # Cricket — keyword detection
     if "icc-" in s or "t20-" in s or "odi-" in s:
         return ("cricket", "ICC")
     if "cricket" in s or "cricket" in t:
         return ("cricket", "Cricket")
+    # Cricket — team-based heuristic (catches "India vs. New Zealand" etc.)
+    if _is_cricket_match(title):
+        return ("cricket", "International")
 
     return ("unknown", "Unknown")
 
@@ -257,7 +294,7 @@ async def discover_sports_markets(session: aiohttp.ClientSession) -> list[SportM
                 continue
 
             sport, league = classify_market(slug, title)
-            if sport not in ("nba", "football", "tennis"):
+            if sport not in ("nba", "football", "tennis", "cricket"):
                 continue
 
             # Process sub-markets within the event

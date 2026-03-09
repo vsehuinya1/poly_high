@@ -46,6 +46,9 @@ ESPN_CRICKET_LEAGUES = [
     # SA20, CPL, PSL, etc. can be added
 ]
 
+# Dynamic discovery endpoint — returns ALL active cricket globally
+ESPN_HEADER_URL = "https://site.api.espn.com/apis/v2/scoreboard/header"
+
 CRICKET_POLL_INTERVAL_S = 30  # poll every 30 seconds
 
 
@@ -314,12 +317,136 @@ class CricketFeed:
             # Brief pause between leagues
             await asyncio.sleep(0.3)
 
+        # ── Dynamic discovery via ESPN header API ─────────────────
+        # This catches ALL active cricket globally, including bilateral
+        # series, qualifiers, and domestic leagues not in our static list.
+        try:
+            async with session.get(
+                ESPN_HEADER_URL,
+                params={"sport": "cricket", "limit": "50"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 200:
+                    header = await resp.json()
+                    for sport_block in header.get("sports", []):
+                        for league in sport_block.get("leagues", []):
+                            league_name = league.get("name", "")
+                            league_id = league.get("id", "")
+                            for hdr_evt in league.get("events", []):
+                                hdr_state = hdr_evt.get("status", "")
+                                # Only care about live and upcoming
+                                if hdr_state not in ("in", "pre"):
+                                    continue
+
+                                hdr_id = str(hdr_evt.get("id", ""))
+                                if hdr_id in self.games:
+                                    continue  # already have from league poll
+
+                                # Parse teams from header event
+                                competitors = hdr_evt.get("competitors", [])
+                                home_team = ""
+                                away_team = ""
+                                for c in competitors:
+                                    if c.get("homeAway") == "home":
+                                        home_team = c.get("displayName", "")
+                                    else:
+                                        away_team = c.get("displayName", "")
+
+                                if not home_team and not away_team:
+                                    # Fallback: just use first two competitor names
+                                    if len(competitors) >= 2:
+                                        home_team = competitors[0].get("displayName", "")
+                                        away_team = competitors[1].get("displayName", "")
+
+                                # Determine format from league name
+                                match_format = "t20"  # default
+                                ln = league_name.lower()
+                                if "test" in ln:
+                                    match_format = "test"
+                                elif "odi" in ln or ("world cup" in ln and "t20" not in ln):
+                                    match_format = "odi"
+
+                                # Build minimal CricketState from header data
+                                cs = CricketState(
+                                    match_id=hdr_id,
+                                    format=match_format,
+                                    team_a=home_team,
+                                    team_b=away_team,
+                                    batting_team=home_team,
+                                    bowling_team=away_team,
+                                    innings=1,
+                                    runs=0,
+                                    wickets=0,
+                                    overs=0.0,
+                                    balls=0,
+                                    run_rate=0.0,
+                                    required_run_rate=0.0,
+                                    target_score=0,
+                                    first_innings_total=0,
+                                    recent_over_runs=(),
+                                    recent_wickets=(),
+                                    venue="",
+                                    timestamp=now,
+                                )
+                                self.games[hdr_id] = cs
+
+                                if hdr_state == "in":
+                                    total_live += 1
+                                log.info(
+                                    "CRICKET_HEADER_FOUND | %s | %s vs %s | league=%s | state=%s",
+                                    hdr_id, home_team, away_team, league_name, hdr_state,
+                                )
+
+                                # Also fetch full scoreboard for this league
+                                # if we haven't already
+                                if league_id and league_id not in ESPN_CRICKET_LEAGUES:
+                                    try:
+                                        full_url = f"{ESPN_CRICKET_BASE}/{league_id}/scoreboard"
+                                        async with session.get(
+                                            full_url,
+                                            timeout=aiohttp.ClientTimeout(total=10),
+                                        ) as full_resp:
+                                            if full_resp.status == 200:
+                                                full_data = await full_resp.json()
+                                                for evt in full_data.get("events", []):
+                                                    eid = str(evt.get("id", ""))
+                                                    evt_state = evt.get("status", {}).get("type", {}).get("state", "")
+                                                    if evt_state not in ("in", "post"):
+                                                        continue
+                                                    if eid in self.games:
+                                                        # Update with richer data
+                                                        innings = _parse_innings_data(evt)
+                                                        existing = self.games[eid]
+                                                        existing.runs = innings["runs"]
+                                                        existing.wickets = innings["wickets"]
+                                                        existing.overs = innings["overs"]
+                                                        existing.balls = innings["balls"]
+                                                        existing.run_rate = innings["run_rate"]
+                                                        existing.required_run_rate = innings["required_run_rate"]
+                                                        existing.target_score = innings["target_score"]
+                                                        existing.first_innings_total = innings["first_innings_total"]
+                                                        existing.batting_team = innings["batting_team"] or existing.team_a
+                                                        existing.bowling_team = innings["bowling_team"] or existing.team_b
+                                                        existing.innings = innings["innings"]
+                                                        existing.timestamp = now
+                                                        log.info("CRICKET_FULL_UPDATE | %s | %s", eid, existing)
+                                    except Exception as e:
+                                        log.debug("CRICKET_FULL_FETCH_ERR | league=%s | %s", league_id, e)
+                                    await asyncio.sleep(0.3)
+                else:
+                    log.debug("CRICKET_HEADER_ERR | HTTP %d", resp.status)
+        except Exception as e:
+            log.warning("CRICKET_HEADER_ERR | %s", e)
+
         self._poll_count += 1
         self._last_poll_ts = now
 
         if total_live > 0 or self._poll_count % 20 == 0:
             log.info("CRICKET_FEED | live=%d total=%d poll=%d",
                      total_live, len(self.games), self._poll_count)
+
+        if total_live == 0 and len(self.games) == 0 and self._poll_count % 20 == 0:
+            log.warning("CRICKET_FEED_WARN | zero live matches across all endpoints")
 
         return {gid: gs for gid, gs in self.games.items()}
 

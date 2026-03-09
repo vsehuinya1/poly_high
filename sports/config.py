@@ -146,6 +146,13 @@ SPORTS_SLUG_PATTERNS = [
     "australian-open", "french-open", "wimbledon", "us-open",
     # Cricket
     "icc-", "t20-", "odi-", "cricket",
+    # Cricket nation slugs (catches "india-vs-new-zealand-final" etc.)
+    "india-vs", "australia-vs", "england-vs", "pakistan-vs",
+    "new-zealand-vs", "south-africa-vs", "west-indies-vs",
+    "sri-lanka-vs", "bangladesh-vs", "afghanistan-vs",
+    "cayman-islands-vs", "ireland-vs", "zimbabwe-vs",
+    "nepal-vs", "namibia-vs", "scotland-vs", "usa-vs",
+    "netherlands-vs", "uae-vs", "oman-vs", "canada-vs",
 ]
 
 # Polymarket slug team abbreviation → full name mapping
