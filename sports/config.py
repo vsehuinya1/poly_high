@@ -95,7 +95,7 @@ PER_GAME_STOP         = 200.0    # max loss per game before stopping
 # ── Tennis (Strategy B — Inflection Sniping) ─────────────────────────
 TENNIS_SERVE_WIN_P    = 0.64      # ATP average service point win rate
 TENNIS_PANIC_EDGE     = 0.06      # min edge for panic discount trigger
-TENNIS_REVERSION_EDGE = 0.05      # min edge for set mean reversion trigger
+TENNIS_REVERSION_EDGE = 0.08      # min edge for set mean reversion trigger (raised from 0.05 — sub-0.08 edges produce near-zero R)
 TENNIS_PRICE_CAP      = 0.85      # no entries above this market price
 TENNIS_STALENESS_S    = 3.0       # max state age for execution
 TENNIS_COOLDOWN_S     = 120.0     # cooldown after position exit (seconds)

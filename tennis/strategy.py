@@ -88,6 +88,11 @@ class InflectionStrategy:
         # ── Dead market logging (log-once-per-match) ──────────────
         self._dead_market_logged: set[str] = set()
 
+        # ── Edge persistence tracker (Steps 2-4) ─────────────────
+        # key: (match_id, selection_id) → (first_ts, edge_value, tick_count)
+        # Prevents early entries by requiring edge to persist for N ticks.
+        self._edge_persistence: dict[tuple[str, str], tuple[float, float, int]] = {}
+
     # ── State Key ─────────────────────────────────────────────────
 
     @staticmethod
@@ -222,6 +227,7 @@ class InflectionStrategy:
             1. The pre-game favorite is down 0-1 in sets.
             2. Not currently in a tiebreak.
             3. Fair value > market price by threshold.
+            4. Edge has persisted for required ticks (2 normal, 3 extreme).
 
         Reasoning:
             Losing the first set often causes >15% market drop for the
@@ -237,11 +243,41 @@ class InflectionStrategy:
             return None
 
         edge = fair_fav - market_price
+
+        # ── Persistence tracker key ──────────────────────────────
+        persist_key = (state.match_id, state.pregame_favorite_id or "")
+
+        # ── Safe reset: edge dropped below threshold ─────────────
         if edge < self.reversion_edge:
+            if persist_key in self._edge_persistence:
+                del self._edge_persistence[persist_key]
             return None
 
-        log.info("SET_MEAN_REVERSION triggered | edge=%.4f fair=%.4f mkt=%.4f | %s",
-                 edge, fair_fav, market_price, state)
+        # ── Update or create persistence entry ───────────────────
+        now = time.time()
+        if persist_key in self._edge_persistence:
+            prev_ts, prev_edge, prev_count = self._edge_persistence[persist_key]
+            self._edge_persistence[persist_key] = (prev_ts, edge, prev_count + 1)
+        else:
+            self._edge_persistence[persist_key] = (now, edge, 1)
+
+        _, _, tick_count = self._edge_persistence[persist_key]
+
+        # ── Required tick count (extreme edge safety) ────────────
+        required_ticks = 3 if edge > 0.30 else 2
+
+        if tick_count < required_ticks:
+            if tick_count == 1:
+                log.info("SET_MR_PENDING | edge=%.4f | ticks=%d/%d | %s",
+                         edge, tick_count, required_ticks, state.match_id)
+            return None
+
+        # ── Edge has persisted — fire signal ──────────────────────
+        # Clear persistence tracker (one signal per persistence window)
+        del self._edge_persistence[persist_key]
+
+        log.info("SET_MEAN_REVERSION triggered | edge=%.4f fair=%.4f mkt=%.4f | ticks=%d | %s",
+                 edge, fair_fav, market_price, tick_count, state)
 
         return TennisSignal(
             timestamp=time.time(),
