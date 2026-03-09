@@ -120,7 +120,14 @@ class CricketState:
     last_wicket_ts: float = 0.0
     last_boundary_ts: float = 0.0
 
+    # ── Status ───────────────────────────────────────────────────
+    status: str = "live"       # "live", "finished", "scheduled"
+
     # ── Computed Properties ──────────────────────────────────────
+
+    @property
+    def is_live(self) -> bool:
+        return self.status == "live"
 
     @property
     def overs_remaining(self) -> float:

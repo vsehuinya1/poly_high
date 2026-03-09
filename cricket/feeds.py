@@ -303,6 +303,7 @@ class CricketFeed:
                     recent_wickets=innings.get("recent_wickets", ()),
                     venue=venue,
                     timestamp=now,
+                    status=match_status,
                 )
 
                 self.games[event_id] = cs
@@ -387,6 +388,7 @@ class CricketFeed:
                                     recent_wickets=(),
                                     venue="",
                                     timestamp=now,
+                                    status="live" if hdr_state == "in" else "finished",
                                 )
                                 self.games[hdr_id] = cs
 
