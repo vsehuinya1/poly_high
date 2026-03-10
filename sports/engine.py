@@ -29,6 +29,10 @@ from sports.config import (
     GATE_FRESH_THRESHOLD, GATE_STREAK_S, GATE_ROLLING_WINDOW_S, GATE_ROLLING_FRESH_PCT,
     FREEZE_STALE_THRESHOLD, FREEZE_STALE_DURATION_S, UNFREEZE_STREAK_S,
     COOLDOWN_S, PER_GAME_STOP,
+    # Execution stability (v4.0)
+    MIN_HOLD_S, EDGE_CONFIRM_TICKS, MAX_TRADES_PER_GAME,
+    POST_EXIT_COOLDOWN_S, STOP_LOSS_TICKS, EDGE_FLIP_THRESHOLD,
+    ENTRY_MAX_SPREAD, ENTRY_MAX_BOOK_AGE_S,
 )
 from sports.feeds import GameState, BookState
 from sports.models import (
@@ -89,6 +93,9 @@ class PaperPosition:
     exit_reason: str = ""
     pnl: float = 0.0
     is_open: bool = True
+    # v4.0 stability fields
+    edge_at_exit: float = 0.0
+    stop_loss_triggered: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -142,13 +149,20 @@ class CSVLogger:
             signal.direction, signal.game_state,
         ])
 
-    def log_trade(self, pos: PaperPosition, event: str):
+    def log_trade(self, pos: PaperPosition, event: str,
+                  edge_confirm_count: int = 0, game_trade_count: int = 0):
         headers = [
             "timestamp", "event", "position_id", "game_id",
             "token_id", "outcome", "direction",
             "entry_price", "exit_price", "entry_edge",
             "size_usd", "pnl", "exit_reason", "game_state",
+            # v4.0 stability fields
+            "hold_duration_s", "edge_at_exit", "stop_loss_triggered",
+            "edge_confirm_count", "game_trade_count",
         ]
+        hold_dur = ""
+        if pos.exit_time and pos.entry_time:
+            hold_dur = f"{pos.exit_time - pos.entry_time:.2f}"
         w = self._get_writer("paper_trades", headers)
         w.writerow([
             time.time(), event, pos.position_id, pos.game_id,
@@ -159,6 +173,11 @@ class CSVLogger:
             f"{pos.size_usd:.2f}",
             f"{pos.pnl:.2f}" if pos.pnl else "",
             pos.exit_reason, pos.entry_game_state,
+            hold_dur,
+            f"{pos.edge_at_exit:.4f}" if pos.edge_at_exit else "",
+            "1" if pos.stop_loss_triggered else "0",
+            edge_confirm_count,
+            game_trade_count,
         ])
 
     def log_book_update(self, token_id: str, book: BookState):
@@ -203,6 +222,7 @@ class GameTradeState:
         self.status = GameStatus.INACTIVE
         self.pnl: float = 0.0
         self.trade_count: int = 0
+        self.entry_count: int = 0       # v4.0: counts entries (trade_count counts exits)
         self.last_exit_time: float = 0.0
         self.band_rejects: int = 0
 
@@ -365,6 +385,11 @@ class SignalEngine:
             "BLOCK_BOOK_AGE": 0,
             "BLOCK_SCORE_DIFF": 0,
             "BLOCK_DIRECTION": 0,
+            # v4.0 stability patch counters
+            "BLOCK_GAME_TRADE_LIMIT": 0,
+            "BLOCK_EDGE_CONFIRM": 0,
+            "BLOCK_ENTRY_SPREAD": 0,
+            "BLOCK_ENTRY_FRESHNESS": 0,
         }
         self._trades_taken = 0
         self._last_summary_ts = 0.0
@@ -372,6 +397,10 @@ class SignalEngine:
         self._gate_log_times: dict[tuple, float] = {}
         # Rate-limited BLOCK_TIME logging (v3.8): {key: last_log_ts}
         self._block_time_log: dict[str, float] = {}
+        # v4.0: edge confirmation counters: {(game_id, direction): consecutive_count}
+        self._edge_confirm: dict[tuple[str, str], int] = {}
+        # v4.0: timestamp of last edge signal per (game_id, direction) for staleness detection
+        self._edge_confirm_last_ts: dict[tuple[str, str], float] = {}
 
     def _get_game_state(self, game_id: str) -> GameTradeState:
         if game_id not in self._game_states:
@@ -770,7 +799,16 @@ class SignalEngine:
                      gs_str, signal.direction, signal.game_id)
             return
 
-        # 9. BLOCK_COOLDOWN — per-direction cooldown after close
+        # 9a. BLOCK_COOLDOWN — game-level post-exit cooldown (v4.0 Patch 4)
+        if gts.last_exit_time > 0:
+            game_cd = now - gts.last_exit_time
+            if game_cd < POST_EXIT_COOLDOWN_S:
+                self._blocks["BLOCK_COOLDOWN"] += 1
+                log.info("BLOCK_COOLDOWN | %s | game cooldown %.0fs < %.0fs",
+                         gs_str, game_cd, POST_EXIT_COOLDOWN_S)
+                return
+
+        # 9b. BLOCK_COOLDOWN — per-direction cooldown after close (existing)
         dir_cd = gts.direction_cooldown_remaining(signal.direction, now)
         if dir_cd > 0:
             self._blocks["BLOCK_COOLDOWN"] += 1
@@ -782,17 +820,58 @@ class SignalEngine:
         if gts.status == GameStatus.STOPPED:
             return
 
+        # 11. BLOCK_GAME_TRADE_LIMIT — max entries per game (v4.0 Patch 3)
+        if gts.entry_count >= MAX_TRADES_PER_GAME:
+            self._blocks["BLOCK_GAME_TRADE_LIMIT"] += 1
+            log.info("BLOCK_GAME_TRADE_LIMIT | %s | entries=%d >= %d",
+                     gs_str, gts.entry_count, MAX_TRADES_PER_GAME)
+            return
+
+        # 12. BLOCK_EDGE_CONFIRM — edge must persist N ticks (v4.0 Patch 2)
+        confirm_key = (signal.game_id, signal.direction)
+        # Decay counter if last signal for this key was >15s ago (prevents stale counters)
+        last_ts = self._edge_confirm_last_ts.get(confirm_key, 0)
+        if last_ts > 0 and (now - last_ts) > 15.0:
+            self._edge_confirm[confirm_key] = 0
+        self._edge_confirm[confirm_key] = self._edge_confirm.get(confirm_key, 0) + 1
+        self._edge_confirm_last_ts[confirm_key] = now
+        # Reset opposite direction counter for this game
+        opp_key = (signal.game_id, "BUY" if signal.direction == "SELL" else "SELL")
+        self._edge_confirm[opp_key] = 0
+
+        if self._edge_confirm[confirm_key] < EDGE_CONFIRM_TICKS:
+            self._blocks["BLOCK_EDGE_CONFIRM"] += 1
+            log.info("BLOCK_EDGE_CONFIRM | %s | %s confirm=%d/%d",
+                     gs_str, signal.direction,
+                     self._edge_confirm[confirm_key], EDGE_CONFIRM_TICKS)
+            return
+
         # ── Determine execution price ─────────────────────────────
         if signal.direction == "BUY":
             entry_price = book.best_ask if book.best_ask > 0 else signal.market_prob
         else:
             entry_price = book.best_bid if book.best_bid > 0 else signal.market_prob
 
-        # 11. BLOCK_PRICE on ACTUAL execution price (v3.8: direction-specific)
+        # 13. BLOCK_PRICE on ACTUAL execution price (v3.8: direction-specific)
         if not (band_lo <= entry_price <= band_hi):
             self._blocks["BLOCK_PRICE"] += 1
             log.info("BLOCK_PRICE | %s | %s entry=%.3f (actual) outside [%.2f,%.2f]",
                      gs_str, signal.direction, entry_price, band_lo, band_hi)
+            return
+
+        # 14. BLOCK_ENTRY_SPREAD — tight spread check at execution (v4.0 Patch 7)
+        if book.spread > ENTRY_MAX_SPREAD:
+            self._blocks["BLOCK_ENTRY_SPREAD"] += 1
+            log.info("BLOCK_ENTRY_SPREAD | %s | spread=%.3f > %.3f",
+                     gs_str, book.spread, ENTRY_MAX_SPREAD)
+            return
+
+        # 15. BLOCK_ENTRY_FRESHNESS — book must be recent (v4.0 Patch 7)
+        entry_book_age = now - book.timestamp if book.timestamp > 0 else 9999
+        if entry_book_age > ENTRY_MAX_BOOK_AGE_S:
+            self._blocks["BLOCK_ENTRY_FRESHNESS"] += 1
+            log.info("BLOCK_ENTRY_FRESHNESS | %s | book_age=%.1fs > %.1fs",
+                     gs_str, entry_book_age, ENTRY_MAX_BOOK_AGE_S)
             return
 
         # ── Log daily summary periodically ────────────────────────
@@ -819,12 +898,19 @@ class SignalEngine:
         )
 
         self.positions[pos.position_id] = pos
-        self.csv.log_trade(pos, "ENTRY")
+        # v4.0: track entry count (for per-game trade limit)
+        gts.entry_count += 1
+        edge_cc = self._edge_confirm.get(confirm_key, 0)
+        self.csv.log_trade(pos, "ENTRY",
+                           edge_confirm_count=edge_cc,
+                           game_trade_count=gts.entry_count)
         self._trades_taken += 1
+        # v4.0: reset edge confirmation counter after entry
+        self._edge_confirm[confirm_key] = 0
 
-        log.info("PAPER ENTRY: %s %s %s @ %.3f ($%.0f) edge=%.3f | %s",
+        log.info("PAPER ENTRY: %s %s %s @ %.3f ($%.0f) edge=%.3f confirm=%d | %s",
                  pos.position_id, pos.direction, pos.outcome,
-                 entry_price, size, signal.edge, signal.game_state)
+                 entry_price, size, signal.edge, edge_cc, signal.game_state)
 
         await self.tg.notify_paper_entry(
             pos.position_id, pos.direction, pos.outcome,
@@ -853,17 +939,38 @@ class SignalEngine:
             if pos.direction == "SELL":
                 current_edge = -current_edge
 
+            now = time.time()
+            time_since_entry = now - pos.entry_time
+
             exit_reason = ""
 
-            # Check for convergence or edge flip
-            if abs(current_edge) < EXIT_CONVERGENCE:
+            # ── v4.0 exit priority (Patches 1, 5, 6) ──────────────
+            # Priority: stop_loss > convergence > edge_flip > game_end > timeout
+            # stop_loss and game_end/timeout override the hold window.
+            # edge_flip is suppressed during the hold window.
+
+            # Patch 5: HARD STOP-LOSS — always fires, overrides hold window
+            if pos.direction == "BUY":
+                adverse = pos.entry_price - current_mid
+            else:
+                adverse = current_mid - pos.entry_price
+            stop_price = STOP_LOSS_TICKS * 0.01
+
+            if adverse >= stop_price:
+                exit_reason = "stop_loss"
+
+            # Convergence — allowed during hold window (edge closed = good exit)
+            elif abs(current_edge) < EXIT_CONVERGENCE:
                 exit_reason = "convergence"
-            elif current_edge < -ENTRY_EDGE_THRESHOLD:
+
+            # Patch 1+6: edge_flip — only after hold window, require meaningful reversal
+            elif current_edge < -EDGE_FLIP_THRESHOLD and time_since_entry >= MIN_HOLD_S:
                 exit_reason = "edge_flip"
-            
+
+            # game_end and timeout override everything (absolute exits)
             if not game_state.is_live:
                 exit_reason = "game_end"
-            if time.time() - pos.entry_time > 1800: # 30 min timeout
+            if time_since_entry > 1800:  # 30 min timeout
                 exit_reason = "timeout"
 
             if exit_reason:
@@ -886,26 +993,32 @@ class SignalEngine:
                     pnl = (pos.entry_price - exit_price) * pos.size_usd
 
                 pos.exit_price = exit_price
-                pos.exit_time = time.time()
+                pos.exit_time = now
                 pos.exit_reason = exit_reason
                 pos.pnl = pnl
                 pos.is_open = False
+                # v4.0 stability fields
+                pos.edge_at_exit = current_edge
+                pos.stop_loss_triggered = (exit_reason == "stop_loss")
                 self.daily_pnl += pnl
 
                 # Per-game PnL + cooldown tracking
                 gts = self._get_game_state(game_state.game_id)
-                stop_transition = gts.record_exit(pnl, time.time())
-                gts.record_direction_exit(pos.direction, time.time())  # v3.4 per-direction cooldown
+                stop_transition = gts.record_exit(pnl, now)
+                gts.record_direction_exit(pos.direction, now)  # v3.4 per-direction cooldown
                 if stop_transition:
                     log.info("%s: %s (pnl=$%.2f, game_id=%s)",
                              stop_transition, link.polymarket_title,
                              gts.pnl, game_state.game_id)
-                self.csv.log_trade(pos, "EXIT")
+                self.csv.log_trade(pos, "EXIT",
+                                   game_trade_count=gts.entry_count)
 
-                log.info("PAPER EXIT: %s %s @ %.3f → %.3f PnL=$%.2f (%s) | daily=$%.2f",
+                log.info("PAPER EXIT: %s %s @ %.3f → %.3f PnL=$%.2f (%s) "
+                         "hold=%.1fs edge_now=%.3f | daily=$%.2f",
                          pos.position_id, pos.outcome,
                          pos.entry_price, exit_price, pnl,
-                         exit_reason, self.daily_pnl)
+                         exit_reason, time_since_entry, current_edge,
+                         self.daily_pnl)
 
                 await self.tg.notify_paper_exit(
                     pos.position_id, pos.outcome,

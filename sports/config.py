@@ -92,6 +92,16 @@ UNFREEZE_STREAK_S     = 60.0     # fresh streak needed to unfreeze
 COOLDOWN_S            = 300.0    # 5-minute cooldown per game after exit
 PER_GAME_STOP         = 200.0    # max loss per game before stopping
 
+# ── Execution Stability (v4.0 — stability patch) ────────────────────
+MIN_HOLD_S            = 5        # Patch 1: suppress edge_flip for 5s after entry
+EDGE_CONFIRM_TICKS    = 3        # Patch 2: edge must persist 3 consecutive ticks
+MAX_TRADES_PER_GAME   = 20       # Patch 3: cap total entries per game
+POST_EXIT_COOLDOWN_S  = 30       # Patch 4: game-level cooldown after any exit
+STOP_LOSS_TICKS       = 6        # Patch 5: hard stop at 6 ticks (0.06) adverse
+EDGE_FLIP_THRESHOLD   = 0.03     # Patch 6: edge reversal must exceed this to exit
+ENTRY_MAX_SPREAD      = 0.03     # Patch 7: max 3-tick spread at execution moment
+ENTRY_MAX_BOOK_AGE_S  = 3.0      # Patch 7: book must be <3s old at execution
+
 # ── Tennis (Strategy B — Inflection Sniping) ─────────────────────────
 TENNIS_SERVE_WIN_P    = 0.64      # ATP average service point win rate
 TENNIS_PANIC_EDGE     = 0.06      # min edge for panic discount trigger
