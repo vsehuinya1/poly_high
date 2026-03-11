@@ -102,6 +102,13 @@ EDGE_FLIP_THRESHOLD   = 0.03     # Patch 6: edge reversal must exceed this to ex
 ENTRY_MAX_SPREAD      = 0.03     # Patch 7: max 3-tick spread at execution moment
 ENTRY_MAX_BOOK_AGE_S  = 3.0      # Patch 7: book must be <3s old at execution
 
+# ── Football Risk Controls (v4.3 — MAE-based) ───────────────────────
+FOOTBALL_STOP_LOSS_TICKS = 12     # MAE-based statistical stop (median MAE ≈ 11.25)
+FOOTBALL_FAST_MOVE_TICKS = 3      # early momentum exit threshold (ticks)
+FOOTBALL_FAST_MOVE_S     = 300    # momentum window (5 minutes)
+FOOTBALL_TIMEOUT_S       = 900    # reduced timeout (15 min, was 30 min)
+DEFAULT_TIMEOUT_S        = 1800   # NBA / default timeout (30 min)
+
 # ── Tennis (Strategy B — Inflection Sniping) ─────────────────────────
 TENNIS_SERVE_WIN_P    = 0.64      # ATP average service point win rate
 TENNIS_PANIC_EDGE     = 0.06      # min edge for panic discount trigger

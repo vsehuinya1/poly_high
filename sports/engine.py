@@ -33,6 +33,9 @@ from sports.config import (
     MIN_HOLD_S, EDGE_CONFIRM_TICKS, MAX_TRADES_PER_GAME,
     POST_EXIT_COOLDOWN_S, STOP_LOSS_TICKS, EDGE_FLIP_THRESHOLD,
     ENTRY_MAX_SPREAD, ENTRY_MAX_BOOK_AGE_S,
+    # Football risk controls (v4.3)
+    FOOTBALL_STOP_LOSS_TICKS, FOOTBALL_FAST_MOVE_TICKS,
+    FOOTBALL_FAST_MOVE_S, FOOTBALL_TIMEOUT_S, DEFAULT_TIMEOUT_S,
 )
 from sports.feeds import GameState, BookState
 from sports.models import (
@@ -96,6 +99,13 @@ class PaperPosition:
     # v4.0 stability fields
     edge_at_exit: float = 0.0
     stop_loss_triggered: bool = False
+    # v4.3 sport + MAE/MFE tracking
+    sport: str = ""
+    mae_ticks: float = 0.0
+    mfe_ticks: float = 0.0
+    time_to_mae_s: float = 0.0
+    time_to_mfe_s: float = 0.0
+    momentum_exit_triggered: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -159,6 +169,9 @@ class CSVLogger:
             # v4.0 stability fields
             "hold_duration_s", "edge_at_exit", "stop_loss_triggered",
             "edge_confirm_count", "game_trade_count",
+            # v4.3 football diagnostics
+            "sport", "mae_ticks", "mfe_ticks",
+            "time_to_mae_s", "time_to_mfe_s", "momentum_exit_triggered",
         ]
         hold_dur = ""
         if pos.exit_time and pos.entry_time:
@@ -178,6 +191,12 @@ class CSVLogger:
             "1" if pos.stop_loss_triggered else "0",
             edge_confirm_count,
             game_trade_count,
+            pos.sport,
+            f"{pos.mae_ticks:.1f}",
+            f"{pos.mfe_ticks:.1f}",
+            f"{pos.time_to_mae_s:.1f}",
+            f"{pos.time_to_mfe_s:.1f}",
+            "1" if pos.momentum_exit_triggered else "0",
         ])
 
     def log_book_update(self, token_id: str, book: BookState):
@@ -895,6 +914,7 @@ class SignalEngine:
             entry_game_state=signal.game_state,
             market_title=link.polymarket_title,
             size_usd=size,
+            sport=link.sport,
         )
 
         self.positions[pos.position_id] = pos
@@ -942,35 +962,58 @@ class SignalEngine:
             now = time.time()
             time_since_entry = now - pos.entry_time
 
-            exit_reason = ""
-
-            # ── v4.0 exit priority (Patches 1, 5, 6) ──────────────
-            # Priority: stop_loss > convergence > edge_flip > game_end > timeout
-            # stop_loss and game_end/timeout override the hold window.
-            # edge_flip is suppressed during the hold window.
-
-            # Patch 5: HARD STOP-LOSS — always fires, overrides hold window
+            # ── v4.3: Compute adverse move + live MAE/MFE tracking ──
             if pos.direction == "BUY":
                 adverse = pos.entry_price - current_mid
+                favorable = current_mid - pos.entry_price
             else:
                 adverse = current_mid - pos.entry_price
-            stop_price = STOP_LOSS_TICKS * 0.01
+                favorable = pos.entry_price - current_mid
 
+            adverse_ticks = max(0.0, adverse * 100)
+            favorable_ticks = max(0.0, favorable * 100)
+
+            # Update running MAE/MFE on the position
+            if adverse_ticks > pos.mae_ticks:
+                pos.mae_ticks = adverse_ticks
+                pos.time_to_mae_s = time_since_entry
+            if favorable_ticks > pos.mfe_ticks:
+                pos.mfe_ticks = favorable_ticks
+                pos.time_to_mfe_s = time_since_entry
+
+            # ── Determine sport-specific parameters ────────────────
+            is_football = link.sport.lower() == "football"
+            sl_ticks = FOOTBALL_STOP_LOSS_TICKS if is_football else STOP_LOSS_TICKS
+            timeout_s = FOOTBALL_TIMEOUT_S if is_football else DEFAULT_TIMEOUT_S
+
+            exit_reason = ""
+
+            # ── v4.3 exit priority ─────────────────────────────────
+            # Priority: stop_loss > momentum_exit > convergence > edge_flip > game_end > timeout
+
+            # HARD STOP-LOSS — sport-specific threshold
+            stop_price = sl_ticks * 0.01
             if adverse >= stop_price:
                 exit_reason = "stop_loss"
+
+            # v4.3: MOMENTUM EXIT — football only, early trend detection
+            elif is_football and time_since_entry <= FOOTBALL_FAST_MOVE_S \
+                    and adverse_ticks >= FOOTBALL_FAST_MOVE_TICKS:
+                exit_reason = "momentum_exit"
+                pos.momentum_exit_triggered = True
 
             # Convergence — allowed during hold window (edge closed = good exit)
             elif abs(current_edge) < EXIT_CONVERGENCE:
                 exit_reason = "convergence"
 
-            # Patch 1+6: edge_flip — only after hold window, require meaningful reversal
+            # edge_flip — only after hold window, require meaningful reversal
             elif current_edge < -EDGE_FLIP_THRESHOLD and time_since_entry >= MIN_HOLD_S:
                 exit_reason = "edge_flip"
 
             # game_end and timeout override everything (absolute exits)
             if not game_state.is_live:
                 exit_reason = "game_end"
-            if time_since_entry > 1800:  # 30 min timeout
+            if time_since_entry > timeout_s:
                 exit_reason = "timeout"
 
             if exit_reason:
