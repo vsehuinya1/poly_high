@@ -23,6 +23,7 @@ from difflib import SequenceMatcher
 
 import aiohttp
 
+from config import POLYMARKET_API_KEY, POLYMARKET_SECRET, POLYMARKET_PASSPHRASE
 from sports.config import (
     DATA_DIR, LOG_DIR, SCORE_POLL_INTERVAL_S, POLYMARKET_SNAPSHOT_S,
     DISCOVERY_INTERVAL_S,
@@ -373,6 +374,9 @@ class SportsOrchestrator:
             self.tennis_live = LiveExecutor(
                 private_key=POLY_PRIVATE_KEY,
                 funder_address=POLY_FUNDER_ADDRESS,
+                api_key=POLYMARKET_API_KEY,
+                api_secret=POLYMARKET_SECRET,
+                api_passphrase=POLYMARKET_PASSPHRASE,
                 initial_bankroll=TENNIS_BANKROLL,
                 kelly_pct=TENNIS_KELLY_PCT,
                 min_order_usd=TENNIS_MIN_ORDER_USD,

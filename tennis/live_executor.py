@@ -45,7 +45,7 @@ class LiveExecutor:
     """
     Manages live Polymarket execution for tennis trades.
 
-    - Initializes CLOB client from private key + funder
+    - Initializes CLOB client from private key + API creds
     - Tracks bankroll with compounding
     - Places market BUY orders (FOK)
     - Logs every order to CSV
@@ -53,8 +53,11 @@ class LiveExecutor:
 
     def __init__(
         self,
-        private_key: str,
-        funder_address: str,
+        private_key: str = "",
+        funder_address: str = "",
+        api_key: str = "",
+        api_secret: str = "",
+        api_passphrase: str = "",
         initial_bankroll: float = 24.0,
         kelly_pct: float = 0.30,
         min_order_usd: float = 1.0,
@@ -77,8 +80,8 @@ class LiveExecutor:
             log.error("py-clob-client not available — cannot trade live")
             return
 
-        if not private_key or not funder_address:
-            log.error("POLY_PRIVATE_KEY or POLY_FUNDER_ADDRESS not set — live trading disabled")
+        if not private_key:
+            log.error("POLY_PRIVATE_KEY not set — live trading disabled")
             return
 
         try:
@@ -87,9 +90,22 @@ class LiveExecutor:
                 key=private_key,
                 chain_id=137,
                 signature_type=0,  # EOA wallet
-                funder=funder_address,
+                funder=funder_address if funder_address else None,
             )
-            self._client.set_api_creds(self._client.create_or_derive_api_creds())
+
+            # Use pre-existing API creds if provided, otherwise derive
+            if api_key and api_secret and api_passphrase:
+                from py_clob_client.clob_types import ApiCreds
+                self._client.set_api_creds(ApiCreds(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    api_passphrase=api_passphrase,
+                ))
+                log.info("LIVE EXECUTOR: using pre-existing API credentials")
+            else:
+                self._client.set_api_creds(self._client.create_or_derive_api_creds())
+                log.info("LIVE EXECUTOR: derived API credentials from private key")
+
             log.info("LIVE EXECUTOR: initialized (bankroll=$%.2f, kelly=%.0f%%)",
                      self.bankroll, self.kelly_pct * 100)
         except Exception as e:
