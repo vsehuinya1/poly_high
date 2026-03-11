@@ -50,7 +50,10 @@ from sports.config import (
     TENNIS_FEED_POLL_S,
     TENNIS_PRICE_FLOOR, TENNIS_MAX_SIGNALS_HR,
     TENNIS_STALE_DISABLE_COUNT, TENNIS_STALE_DISABLE_S,
+    TENNIS_LIVE_MODE, TENNIS_BANKROLL, TENNIS_KELLY_PCT,
+    TENNIS_MIN_ORDER_USD, POLY_PRIVATE_KEY, POLY_FUNDER_ADDRESS,
 )
+from tennis.live_executor import LiveExecutor
 
 # Cricket engine imports
 from cricket import (
@@ -359,7 +362,28 @@ class SportsOrchestrator:
             stale_disable_s=TENNIS_STALE_DISABLE_S,
         )
         self.tennis_logger = TennisCSVLogger(DATA_DIR)
-        self.tennis_exit_mgr = TennisExitManager(DATA_DIR)
+        self.tennis_exit_mgr = TennisExitManager(
+            DATA_DIR,
+            on_close=self._tennis_live_sell_callback,
+        )
+
+        # ── Tennis Live Executor (v4.4) ───────────────────────────
+        self.tennis_live = None
+        if TENNIS_LIVE_MODE:
+            self.tennis_live = LiveExecutor(
+                private_key=POLY_PRIVATE_KEY,
+                funder_address=POLY_FUNDER_ADDRESS,
+                initial_bankroll=TENNIS_BANKROLL,
+                kelly_pct=TENNIS_KELLY_PCT,
+                min_order_usd=TENNIS_MIN_ORDER_USD,
+                data_dir=DATA_DIR,
+            )
+            if self.tennis_live.is_ready:
+                log.info("TENNIS LIVE MODE: ON | bankroll=$%.2f | kelly=%.0f%%",
+                         TENNIS_BANKROLL, TENNIS_KELLY_PCT * 100)
+            else:
+                log.warning("TENNIS LIVE MODE: credentials missing — paper only")
+                self.tennis_live = None
         self.tennis_score_feed = TennisScoreFeed(poll_interval_s=TENNIS_FEED_POLL_S)
         self.tennis_markets: list[SportMarket] = []  # discovered tennis markets
         self.tennis_links: dict[str, GameMarketLink] = {}  # match_id → link
@@ -814,10 +838,24 @@ class SportsOrchestrator:
                              link.polymarket_title[:30],
                              state.sets_a, state.sets_b, state.games_a, state.games_b)
 
+                    # ── LIVE ORDER (v4.4) ──────────────────────────
+                    live_tag = "PAPER"
+                    if self.tennis_live and self.tennis_live.is_ready:
+                        match_desc = f"{link.polymarket_title[:40]} {state.sets_a}-{state.sets_b}"
+                        result = self.tennis_live.buy(
+                            token_id=fav_token,
+                            price=market_price,
+                            match_info=match_desc,
+                        )
+                        if result.success:
+                            live_tag = f"LIVE ${result.filled_size:.2f}"
+                        else:
+                            live_tag = f"LIVE FAIL: {result.error}"
+
                     # Telegram alert
                     try:
                         await self.engine.tg.send(
-                            f"🎾 <b>Tennis Signal</b>\n"
+                            f"🎾 <b>Tennis Signal [{live_tag}]</b>\n"
                             f"Trigger: {signal.trigger_type}\n"
                             f"Edge: {signal.edge:+.4f}\n"
                             f"Fair: {signal.fair_price:.4f} | Mkt: {market_price:.4f}\n"
@@ -886,6 +924,50 @@ class SportsOrchestrator:
             get_score=_get_score,
             is_match_finished=_is_finished,
         )
+
+    def _tennis_live_sell_callback(self, trade):
+        """Called by ExitManager when a trade closes — fire live SELL."""
+        if not self.tennis_live or not self.tennis_live.is_ready:
+            return
+
+        exit_price = trade.exit_price or 0.0
+        if exit_price <= 0:
+            return
+
+        # Estimate sell size from original buy
+        sell_size = self.tennis_live.order_size  # approximate
+        match_desc = f"{trade.player} R={trade.R_multiple:+.4f}"
+
+        result = self.tennis_live.sell(
+            token_id=trade.selection_id,
+            size_usd=sell_size,
+            price=exit_price,
+            match_info=match_desc,
+        )
+
+        # Update bankroll with actual PnL
+        self.tennis_live.record_exit_pnl(
+            entry_size=self.tennis_live.order_size,
+            exit_price=exit_price,
+            entry_price=trade.entry_price,
+        )
+
+        # Telegram exit notification
+        live_tag = f"LIVE SELL" if result.success else "LIVE SELL FAIL"
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(self.engine.tg.send(
+                    f"🎾 <b>Tennis Exit [{live_tag}]</b>\n"
+                    f"Player: {trade.player}\n"
+                    f"Reason: {trade.exit_reason}\n"
+                    f"Entry: {trade.entry_price:.4f} → Exit: {exit_price:.4f}\n"
+                    f"R: {trade.R_multiple:+.4f}\n"
+                    f"Bankroll: ${self.tennis_live.bankroll:.2f}"
+                ))
+        except Exception:
+            pass
 
     async def _cricket_signal_loop(self):
         """Cricket paper-only signal processing loop."""

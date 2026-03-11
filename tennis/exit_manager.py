@@ -98,7 +98,7 @@ class TennisExitManager:
         (60 * 60,  "price_t60", "_snapshot_60_done"),
     ]
 
-    def __init__(self, data_dir: Path):
+    def __init__(self, data_dir: Path, on_close=None):
         self.open_trades: dict[str, TennisPaperTrade] = {}  # match_id → trade
         self.closed_trades: list[TennisPaperTrade] = []
         self._data_dir = data_dir
@@ -106,6 +106,7 @@ class TennisExitManager:
         self._csv_writer = None
         self._csv_fh = None
         self._csv_initialized = False
+        self._on_close = on_close  # callback(trade) for live sell hook
 
     # ── Trade Registration ──────────────────────────────────────
 
@@ -326,6 +327,13 @@ class TennisExitManager:
         )
 
         self._write_lifecycle_row(trade)
+
+        # v4.4: fire on_close callback for live sell
+        if self._on_close:
+            try:
+                self._on_close(trade)
+            except Exception as e:
+                log.error("on_close callback error: %s", e)
 
     def _ensure_csv(self):
         """Lazily create CSV writer."""

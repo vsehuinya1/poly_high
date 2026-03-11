@@ -136,6 +136,14 @@ CRICKET_WICKET_EDGE        = 0.10   # min edge for wicket overreaction
 CRICKET_LATENCY_THRESH_MS  = 2000.0 # min latency for snipe logging
 CRICKET_COOLDOWN_S         = 120.0  # cooldown between trades
 
+# ── Tennis Live Execution (v4.4) ─────────────────────────────────────
+TENNIS_LIVE_MODE       = os.getenv("TENNIS_LIVE_MODE", "false").lower() == "true"
+TENNIS_BANKROLL        = float(os.getenv("TENNIS_BANKROLL", "24.0"))
+TENNIS_KELLY_PCT       = float(os.getenv("TENNIS_KELLY_PCT", "0.30"))
+TENNIS_MIN_ORDER_USD   = 1.0      # minimum order size
+POLY_PRIVATE_KEY       = os.getenv("POLY_PRIVATE_KEY", "")
+POLY_FUNDER_ADDRESS    = os.getenv("POLY_FUNDER_ADDRESS", "")
+
 # ── Data Storage ─────────────────────────────────────────────────────
 DATA_DIR = Path(os.getenv("SPORTS_DATA_DIR", "sports_data"))
 LOG_DIR  = Path(os.getenv("LOG_DIR", "logs"))
