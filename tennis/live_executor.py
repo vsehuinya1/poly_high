@@ -7,6 +7,7 @@ Handles bankroll tracking, Kelly sizing, and order logging.
 v4.4 — 2026-03-11
 """
 import csv
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -63,11 +64,20 @@ class LiveExecutor:
         min_order_usd: float = 1.0,
         data_dir: Path = Path("sports_data"),
     ):
-        self.bankroll = initial_bankroll
         self.kelly_pct = kelly_pct
         self.min_order_usd = min_order_usd
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._bankroll_file = self.data_dir / "tennis_bankroll.json"
+
+        # Load persisted bankroll or use initial
+        saved = self._load_bankroll()
+        if saved is not None:
+            self.bankroll = saved
+            log.info("BANKROLL: loaded persisted $%.2f", self.bankroll)
+        else:
+            self.bankroll = initial_bankroll
+            log.info("BANKROLL: starting fresh $%.2f", self.bankroll)
 
         self._client: Optional[ClobClient] = None
         self._csv_writer = None
@@ -170,6 +180,7 @@ class LiveExecutor:
                 self.bankroll -= size_usd
                 self._orders_placed += 1
                 self._total_spent += size_usd
+                self._save_bankroll()
                 log.info("LIVE BUY FILLED | order=%s | $%.2f @ %.4f | bankroll=$%.2f",
                          order_id, size_usd, price, self.bankroll)
             else:
@@ -230,6 +241,7 @@ class LiveExecutor:
                 proceeds = size_usd  # approximate — actual may differ
                 self.bankroll += proceeds
                 self._total_received += proceeds
+                self._save_bankroll()
                 log.info("LIVE SELL FILLED | order=%s | $%.2f @ %.4f | bankroll=$%.2f",
                          order_id, size_usd, price, self.bankroll)
             else:
@@ -256,6 +268,7 @@ class LiveExecutor:
             proceeds = shares * exit_price
             pnl = proceeds - entry_size
             self.bankroll += pnl  # note: entry_size was already subtracted on buy
+            self._save_bankroll()
             log.info("LIVE PNL | entry=$%.2f@%.4f exit@%.4f | shares=%.2f pnl=$%.2f | bankroll=$%.2f",
                      entry_size, entry_price, exit_price, shares, pnl, self.bankroll)
 
@@ -289,7 +302,27 @@ class LiveExecutor:
         return (f"LIVE: ON | bankroll=${self.bankroll:.2f} | "
                 f"size=${self.order_size:.2f} | orders={self._orders_placed}")
 
+    def _save_bankroll(self):
+        """Persist bankroll to disk for restart recovery."""
+        try:
+            with open(self._bankroll_file, "w") as f:
+                json.dump({"bankroll": self.bankroll, "updated": time.time()}, f)
+        except Exception:
+            pass
+
+    def _load_bankroll(self) -> Optional[float]:
+        """Load persisted bankroll if available."""
+        try:
+            if self._bankroll_file.exists():
+                with open(self._bankroll_file) as f:
+                    data = json.load(f)
+                return data.get("bankroll")
+        except Exception:
+            pass
+        return None
+
     def close(self):
         """Clean up CSV handle."""
+        self._save_bankroll()
         if self._csv_fh:
             self._csv_fh.close()
