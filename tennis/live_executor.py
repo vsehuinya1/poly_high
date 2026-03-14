@@ -21,6 +21,7 @@ try:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType
     from py_clob_client.order_builder.constants import BUY, SELL
+    import py_clob_client.http_helpers.helpers as _clob_helpers
     HAS_CLOB = True
 except ImportError:
     HAS_CLOB = False
@@ -59,6 +60,7 @@ class LiveExecutor:
         api_key: str = "",
         api_secret: str = "",
         api_passphrase: str = "",
+        proxy_url: str = "",
         initial_bankroll: float = 24.0,
         kelly_pct: float = 0.30,
         min_order_usd: float = 1.0,
@@ -85,6 +87,7 @@ class LiveExecutor:
         self._orders_placed = 0
         self._total_spent = 0.0
         self._total_received = 0.0
+        self._live_fills: set = set()  # match_ids with confirmed live fills
 
         if not HAS_CLOB:
             log.error("py-clob-client not available — cannot trade live")
@@ -118,6 +121,21 @@ class LiveExecutor:
 
             log.info("LIVE EXECUTOR: initialized (bankroll=$%.2f, kelly=%.0f%%)",
                      self.bankroll, self.kelly_pct * 100)
+
+            # Monkey-patch py-clob-client's httpx client with proxy
+            if proxy_url and HAS_CLOB:
+                try:
+                    import httpx
+                    proxied = httpx.Client(
+                        http2=True,
+                        proxy=proxy_url,
+                        timeout=10.0,
+                    )
+                    _clob_helpers._http_client = proxied
+                    log.info("LIVE EXECUTOR: proxy set → %s", proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url)
+                except Exception as pe:
+                    log.error("LIVE EXECUTOR: failed to set proxy: %s", pe)
+
         except Exception as e:
             log.error("LIVE EXECUTOR: failed to init ClobClient: %s", e)
             self._client = None
@@ -125,6 +143,14 @@ class LiveExecutor:
     @property
     def is_ready(self) -> bool:
         return self._client is not None
+
+    def record_fill(self, match_id: str):
+        """Record that a live fill happened for this match."""
+        self._live_fills.add(match_id)
+
+    def has_live_fill(self, match_id: str) -> bool:
+        """Check if a match had a confirmed live fill."""
+        return match_id in self._live_fills
 
     @property
     def order_size(self) -> float:

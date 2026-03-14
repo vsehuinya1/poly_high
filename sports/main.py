@@ -53,6 +53,7 @@ from sports.config import (
     TENNIS_STALE_DISABLE_COUNT, TENNIS_STALE_DISABLE_S,
     TENNIS_LIVE_MODE, TENNIS_BANKROLL, TENNIS_KELLY_PCT,
     TENNIS_MIN_ORDER_USD, POLY_PRIVATE_KEY, POLY_FUNDER_ADDRESS,
+    CLOB_PROXY_URL,
 )
 from tennis.live_executor import LiveExecutor
 
@@ -377,6 +378,7 @@ class SportsOrchestrator:
                 api_key=POLYMARKET_API_KEY,
                 api_secret=POLYMARKET_SECRET,
                 api_passphrase=POLYMARKET_PASSPHRASE,
+                proxy_url=CLOB_PROXY_URL,
                 initial_bankroll=TENNIS_BANKROLL,
                 kelly_pct=TENNIS_KELLY_PCT,
                 min_order_usd=TENNIS_MIN_ORDER_USD,
@@ -853,6 +855,7 @@ class SportsOrchestrator:
                         )
                         if result.success:
                             live_tag = f"LIVE ${result.filled_size:.2f}"
+                            self.tennis_live.record_fill(match_id)
                         else:
                             live_tag = f"LIVE FAIL: {result.error}"
 
@@ -930,12 +933,12 @@ class SportsOrchestrator:
         )
 
     def _tennis_live_sell_callback(self, trade):
-        """Called by ExitManager when a trade closes — fire live SELL."""
+        """Called by ExitManager when a trade closes — fire live SELL only if we had a fill."""
         if not self.tennis_live or not self.tennis_live.is_ready:
             return
 
-        exit_price = trade.exit_price or 0.0
-        if exit_price <= 0:
+        # Only sell if we actually bought live
+        if not self.tennis_live.has_live_fill(trade.match_id):
             return
 
         # Estimate sell size from original buy

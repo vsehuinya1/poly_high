@@ -143,6 +143,7 @@ TENNIS_KELLY_PCT       = float(os.getenv("TENNIS_KELLY_PCT", "0.30"))
 TENNIS_MIN_ORDER_USD   = 1.0      # minimum order size
 POLY_PRIVATE_KEY       = os.getenv("POLY_PRIVATE_KEY", "")
 POLY_FUNDER_ADDRESS    = os.getenv("POLY_FUNDER_ADDRESS", "")
+CLOB_PROXY_URL         = os.getenv("CLOB_PROXY_URL", "")  # US proxy for geoblock bypass
 
 # ── Data Storage ─────────────────────────────────────────────────────
 DATA_DIR = Path(os.getenv("SPORTS_DATA_DIR", "sports_data"))
