@@ -867,7 +867,8 @@ class SportsOrchestrator:
                             f"Edge: {signal.edge:+.4f}\n"
                             f"Fair: {signal.fair_price:.4f} | Mkt: {market_price:.4f}\n"
                             f"Match: {link.polymarket_title}\n"
-                            f"Score: {state.sets_a}-{state.sets_b} | {state.games_a}-{state.games_b} | {state.point_a.value}-{state.point_b.value}"
+                            f"Score: {state.sets_a}-{state.sets_b} | {state.games_a}-{state.games_b} | {state.point_a.value}-{state.point_b.value}\n"
+                            f"Trades today: {len(self.tennis_exit_mgr.open_trades)} open | {len(self.tennis_exit_mgr.closed_trades)} closed"
                         )
                     except Exception:
                         pass
@@ -933,45 +934,57 @@ class SportsOrchestrator:
         )
 
     def _tennis_live_sell_callback(self, trade):
-        """Called by ExitManager when a trade closes — fire live SELL only if we had a fill."""
-        if not self.tennis_live or not self.tennis_live.is_ready:
-            return
+        """Called by ExitManager when a trade closes — send Telegram + fire live SELL if filled."""
+        exit_price = trade.exit_price or 0.0
 
-        # Only sell if we actually bought live
-        if not self.tennis_live.has_live_fill(trade.match_id):
-            return
+        # Calculate $ PnL (paper estimate based on $3.90 trade size)
+        if trade.entry_price and trade.entry_price > 0:
+            pnl_pct = (exit_price - trade.entry_price) / trade.entry_price
+            pnl_usd = pnl_pct * 3.90  # approximate
+        else:
+            pnl_pct = 0.0
+            pnl_usd = 0.0
 
-        # Estimate sell size from original buy
-        sell_size = self.tennis_live.order_size  # approximate
-        match_desc = f"{trade.player} R={trade.R_multiple:+.4f}"
+        r_mult = trade.R_multiple if hasattr(trade, 'R_multiple') else 0.0
+        win_emoji = "✅" if r_mult > 0 else "❌" if r_mult < -0.05 else "➖"
 
-        result = self.tennis_live.sell(
-            token_id=trade.selection_id,
-            size_usd=sell_size,
-            price=exit_price,
-            match_info=match_desc,
-        )
+        # Running tally from closed trades
+        closed = self.tennis_exit_mgr.closed_trades
+        wins = sum(1 for t in closed if getattr(t, 'R_multiple', 0) > 0)
+        losses = len(closed) - wins
+        total_r = sum(getattr(t, 'R_multiple', 0) for t in closed)
 
-        # Update bankroll with actual PnL
-        self.tennis_live.record_exit_pnl(
-            entry_size=self.tennis_live.order_size,
-            exit_price=exit_price,
-            entry_price=trade.entry_price,
-        )
+        # Live sell if we had a live fill
+        live_tag = "PAPER"
+        if self.tennis_live and self.tennis_live.is_ready and self.tennis_live.has_live_fill(trade.match_id):
+            sell_size = self.tennis_live.order_size
+            match_desc = f"{trade.player} R={r_mult:+.4f}"
+            result = self.tennis_live.sell(
+                token_id=trade.selection_id,
+                size_usd=sell_size,
+                price=exit_price,
+                match_info=match_desc,
+            )
+            self.tennis_live.record_exit_pnl(
+                entry_size=self.tennis_live.order_size,
+                exit_price=exit_price,
+                entry_price=trade.entry_price,
+            )
+            live_tag = "LIVE SELL" if result.success else f"LIVE SELL FAIL: {result.error}"
 
-        # Telegram exit notification
-        live_tag = f"LIVE SELL" if result.success else "LIVE SELL FAIL"
+        # ALWAYS send Telegram exit notification
         try:
             import asyncio
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 loop.create_task(self.engine.tg.send(
-                    f"🎾 <b>Tennis Exit [{live_tag}]</b>\n"
+                    f"{win_emoji} <b>Tennis Exit [{live_tag}]</b>\n"
                     f"Player: {trade.player}\n"
                     f"Reason: {trade.exit_reason}\n"
                     f"Entry: {trade.entry_price:.4f} → Exit: {exit_price:.4f}\n"
-                    f"R: {trade.R_multiple:+.4f}\n"
-                    f"Bankroll: ${self.tennis_live.bankroll:.2f}"
+                    f"<b>R: {r_mult:+.4f}</b> | ~${pnl_usd:+.2f}\n"
+                    f"Duration: {trade.duration_seconds:.0f}s\n"
+                    f"Record: {wins}W-{losses}L | ΣR: {total_r:+.4f}"
                 ))
         except Exception:
             pass
