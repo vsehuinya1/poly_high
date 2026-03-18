@@ -52,6 +52,9 @@ from sports.config import (
     TENNIS_PRICE_CAP, TENNIS_STALENESS_S, TENNIS_COOLDOWN_S,
     TENNIS_FEED_POLL_S,
     TENNIS_PRICE_FLOOR, TENNIS_MAX_SIGNALS_HR,
+    # v4.6 Tennis Entry Timing
+    TENNIS_ENTRY_DELAY_S, TENNIS_ENTRY_CONFIRM_TICKS,
+    TENNIS_ENTRY_MIN_EDGE, TENNIS_EDGE_DECAY_THRESH, TENNIS_ENTRY_MAX_DELAY_S,
     TENNIS_STALE_DISABLE_COUNT, TENNIS_STALE_DISABLE_S,
     TENNIS_LIVE_MODE, TENNIS_BANKROLL, TENNIS_KELLY_PCT,
     TENNIS_MIN_ORDER_USD, POLY_PRIVATE_KEY, POLY_FUNDER_ADDRESS,
@@ -352,6 +355,7 @@ class SportsOrchestrator:
         self.markets: list[SportMarket] = []
         self.links: dict[str, GameMarketLink] = {}  # game_id → link
         self._shutdown = False
+        self._tennis_pending: dict[tuple, dict] = {}  # v4.6: (match_id, token, dir) → pending state
         self._session: aiohttp.ClientSession | None = None
 
         # ── Tennis Engine ─────────────────────────────────────────
@@ -839,7 +843,82 @@ class SportsOrchestrator:
                         log.info("TENNIS BLOCKED | %s | %s", decision.reason, match_id)
                         continue
 
-                    # Paper trade: log entry (pass state_key + edge for loop breaker)
+                    # ── v4.6: Lightweight Entry Timing ───────────────
+                    pending_key = (match_id, fav_token, "BUY")
+                    now_t = time.time()
+
+                    if pending_key not in self._tennis_pending:
+                        # First tick — buffer signal, don't enter
+                        self._tennis_pending[pending_key] = {
+                            "start_time": now_t,
+                            "confirm_count": 1,
+                            "initial_edge": signal.edge,
+                            "last_edge": signal.edge,
+                            "signal": signal,
+                            "link": link,
+                            "state": state,
+                            "fav_token": fav_token,
+                            "fav_book": fav_book,
+                            "market_price": market_price,
+                        }
+                        log.info("TENNIS_PENDING_START | %s | edge=%.4f | mkt=%.4f | %s",
+                                 signal.trigger_type, signal.edge, market_price,
+                                 link.polymarket_title[:40])
+                        continue  # don't enter yet
+
+                    # Update existing pending entry
+                    pend = self._tennis_pending[pending_key]
+                    elapsed_p = now_t - pend["start_time"]
+                    pend["last_edge"] = signal.edge
+                    pend["signal"] = signal
+                    pend["state"] = state
+                    pend["fav_book"] = fav_book
+                    pend["market_price"] = market_price
+
+                    # Edge persistence check
+                    if signal.edge >= TENNIS_ENTRY_MIN_EDGE:
+                        pend["confirm_count"] += 1
+                    else:
+                        pend["confirm_count"] = max(0, pend["confirm_count"] - 1)
+
+                    # Decay guard: cancel if edge dropped >30% from initial
+                    if pend["initial_edge"] > 0 and signal.edge < pend["initial_edge"] * (1 - TENNIS_EDGE_DECAY_THRESH):
+                        log.info("TENNIS_PENDING_CANCEL_DECAY | edge %.4f → %.4f (>%.0f%% drop) | %s",
+                                 pend["initial_edge"], signal.edge,
+                                 TENNIS_EDGE_DECAY_THRESH * 100,
+                                 link.polymarket_title[:40])
+                        del self._tennis_pending[pending_key]
+                        continue
+
+                    # Expiry: cancel if too old
+                    if elapsed_p > TENNIS_ENTRY_MAX_DELAY_S:
+                        log.info("TENNIS_PENDING_EXPIRE | %.0fs > %ds | %s",
+                                 elapsed_p, TENNIS_ENTRY_MAX_DELAY_S,
+                                 link.polymarket_title[:40])
+                        del self._tennis_pending[pending_key]
+                        continue
+
+                    # Check all entry conditions
+                    time_ok = elapsed_p >= TENNIS_ENTRY_DELAY_S
+                    confirm_ok = pend["confirm_count"] >= TENNIS_ENTRY_CONFIRM_TICKS
+                    edge_ok = signal.edge >= TENNIS_ENTRY_MIN_EDGE
+
+                    if not (time_ok and confirm_ok and edge_ok):
+                        log.info("TENNIS_PENDING_UPDATE | time=%.0f/%ds conf=%d/%d edge=%.4f | %s",
+                                 elapsed_p, TENNIS_ENTRY_DELAY_S,
+                                 pend["confirm_count"], TENNIS_ENTRY_CONFIRM_TICKS,
+                                 signal.edge, link.polymarket_title[:30])
+                        continue
+
+                    # ── All conditions met — execute delayed entry ──
+                    entry_delay_actual = elapsed_p
+                    confirm_at_entry = pend["confirm_count"]
+                    del self._tennis_pending[pending_key]  # consumed
+                    log.info("TENNIS_DELAYED_ENTRY | delay=%.0fs confirm=%d edge=%.4f | %s",
+                             entry_delay_actual, confirm_at_entry,
+                             signal.edge, link.polymarket_title[:40])
+
+                    # Paper trade: log entry
                     self.tennis_guard.record_entry(
                         match_id, state_key=state_key, edge=signal.edge
                     )
@@ -861,8 +940,9 @@ class SportsOrchestrator:
                         spread=current_spread,
                     )
 
-                    log.info("TENNIS PAPER ENTRY | %s | edge=%.4f | mkt=%.4f | %s %d-%d %d-%d",
+                    log.info("TENNIS PAPER ENTRY | %s | edge=%.4f | mkt=%.4f | delay=%.0fs | %s %d-%d %d-%d",
                              signal.trigger_type, signal.edge, market_price,
+                             entry_delay_actual,
                              link.polymarket_title[:30],
                              state.sets_a, state.sets_b, state.games_a, state.games_b)
 
