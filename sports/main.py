@@ -32,6 +32,8 @@ from sports.discovery import discover_sports_markets, SportMarket
 from sports.feeds import FootballFeed, NBAFeed, NCAAFeed, PolymarketFeed, GameState
 from sports.engine import SignalEngine, GameMarketLink
 from sports.models import invert_1x2_to_lambdas
+from sports.tick_recorder import TickRecorder
+from sports.microstructure import MicrostructureScanner
 
 # Tennis engine imports
 from tennis.state import TennisState, PointScore, update_from_point, compute_momentum_delta
@@ -345,6 +347,8 @@ class SportsOrchestrator:
         self.ncaa_feed = NCAAFeed()
         self.poly_feed = PolymarketFeed()
         self.engine = SignalEngine(DATA_DIR)
+        self.tick_recorder = TickRecorder()
+        self.micro_scanner = MicrostructureScanner()
         self.markets: list[SportMarket] = []
         self.links: dict[str, GameMarketLink] = {}  # game_id → link
         self._shutdown = False
@@ -591,6 +595,17 @@ class SportsOrchestrator:
         log.info("subscribing to %d token IDs for %d matched games on Polymarket WS",
                  len(all_tokens), len(self.links) + len(self.tennis_links))
         self.poly_feed.set_tokens(all_tokens)
+
+        # Register tick recorder + microstructure scanner callbacks
+        self.poly_feed._on_update_callbacks = [
+            self.tick_recorder.record_tick,
+            self.micro_scanner.on_book_update,
+        ]
+        # Register token labels for queryability
+        for link in list(self.links.values()) + list(self.tennis_links.values()):
+            for tid in link.all_token_ids:
+                self.tick_recorder.set_label(tid, link.polymarket_title, link.sport)
+                self.micro_scanner.register_token(tid, link.polymarket_title, link.sport)
 
     async def _score_polling_loop(self):
         """Poll live scores for football and NBA."""

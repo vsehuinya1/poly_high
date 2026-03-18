@@ -605,6 +605,7 @@ class PolymarketFeed:
         self._rest_poll_count = 0
         self._rest_poll_errors = 0
         self._rest_session: Optional[aiohttp.ClientSession] = None
+        self._on_update_callbacks: list = []  # called with (token_id, bid, ask, mid, spread)
 
     def set_tokens(self, token_ids: list[str]):
         """Update the set of token IDs to subscribe to.
@@ -854,20 +855,23 @@ class PolymarketFeed:
 
         self._update_mid(book)
 
-    @staticmethod
-    def _update_mid(book: BookState):
+    def _update_mid(self, book: BookState):
         """Recalculate mid/spread from current BBO."""
         if book.best_bid > 0 and book.best_ask > 0:
             book.mid = (book.best_bid + book.best_ask) / 2
             book.spread = book.best_ask - book.best_bid
         elif book.best_ask > 0:
-            # One-sided: only asks (team heavily favored). Use ask as ceiling.
             book.mid = book.best_ask
             book.spread = 1.0
         elif book.best_bid > 0:
-            # One-sided: only bids. Use bid as floor.
             book.mid = book.best_bid
             book.spread = 1.0
+        # Fire update callbacks (tick recorder, microstructure scanner)
+        for cb in self._on_update_callbacks:
+            try:
+                cb(book.token_id, book.best_bid, book.best_ask, book.mid, book.spread)
+            except Exception:
+                pass
         # else: both zero, don't update mid
 
     # ── REST Book Polling (fallback for illiquid markets) ────────
