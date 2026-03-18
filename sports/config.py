@@ -134,7 +134,7 @@ TENNIS_FEED_STALL_S   = 60.0      # feed stall detection threshold
 TENNIS_FEED_HEALTH_S  = 60.0      # feed health log interval
 
 # Tennis execution hardening (v2.0)
-TENNIS_PRICE_FLOOR         = 0.30   # v4.5: min market price (raised from 0.05 — thin liquidity below)
+TENNIS_PRICE_FLOOR         = 0.15   # v4.5.4: lowered from 0.30 — backtest proved 0.30 kills +6R winners
 TENNIS_MAX_SIGNALS_HR      = 10     # max signals per match per rolling hour
 TENNIS_STALE_DISABLE_COUNT = 5      # consecutive stale events before auto-disable
 TENNIS_STALE_DISABLE_S     = 300    # auto-disable duration (5 minutes)
