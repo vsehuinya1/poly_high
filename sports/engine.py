@@ -36,6 +36,12 @@ from sports.config import (
     # Football risk controls (v4.3)
     FOOTBALL_STOP_LOSS_TICKS, FOOTBALL_FAST_MOVE_TICKS,
     FOOTBALL_FAST_MOVE_S, FOOTBALL_TIMEOUT_S, DEFAULT_TIMEOUT_S,
+    # v4.5 sport-specific tuning
+    NBA_MIN_HOLD_S, FOOTBALL_MIN_HOLD_S,
+    NBA_EDGE_FLIP_THRESHOLD, NBA_TIMEOUT_S,
+    FOOTBALL_EDGE_TRADE, NBA_EDGE_TRADE,
+    NBA_Q1_BLOCK, NBA_QUARTER_END_BLOCK_S,
+    FB_HALFTIME_BLOCK_START, FB_HALFTIME_BLOCK_END,
 )
 from sports.feeds import GameState, BookState
 from sports.models import (
@@ -752,11 +758,40 @@ class SignalEngine:
                 self._block_time_log[bt_key] = now
             return
 
-        # 2. BLOCK_EDGE
-        if abs(signal.edge) < EDGE_TRADE_THRESHOLD:
+        # 1b. v4.5: NBA Q1 block + quarter-end block
+        sport_lower = link.sport.lower() if link.sport else ""
+        if sport_lower == "nba":
+            quarter = getattr(game_state, 'period', 0) or 0
+            elapsed_min = game_state.elapsed_minutes or 0
+            # Block all Q1 entries (odds too noisy)
+            if NBA_Q1_BLOCK and quarter <= 1 and elapsed_min < 12:
+                self._blocks["BLOCK_NBA_Q1"] = self._blocks.get("BLOCK_NBA_Q1", 0) + 1
+                return
+            # Block last 2min of each quarter (free throws whipsaw)
+            quarter_min = elapsed_min % 12 if elapsed_min > 0 else 0
+            if quarter_min >= (12 - NBA_QUARTER_END_BLOCK_S / 60):
+                self._blocks["BLOCK_NBA_QEND"] = self._blocks.get("BLOCK_NBA_QEND", 0) + 1
+                return
+
+        # 1c. v4.5: Football half-time block (min 40-50)
+        if sport_lower == "football":
+            elapsed_min = game_state.elapsed_minutes or 0
+            if FB_HALFTIME_BLOCK_START <= elapsed_min <= FB_HALFTIME_BLOCK_END:
+                self._blocks["BLOCK_FB_HT"] = self._blocks.get("BLOCK_FB_HT", 0) + 1
+                return
+
+        # 2. BLOCK_EDGE — sport-specific thresholds (v4.5)
+        if sport_lower == "football":
+            edge_thresh = FOOTBALL_EDGE_TRADE
+        elif sport_lower == "nba":
+            edge_thresh = NBA_EDGE_TRADE
+        else:
+            edge_thresh = EDGE_TRADE_THRESHOLD
+
+        if abs(signal.edge) < edge_thresh:
             self._blocks["BLOCK_EDGE"] += 1
             self._log_gate_block(link.game_id, "BLOCK_EDGE", signal, gs_str,
-                                 f"edge={abs(signal.edge):.3f} < {EDGE_TRADE_THRESHOLD}")
+                                 f"edge={abs(signal.edge):.3f} < {edge_thresh}")
             return
 
         # 2b. BLOCK_DIRECTION — SELL-only mode (v3.5)
@@ -983,13 +1018,28 @@ class SignalEngine:
 
             # ── Determine sport-specific parameters ────────────────
             is_football = link.sport.lower() == "football"
+            is_nba = link.sport.lower() == "nba"
             sl_ticks = FOOTBALL_STOP_LOSS_TICKS if is_football else STOP_LOSS_TICKS
-            timeout_s = FOOTBALL_TIMEOUT_S if is_football else DEFAULT_TIMEOUT_S
 
-            exit_reason = ""
+            # v4.5: sport-specific timeouts
+            if is_football:
+                timeout_s = FOOTBALL_TIMEOUT_S
+            elif is_nba:
+                timeout_s = NBA_TIMEOUT_S
+            else:
+                timeout_s = DEFAULT_TIMEOUT_S
 
-            # ── v4.3 exit priority ─────────────────────────────────
-            # Priority: stop_loss > momentum_exit > convergence > edge_flip > game_end > timeout
+            # v4.5: sport-specific min hold and edge flip
+            if is_nba:
+                min_hold = NBA_MIN_HOLD_S
+                flip_thresh = NBA_EDGE_FLIP_THRESHOLD
+            elif is_football:
+                min_hold = FOOTBALL_MIN_HOLD_S
+                flip_thresh = EDGE_FLIP_THRESHOLD
+            else:
+                min_hold = MIN_HOLD_S
+                flip_thresh = EDGE_FLIP_THRESHOLD
+
 
             # HARD STOP-LOSS — sport-specific threshold
             stop_price = sl_ticks * 0.01
@@ -1006,8 +1056,8 @@ class SignalEngine:
             elif abs(current_edge) < EXIT_CONVERGENCE:
                 exit_reason = "convergence"
 
-            # edge_flip — only after hold window, require meaningful reversal
-            elif current_edge < -EDGE_FLIP_THRESHOLD and time_since_entry >= MIN_HOLD_S:
+            # edge_flip — only after sport-specific hold window
+            elif current_edge < -flip_thresh and time_since_entry >= min_hold:
                 exit_reason = "edge_flip"
 
             # game_end and timeout override everything (absolute exits)

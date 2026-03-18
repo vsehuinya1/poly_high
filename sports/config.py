@@ -47,7 +47,7 @@ BOOK_REST_STALE_LOG_S   = 60     # log warning when token is stale for this long
 POLYMARKET_CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 
 # ── Paper Trading Parameters ─────────────────────────────────────────
-ENTRY_EDGE_THRESHOLD  = 0.05     # min 5 cent edge to enter
+ENTRY_EDGE_THRESHOLD  = 0.05     # min 5 cent edge to enter (base — overridden per sport)
 EXIT_CONVERGENCE      = 0.01     # exit when edge < 1 cent
 MAX_POSITION_PER_MARKET = 500.0  # max $500 per market
 MAX_CONCURRENT_POSITIONS = 10
@@ -65,7 +65,9 @@ BUY_PRICE_BAND_HI     = 0.45     # BUY: market price must be <= this
 MAX_SPREAD            = 0.06     # spread must be <= this
 MAX_BOOK_AGE_S        = 20.0     # book_age must be <= this
 MAX_SCORE_DIFF        = 15       # |home - away| must be <= this
-EDGE_TRADE_THRESHOLD  = 0.10     # min edge to open a trade (separate from signal threshold)
+EDGE_TRADE_THRESHOLD  = 0.10     # min edge to open a trade (base — overridden per sport)
+FOOTBALL_EDGE_TRADE   = 0.15     # v4.5: higher entry edge for football (was 0.10)
+NBA_EDGE_TRADE        = 0.10     # v4.5: NBA keeps 0.10
 MAX_ELAPSED_PCT       = 0.75     # block entries past 75% of game
 LATE_GAME_HARD_STOP_NBA = 36.0   # absolute minute cutoff for NBA entries
 LATE_GAME_HARD_STOP_FB  = 67.0   # absolute minute cutoff for football entries
@@ -93,12 +95,15 @@ COOLDOWN_S            = 300.0    # 5-minute cooldown per game after exit
 PER_GAME_STOP         = 200.0    # max loss per game before stopping
 
 # ── Execution Stability (v4.0 — stability patch) ────────────────────
-MIN_HOLD_S            = 5        # Patch 1: suppress edge_flip for 5s after entry
+MIN_HOLD_S            = 5        # Patch 1: base min hold (overridden per sport)
+NBA_MIN_HOLD_S        = 90       # v4.5: NBA min 90s hold — stops instant edge_flip churn
+FOOTBALL_MIN_HOLD_S   = 30       # v4.5: football 30s min hold
 EDGE_CONFIRM_TICKS    = 3        # Patch 2: edge must persist 3 consecutive ticks
 MAX_TRADES_PER_GAME   = 20       # Patch 3: cap total entries per game
 POST_EXIT_COOLDOWN_S  = 30       # Patch 4: game-level cooldown after any exit
 STOP_LOSS_TICKS       = 6        # Patch 5: hard stop at 6 ticks (0.06) adverse
-EDGE_FLIP_THRESHOLD   = 0.03     # Patch 6: edge reversal must exceed this to exit
+EDGE_FLIP_THRESHOLD   = 0.03     # Patch 6: edge reversal must exceed this to exit (base)
+NBA_EDGE_FLIP_THRESHOLD = 0.05   # v4.5: NBA needs bigger reversal to exit (was 0.03)
 ENTRY_MAX_SPREAD      = 0.03     # Patch 7: max 3-tick spread at execution moment
 ENTRY_MAX_BOOK_AGE_S  = 3.0      # Patch 7: book must be <3s old at execution
 
@@ -106,8 +111,15 @@ ENTRY_MAX_BOOK_AGE_S  = 3.0      # Patch 7: book must be <3s old at execution
 FOOTBALL_STOP_LOSS_TICKS = 12     # MAE-based statistical stop (median MAE ≈ 11.25)
 FOOTBALL_FAST_MOVE_TICKS = 3      # early momentum exit threshold (ticks)
 FOOTBALL_FAST_MOVE_S     = 300    # momentum window (5 minutes)
-FOOTBALL_TIMEOUT_S       = 900    # reduced timeout (15 min, was 30 min)
-DEFAULT_TIMEOUT_S        = 1800   # NBA / default timeout (30 min)
+FOOTBALL_TIMEOUT_S       = 600    # v4.5: reduced timeout (10 min, was 15 min)
+NBA_TIMEOUT_S            = 1200   # v4.5: NBA timeout (20 min, was 30 min)
+DEFAULT_TIMEOUT_S        = 1800   # fallback timeout (30 min)
+
+# v4.5: Time-based entry blocks
+NBA_Q1_BLOCK             = True   # block NBA entries in Q1 entirely
+NBA_QUARTER_END_BLOCK_S  = 120    # block last 2 min of each NBA quarter
+FB_HALFTIME_BLOCK_START  = 40     # block football entries minute 40-50 (half-time zone)
+FB_HALFTIME_BLOCK_END    = 50
 
 # ── Tennis (Strategy B — Inflection Sniping) ─────────────────────────
 TENNIS_SERVE_WIN_P    = 0.64      # ATP average service point win rate
@@ -121,7 +133,7 @@ TENNIS_FEED_STALL_S   = 60.0      # feed stall detection threshold
 TENNIS_FEED_HEALTH_S  = 60.0      # feed health log interval
 
 # Tennis execution hardening (v2.0)
-TENNIS_PRICE_FLOOR         = 0.05   # min market price — below this = dead book
+TENNIS_PRICE_FLOOR         = 0.30   # v4.5: min market price (raised from 0.05 — thin liquidity below)
 TENNIS_MAX_SIGNALS_HR      = 10     # max signals per match per rolling hour
 TENNIS_STALE_DISABLE_COUNT = 5      # consecutive stale events before auto-disable
 TENNIS_STALE_DISABLE_S     = 300    # auto-disable duration (5 minutes)
