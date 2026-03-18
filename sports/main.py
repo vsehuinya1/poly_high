@@ -29,7 +29,7 @@ from sports.config import (
     DISCOVERY_INTERVAL_S,
 )
 from sports.discovery import discover_sports_markets, SportMarket
-from sports.feeds import FootballFeed, NBAFeed, PolymarketFeed, GameState
+from sports.feeds import FootballFeed, NBAFeed, NCAAFeed, PolymarketFeed, GameState
 from sports.engine import SignalEngine, GameMarketLink
 from sports.models import invert_1x2_to_lambdas
 
@@ -342,6 +342,7 @@ class SportsOrchestrator:
         self.target_date = target_date
         self.football_feed = FootballFeed()
         self.nba_feed = NBAFeed()
+        self.ncaa_feed = NCAAFeed()
         self.poly_feed = PolymarketFeed()
         self.engine = SignalEngine(DATA_DIR)
         self.markets: list[SportMarket] = []
@@ -456,6 +457,8 @@ class SportsOrchestrator:
                 # but we call it here to ensure we have data for matching.
                 log.info("fetching NBA scoreboard...")
                 await self.nba_feed.fetch_live_scores(session)
+                await self.ncaa_feed.fetch_live_scores(session)
+                self.nba_feed.games.update(self.ncaa_feed.games)  # merge NCAA into NBA
                 
                 log.info("fetching cricket scoreboard...")
                 await self.cricket_feed.fetch_live_scores(session)
@@ -476,6 +479,8 @@ class SportsOrchestrator:
         # Match NBA games
         async with aiohttp.ClientSession() as session:
             await self.nba_feed.fetch_live_scores(session)
+            await self.ncaa_feed.fetch_live_scores(session)
+            self.nba_feed.games.update(self.ncaa_feed.games)
         for game_id, game in self.nba_feed.games.items():
             match = match_game_to_market(game, self.markets)
             if match:
@@ -602,6 +607,8 @@ class SportsOrchestrator:
                         # NBA
                         try:
                             await self.nba_feed.fetch_live_scores(session)
+                            await self.ncaa_feed.fetch_live_scores(session)
+                            self.nba_feed.games.update(self.ncaa_feed.games)
                         except Exception as e:
                             log.error("nba feed error: %s", e)
 
@@ -1240,6 +1247,8 @@ async def run_discover_only(target_date: str):
 
     async with aiohttp.ClientSession() as session:
         await orch.nba_feed.fetch_live_scores(session)
+        await orch.ncaa_feed.fetch_live_scores(session)
+        orch.nba_feed.games.update(orch.ncaa_feed.games)
     for game_id, game in orch.nba_feed.games.items():
         match = match_game_to_market(game, orch.markets)
         status = "✓ MATCHED" if match else "✗ no match"

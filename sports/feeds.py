@@ -18,6 +18,7 @@ import websockets
 from sports.config import (
     ESPN_FOOTBALL_BASE, ESPN_LEAGUES,
     NBA_SCOREBOARD_URL,
+    NCAA_SCOREBOARD_URL,
     POLYMARKET_WS_URL,
     POLYMARKET_CLOB_BOOK_URL,
     SCORE_POLL_INTERVAL_S,
@@ -481,6 +482,93 @@ class NBAFeed:
             )
 
             self.games[game_id] = gs
+
+        return self.games
+
+
+class NCAAFeed:
+    """
+    NCAA Men's Basketball scoreboard via ESPN API.
+    Games are treated as sport='nba' for model compatibility.
+    NCAA uses 2×20-minute halves (40 min total).
+    """
+
+    def __init__(self):
+        self.games: dict[str, GameState] = {}
+
+    async def fetch_live_scores(self, session: aiohttp.ClientSession) -> dict[str, GameState]:
+        """Fetch today's NCAA scoreboard from ESPN."""
+        try:
+            async with session.get(
+                NCAA_SCOREBOARD_URL,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    log.warning("NCAA scoreboard returned %d", resp.status)
+                    return self.games
+                data = await resp.json(content_type=None)
+        except Exception as e:
+            log.error("NCAA scoreboard error: %s", e)
+            return self.games
+
+        now = time.time()
+        events = data.get("events", [])
+
+        for event in events:
+            event_id = event.get("id", "")
+            competition = event.get("competitions", [{}])[0]
+            status_obj = competition.get("status", {})
+            status_type = status_obj.get("type", {})
+            state = status_type.get("state", "pre")  # pre, in, post
+            period = status_obj.get("period", 0)
+            clock_str = status_obj.get("displayClock", "0:00")
+
+            competitors = competition.get("competitors", [])
+            home = next((c for c in competitors if c.get("homeAway") == "home"), {})
+            away = next((c for c in competitors if c.get("homeAway") == "away"), {})
+
+            home_score = int(home.get("score", 0) or 0)
+            away_score = int(away.get("score", 0) or 0)
+            home_team = home.get("team", {}).get("shortDisplayName", "")
+            away_team = away.get("team", {}).get("shortDisplayName", "")
+
+            # Parse clock "MM:SS" → remaining minutes
+            try:
+                parts = clock_str.split(":")
+                remaining_min = int(parts[0]) + int(parts[1]) / 60.0 if len(parts) == 2 else 0
+            except (ValueError, IndexError):
+                remaining_min = 0
+
+            # NCAA: 2×20-minute halves
+            if state == "in":
+                elapsed = (period - 1) * 20.0 + (20.0 - remaining_min)
+                status_str = f"H{period}"
+            elif state == "post":
+                elapsed = 40.0
+                status_str = "finished"
+            else:
+                elapsed = 0.0
+                status_str = "scheduled"
+
+            gs = GameState(
+                game_id=event_id,
+                sport="nba",  # use same model as NBA
+                league="NCAA",
+                status=status_str,
+                home_team=home_team,
+                away_team=away_team,
+                home_score=home_score,
+                away_score=away_score,
+                elapsed_minutes=elapsed,
+                total_minutes=40.0,  # NCAA = 40 min
+                period=f"H{period}" if period > 0 else "",
+                home_q_scores=[],
+                away_q_scores=[],
+                game_clock=clock_str,
+                timestamp=now,
+            )
+
+            self.games[event_id] = gs
 
         return self.games
 

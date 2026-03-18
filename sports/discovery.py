@@ -93,6 +93,12 @@ def classify_market(slug: str, title: str) -> tuple[str, str]:
 
     if "nba" in s:
         return ("nba", "NBA")
+    # NCAA March Madness — treated as 'nba' for model compatibility
+    if any(kw in s for kw in ["ncaa", "march-madness", "college-basketball"]):
+        return ("nba", "NCAA")
+    if any(kw in t for kw in ["march madness", "ncaa", "college basketball",
+                               "sweet 16", "elite eight", "final four"]):
+        return ("nba", "NCAA")
     if "nfl" in s:
         return ("nfl", "NFL")
     if "nhl" in s:

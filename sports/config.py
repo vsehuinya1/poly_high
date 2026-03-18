@@ -29,6 +29,7 @@ ESPN_LEAGUES = [
 
 # ── NBA ──────────────────────────────────────────────────────────────
 NBA_SCOREBOARD_URL = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
+NCAA_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard?limit=100"
 NBA_BOXSCORE_URL = "https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{game_id}.json"
 
 # ── Polymarket ───────────────────────────────────────────────────────
