@@ -39,7 +39,7 @@ from sports.config import (
     # v4.5 sport-specific tuning
     NBA_MIN_HOLD_S, FOOTBALL_MIN_HOLD_S,
     NBA_EDGE_FLIP_THRESHOLD, NBA_TIMEOUT_S,
-    FOOTBALL_EDGE_TRADE, NBA_EDGE_TRADE,
+    FOOTBALL_EDGE_TRADE, NBA_EDGE_TRADE, NBA_DISABLED,
     NBA_Q1_BLOCK, NBA_QUARTER_END_BLOCK_S,
     FB_HALFTIME_BLOCK_START, FB_HALFTIME_BLOCK_END,
 )
@@ -758,8 +758,12 @@ class SignalEngine:
                 self._block_time_log[bt_key] = now
             return
 
-        # 1b. v4.5: NBA Q1 block + quarter-end block
+        # 1b. v4.5.5: NBA disabled — keep feeds for study but block all entries
         sport_lower = link.sport.lower() if link.sport else ""
+        if sport_lower == "nba" and NBA_DISABLED:
+            return
+
+        # 1c. v4.5: NBA Q1 block + quarter-end block
         if sport_lower == "nba":
             quarter = getattr(game_state, 'period', 0) or 0
             elapsed_min = game_state.elapsed_minutes or 0
