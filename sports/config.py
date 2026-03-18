@@ -69,7 +69,15 @@ MAX_SCORE_DIFF        = 15       # |home - away| must be <= this
 EDGE_TRADE_THRESHOLD  = 0.10     # min edge to open a trade (base — overridden per sport)
 FOOTBALL_EDGE_TRADE   = 0.15     # v4.5: higher entry edge for football (was 0.10)
 NBA_EDGE_TRADE        = 0.10     # v4.5: NBA keeps 0.10
-NBA_DISABLED          = True     # v4.5.5: disable NBA paper trading entirely — model broken
+NBA_DISABLED          = False    # v4.6: re-enabled — delayed entry replaces disable
+
+# ── Entry Timing Engine (v4.6) ──────────────────────────────────
+ENTRY_DELAY_NBA_S     = 120      # NBA/NCAA: 120s before entry
+ENTRY_DELAY_FB_S      = 90       # Football: 90s before entry
+ENTRY_DELAY_DEFAULT_S = 30       # Tennis/other: 30s before entry
+ENTRY_PERSIST_EDGE    = 0.12     # edge must stay above this during delay
+ENTRY_PERSIST_TICKS   = 3        # must re-confirm edge N times during delay
+ENTRY_MAX_DELAY_S     = 300      # discard pending signal if not filled by 5min
 MAX_ELAPSED_PCT       = 0.75     # block entries past 75% of game
 LATE_GAME_HARD_STOP_NBA = 36.0   # absolute minute cutoff for NBA entries
 LATE_GAME_HARD_STOP_FB  = 67.0   # absolute minute cutoff for football entries

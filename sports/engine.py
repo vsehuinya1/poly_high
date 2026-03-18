@@ -42,6 +42,9 @@ from sports.config import (
     FOOTBALL_EDGE_TRADE, NBA_EDGE_TRADE, NBA_DISABLED,
     NBA_Q1_BLOCK, NBA_QUARTER_END_BLOCK_S,
     FB_HALFTIME_BLOCK_START, FB_HALFTIME_BLOCK_END,
+    # v4.6 Entry Timing
+    ENTRY_DELAY_NBA_S, ENTRY_DELAY_FB_S, ENTRY_DELAY_DEFAULT_S,
+    ENTRY_PERSIST_EDGE, ENTRY_PERSIST_TICKS, ENTRY_MAX_DELAY_S,
 )
 from sports.feeds import GameState, BookState
 from sports.models import (
@@ -426,6 +429,8 @@ class SignalEngine:
         self._edge_confirm: dict[tuple[str, str], int] = {}
         # v4.0: timestamp of last edge signal per (game_id, direction) for staleness detection
         self._edge_confirm_last_ts: dict[tuple[str, str], float] = {}
+        # v4.6 Entry Timing Engine — pending signal buffer
+        self._pending_entries: dict[tuple, dict] = {}  # (game_id, token_id, direction) → pending state
 
     def _get_game_state(self, game_id: str) -> GameTradeState:
         if game_id not in self._game_states:
@@ -934,6 +939,81 @@ class SignalEngine:
 
         # ── Log daily summary periodically ────────────────────────
         self.log_daily_summary()
+
+        # ══ 16. ENTRY TIMING ENGINE (v4.6) ═══════════════════════
+        # Instead of entering immediately, buffer the signal and wait
+        # for persistence confirmation over a sport-specific delay.
+        pending_key = (signal.game_id, signal.token_id, signal.direction)
+
+        # Determine sport-specific delay
+        if sport_lower == "nba":
+            entry_delay = ENTRY_DELAY_NBA_S
+        elif sport_lower == "football":
+            entry_delay = ENTRY_DELAY_FB_S
+        else:
+            entry_delay = ENTRY_DELAY_DEFAULT_S
+
+        # Create or update pending entry
+        if pending_key not in self._pending_entries:
+            self._pending_entries[pending_key] = {
+                "start_time": now,
+                "last_seen": now,
+                "confirm_count": 1,
+                "initial_edge": abs(signal.edge),
+                "sport": sport_lower,
+            }
+            log.info("PENDING_ENTRY_START | %s | %s edge=%.3f | delay=%ds",
+                     gs_str, signal.direction, abs(signal.edge), entry_delay)
+            return  # first tick — just buffer, don't enter
+
+        # Update existing pending entry
+        pending = self._pending_entries[pending_key]
+        pending["last_seen"] = now
+        elapsed_pending = now - pending["start_time"]
+
+        # Check if edge still persists
+        if abs(signal.edge) >= ENTRY_PERSIST_EDGE:
+            pending["confirm_count"] += 1
+        else:
+            # Edge dropped — reset confirmation, keep tracking
+            old_count = pending["confirm_count"]
+            pending["confirm_count"] = max(0, pending["confirm_count"] - 1)
+            log.info("PENDING_ENTRY_UPDATE | %s | %s edge=%.3f < %.3f | confirm %d→%d",
+                     gs_str, signal.direction, abs(signal.edge),
+                     ENTRY_PERSIST_EDGE, old_count, pending["confirm_count"])
+
+        # Check expiry — discard if too old
+        if elapsed_pending > ENTRY_MAX_DELAY_S:
+            del self._pending_entries[pending_key]
+            self._blocks["BLOCK_ENTRY_EXPIRED"] = self._blocks.get("BLOCK_ENTRY_EXPIRED", 0) + 1
+            log.info("PENDING_ENTRY_CANCEL | %s | %s expired after %.0fs",
+                     gs_str, signal.direction, elapsed_pending)
+            return
+
+        # Check if all conditions met for delayed entry
+        time_ok = elapsed_pending >= entry_delay
+        persist_ok = pending["confirm_count"] >= ENTRY_PERSIST_TICKS
+        edge_ok = abs(signal.edge) >= ENTRY_PERSIST_EDGE
+
+        if not (time_ok and persist_ok and edge_ok):
+            self._blocks["BLOCK_ENTRY_PENDING"] = self._blocks.get("BLOCK_ENTRY_PENDING", 0) + 1
+            # Log periodically (every 30s)
+            log_key = f"pending_{pending_key}"
+            if now - self._block_time_log.get(log_key, 0) >= 30:
+                self._block_time_log[log_key] = now
+                log.info("PENDING_ENTRY_UPDATE | %s | %s | time=%.0f/%ds confirm=%d/%d edge=%.3f/%.3f",
+                         gs_str, signal.direction, elapsed_pending, entry_delay,
+                         pending["confirm_count"], ENTRY_PERSIST_TICKS,
+                         abs(signal.edge), ENTRY_PERSIST_EDGE)
+            return
+
+        # ── All conditions met — execute delayed entry ────────────
+        entry_delay_actual = elapsed_pending
+        confirm_count_actual = pending["confirm_count"]
+        del self._pending_entries[pending_key]  # consumed
+        log.info("DELAYED_ENTRY_EXECUTED | %s | %s | delay=%.0fs confirm=%d edge=%.3f",
+                 gs_str, signal.direction, entry_delay_actual,
+                 confirm_count_actual, abs(signal.edge))
 
         # ── Size Calculation ──────────────────────────────────────
         # size = abs(edge) * 1000, clamped [50, 300]
