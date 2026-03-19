@@ -1150,6 +1150,9 @@ class SportsOrchestrator:
                         title_lower = link.polymarket_title.lower()
                         best_match = None
                         best_score = 0
+                        # Words that should not be used for last-word matching
+                        GENERIC_WORDS = {"women", "men", "a", "b", "xi", "under",
+                                         "u19", "u23", "colts", "emerging", "select"}
                         for eid, cs in self.cricket_feed.games.items():
                             if not cs.team_a or not cs.team_b:
                                 continue
@@ -1157,13 +1160,17 @@ class SportsOrchestrator:
                             tb_full = cs.team_b.lower()
                             ta_last = ta_full.split()[-1]
                             tb_last = tb_full.split()[-1]
-                            # Require BOTH teams to match (full name or last-word)
-                            a_match = (ta_full in title_lower or ta_last in title_lower)
-                            b_match = (tb_full in title_lower or tb_last in title_lower)
+                            # Full-name match (higher confidence)
+                            a_full = ta_full in title_lower
+                            b_full = tb_full in title_lower
+                            # Last-word match (only if not a generic suffix)
+                            a_last = (ta_last in title_lower) if ta_last not in GENERIC_WORDS else False
+                            b_last = (tb_last in title_lower) if tb_last not in GENERIC_WORDS else False
+                            a_match = a_full or a_last
+                            b_match = b_full or b_last
                             if a_match and b_match:
-                                # Score: prefer full name matches over last-word
-                                score = (2 if ta_full in title_lower else 1) + \
-                                        (2 if tb_full in title_lower else 1)
+                                # Score: full-name match = 2pts, last-word = 1pt
+                                score = (2 if a_full else 1) + (2 if b_full else 1)
                                 if score > best_score:
                                     best_match = (eid, cs)
                                     best_score = score
