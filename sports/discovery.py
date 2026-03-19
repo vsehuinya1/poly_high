@@ -162,11 +162,23 @@ def classify_market(slug: str, title: str) -> tuple[str, str]:
     if s.startswith("chm-"):
         return ("football", "Championship")
 
-    # Cricket — keyword detection
+    # Cricket — Polymarket slug prefix detection (primary path)
+    if s.startswith("crint-"):
+        return ("cricket", "International")
+    if s.startswith("criclcl-"):
+        return ("cricket", "Legends League")
+    if s.startswith("ipl-"):
+        return ("cricket", "IPL")
+    # Cricket — keyword detection (fallback)
     if "icc-" in s or "t20-" in s or "odi-" in s:
         return ("cricket", "ICC")
     if "cricket" in s or "cricket" in t:
         return ("cricket", "Cricket")
+    # Cricket — franchise league titles
+    if any(kw in t for kw in ["legends cricket", "indian premier league",
+                               "big bash", "caribbean premier", "psl ",
+                               "hundred cricket", "sa20 "]):
+        return ("cricket", "Cricket League")
     # Cricket — team-based heuristic (catches "India vs. New Zealand" etc.)
     if _is_cricket_match(title):
         return ("cricket", "International")

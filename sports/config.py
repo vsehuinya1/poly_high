@@ -199,7 +199,10 @@ SPORTS_SLUG_PATTERNS = [
     # Tennis
     "tennis", "atp-", "wta-",
     "australian-open", "french-open", "wimbledon", "us-open",
-    # Cricket
+    # Cricket — Polymarket slug prefixes
+    "crint-",    # Cricket International (NZ vs SA, AFG vs SL, etc.)
+    "criclcl-",  # Cricket Legends League
+    "ipl-",      # Indian Premier League
     "icc-", "t20-", "odi-", "cricket",
     # Cricket nation slugs (catches "india-vs-new-zealand-final" etc.)
     "india-vs", "australia-vs", "england-vs", "pakistan-vs",
