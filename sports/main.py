@@ -850,6 +850,106 @@ class SportsOrchestrator:
 
                     market_price = fav_book.mid
 
+                    # ── v4.6.5: Pending entry fast-path ───────────────
+                    # If we already have a pending entry for this match,
+                    # bypass strategy.evaluate() (which has state dedup
+                    # and would suppress the signal) and directly recheck
+                    # the edge from stored fair_price vs current market.
+                    pending_key = (match_id, fav_token, "BUY")
+                    if pending_key in self._tennis_pending:
+                        pend = self._tennis_pending[pending_key]
+                        now_t = time.time()
+                        elapsed_p = now_t - pend["start_time"]
+                        current_edge = pend["signal"].fair_price - market_price
+                        pend["last_edge"] = current_edge
+                        pend["market_price"] = market_price
+
+                        # Edge persistence check
+                        if current_edge >= TENNIS_ENTRY_MIN_EDGE:
+                            pend["confirm_count"] += 1
+                        else:
+                            pend["confirm_count"] = max(0, pend["confirm_count"] - 1)
+
+                        # Decay guard
+                        if pend["initial_edge"] > 0 and current_edge < pend["initial_edge"] * (1 - TENNIS_EDGE_DECAY_THRESH):
+                            log.info("TENNIS_PENDING_CANCEL_DECAY | edge %.4f → %.4f | %s",
+                                     pend["initial_edge"], current_edge,
+                                     link.polymarket_title[:40])
+                            del self._tennis_pending[pending_key]
+                            continue
+
+                        # Expiry
+                        if elapsed_p > TENNIS_ENTRY_MAX_DELAY_S:
+                            log.info("TENNIS_PENDING_EXPIRE | %.0fs | %s",
+                                     elapsed_p, link.polymarket_title[:40])
+                            del self._tennis_pending[pending_key]
+                            continue
+
+                        # Check entry conditions
+                        time_ok = elapsed_p >= TENNIS_ENTRY_DELAY_S
+                        confirm_ok = pend["confirm_count"] >= TENNIS_ENTRY_CONFIRM_TICKS
+                        edge_ok = current_edge >= TENNIS_ENTRY_MIN_EDGE
+
+                        if not (time_ok and confirm_ok and edge_ok):
+                            log.info("TENNIS_PENDING_UPDATE | time=%.0f/%ds conf=%d/%d edge=%.4f | %s",
+                                     elapsed_p, TENNIS_ENTRY_DELAY_S,
+                                     pend["confirm_count"], TENNIS_ENTRY_CONFIRM_TICKS,
+                                     current_edge, link.polymarket_title[:30])
+                            continue
+
+                        # All conditions met → execute
+                        entry_delay_actual = elapsed_p
+                        confirm_at_entry = pend["confirm_count"]
+                        signal = pend["signal"]
+                        state = pend["state"]
+                        del self._tennis_pending[pending_key]
+                        log.info("TENNIS_DELAYED_ENTRY | delay=%.0fs confirm=%d edge=%.4f | %s",
+                                 entry_delay_actual, confirm_at_entry,
+                                 current_edge, link.polymarket_title[:40])
+                        diag["signal_ok"] += 1
+
+                        # Jump to entry execution (reuse signal + state)
+                        self.tennis_guard.record_entry(
+                            match_id, state_key=self.tennis_strategy._state_key(state, fav_token),
+                            edge=current_edge
+                        )
+                        self.tennis_logger.log_trade_entry(signal, market_price_at_bp=market_price)
+                        score_str = f"{state.sets_a}-{state.sets_b} {state.games_a}-{state.games_b}"
+                        fav_name = state.pregame_favorite_id or link.home_team
+                        current_spread = fav_book.spread if fav_book else 0.0
+                        self.tennis_exit_mgr.register_trade(
+                            match_id=match_id, selection_id=fav_token,
+                            player=fav_name, trigger_type=signal.trigger_type,
+                            entry_price=market_price, fair_value=signal.fair_price,
+                            edge=current_edge, entry_score=score_str, spread=current_spread,
+                        )
+                        log.info("TENNIS PAPER ENTRY | %s | edge=%.4f | mkt=%.4f | delay=%.0fs | %s %d-%d %d-%d",
+                                 signal.trigger_type, current_edge, market_price,
+                                 entry_delay_actual, link.polymarket_title[:30],
+                                 state.sets_a, state.sets_b, state.games_a, state.games_b)
+                        # Live order
+                        live_tag = "PAPER"
+                        if self.tennis_live and self.tennis_live.is_ready:
+                            result = self.tennis_live.buy(token_id=fav_token, price=market_price,
+                                                          match_info=f"{link.polymarket_title[:40]} {state.sets_a}-{state.sets_b}")
+                            if result.success:
+                                live_tag = f"LIVE ${result.filled_size:.2f}"
+                                self.tennis_live.record_fill(match_id)
+                            else:
+                                live_tag = f"LIVE FAIL: {result.error}"
+                        try:
+                            await self.engine.tg.send(
+                                f"🎾 <b>Tennis Signal [{live_tag}]</b>\n"
+                                f"Trigger: {signal.trigger_type}\n"
+                                f"Edge: {current_edge:+.4f} (delay={entry_delay_actual:.0f}s)\n"
+                                f"Fair: {signal.fair_price:.4f} | Mkt: {market_price:.4f}\n"
+                                f"Match: {link.polymarket_title}\n"
+                                f"Score: {state.sets_a}-{state.sets_b} | {state.games_a}-{state.games_b}"
+                            )
+                        except Exception:
+                            pass
+                        continue  # done with this match
+
                     # ── Pre-check: should we even evaluate? ───────
                     # Compute state key for position loop breaker
                     state_key = self.tennis_strategy._state_key(state, fav_token)
@@ -882,137 +982,26 @@ class SportsOrchestrator:
 
                     diag["signal_ok"] += 1
 
-                    # ── v4.6: Lightweight Entry Timing ───────────────
+                    # ── v4.6.5: Create pending entry (first signal tick) ──
+                    # The fast-path above (line ~853) handles all subsequent
+                    # ticks: persistence, decay, expiry, and execution.
                     pending_key = (match_id, fav_token, "BUY")
                     now_t = time.time()
-
-                    if pending_key not in self._tennis_pending:
-                        # First tick — buffer signal, don't enter
-                        self._tennis_pending[pending_key] = {
-                            "start_time": now_t,
-                            "confirm_count": 1,
-                            "initial_edge": signal.edge,
-                            "last_edge": signal.edge,
-                            "signal": signal,
-                            "link": link,
-                            "state": state,
-                            "fav_token": fav_token,
-                            "fav_book": fav_book,
-                            "market_price": market_price,
-                        }
-                        log.info("TENNIS_PENDING_START | %s | edge=%.4f | mkt=%.4f | %s",
-                                 signal.trigger_type, signal.edge, market_price,
-                                 link.polymarket_title[:40])
-                        continue  # don't enter yet
-
-                    # Update existing pending entry
-                    pend = self._tennis_pending[pending_key]
-                    elapsed_p = now_t - pend["start_time"]
-                    pend["last_edge"] = signal.edge
-                    pend["signal"] = signal
-                    pend["state"] = state
-                    pend["fav_book"] = fav_book
-                    pend["market_price"] = market_price
-
-                    # Edge persistence check
-                    if signal.edge >= TENNIS_ENTRY_MIN_EDGE:
-                        pend["confirm_count"] += 1
-                    else:
-                        pend["confirm_count"] = max(0, pend["confirm_count"] - 1)
-
-                    # Decay guard: cancel if edge dropped >30% from initial
-                    if pend["initial_edge"] > 0 and signal.edge < pend["initial_edge"] * (1 - TENNIS_EDGE_DECAY_THRESH):
-                        log.info("TENNIS_PENDING_CANCEL_DECAY | edge %.4f → %.4f (>%.0f%% drop) | %s",
-                                 pend["initial_edge"], signal.edge,
-                                 TENNIS_EDGE_DECAY_THRESH * 100,
-                                 link.polymarket_title[:40])
-                        del self._tennis_pending[pending_key]
-                        continue
-
-                    # Expiry: cancel if too old
-                    if elapsed_p > TENNIS_ENTRY_MAX_DELAY_S:
-                        log.info("TENNIS_PENDING_EXPIRE | %.0fs > %ds | %s",
-                                 elapsed_p, TENNIS_ENTRY_MAX_DELAY_S,
-                                 link.polymarket_title[:40])
-                        del self._tennis_pending[pending_key]
-                        continue
-
-                    # Check all entry conditions
-                    time_ok = elapsed_p >= TENNIS_ENTRY_DELAY_S
-                    confirm_ok = pend["confirm_count"] >= TENNIS_ENTRY_CONFIRM_TICKS
-                    edge_ok = signal.edge >= TENNIS_ENTRY_MIN_EDGE
-
-                    if not (time_ok and confirm_ok and edge_ok):
-                        log.info("TENNIS_PENDING_UPDATE | time=%.0f/%ds conf=%d/%d edge=%.4f | %s",
-                                 elapsed_p, TENNIS_ENTRY_DELAY_S,
-                                 pend["confirm_count"], TENNIS_ENTRY_CONFIRM_TICKS,
-                                 signal.edge, link.polymarket_title[:30])
-                        continue
-
-                    # ── All conditions met — execute delayed entry ──
-                    entry_delay_actual = elapsed_p
-                    confirm_at_entry = pend["confirm_count"]
-                    del self._tennis_pending[pending_key]  # consumed
-                    log.info("TENNIS_DELAYED_ENTRY | delay=%.0fs confirm=%d edge=%.4f | %s",
-                             entry_delay_actual, confirm_at_entry,
-                             signal.edge, link.polymarket_title[:40])
-
-                    # Paper trade: log entry
-                    self.tennis_guard.record_entry(
-                        match_id, state_key=state_key, edge=signal.edge
-                    )
-                    self.tennis_logger.log_trade_entry(signal, market_price_at_bp=market_price)
-
-                    # Register with ExitManager for lifecycle tracking
-                    score_str = f"{state.sets_a}-{state.sets_b} {state.games_a}-{state.games_b}"
-                    fav_name = state.pregame_favorite_id or link.home_team
-                    current_spread = fav_book.spread if fav_book else 0.0
-                    self.tennis_exit_mgr.register_trade(
-                        match_id=match_id,
-                        selection_id=fav_token,
-                        player=fav_name,
-                        trigger_type=signal.trigger_type,
-                        entry_price=market_price,
-                        fair_value=signal.fair_price,
-                        edge=signal.edge,
-                        entry_score=score_str,
-                        spread=current_spread,
-                    )
-
-                    log.info("TENNIS PAPER ENTRY | %s | edge=%.4f | mkt=%.4f | delay=%.0fs | %s %d-%d %d-%d",
+                    self._tennis_pending[pending_key] = {
+                        "start_time": now_t,
+                        "confirm_count": 1,
+                        "initial_edge": signal.edge,
+                        "last_edge": signal.edge,
+                        "signal": signal,
+                        "link": link,
+                        "state": state,
+                        "fav_token": fav_token,
+                        "fav_book": fav_book,
+                        "market_price": market_price,
+                    }
+                    log.info("TENNIS_PENDING_START | %s | edge=%.4f | mkt=%.4f | %s",
                              signal.trigger_type, signal.edge, market_price,
-                             entry_delay_actual,
-                             link.polymarket_title[:30],
-                             state.sets_a, state.sets_b, state.games_a, state.games_b)
-
-                    # ── LIVE ORDER (v4.4) ──────────────────────────
-                    live_tag = "PAPER"
-                    if self.tennis_live and self.tennis_live.is_ready:
-                        match_desc = f"{link.polymarket_title[:40]} {state.sets_a}-{state.sets_b}"
-                        result = self.tennis_live.buy(
-                            token_id=fav_token,
-                            price=market_price,
-                            match_info=match_desc,
-                        )
-                        if result.success:
-                            live_tag = f"LIVE ${result.filled_size:.2f}"
-                            self.tennis_live.record_fill(match_id)
-                        else:
-                            live_tag = f"LIVE FAIL: {result.error}"
-
-                    # Telegram alert
-                    try:
-                        await self.engine.tg.send(
-                            f"🎾 <b>Tennis Signal [{live_tag}]</b>\n"
-                            f"Trigger: {signal.trigger_type}\n"
-                            f"Edge: {signal.edge:+.4f}\n"
-                            f"Fair: {signal.fair_price:.4f} | Mkt: {market_price:.4f}\n"
-                            f"Match: {link.polymarket_title}\n"
-                            f"Score: {state.sets_a}-{state.sets_b} | {state.games_a}-{state.games_b} | {state.point_a.value}-{state.point_b.value}\n"
-                            f"Trades today: {len(self.tennis_exit_mgr.open_trades)} open | {len(self.tennis_exit_mgr.closed_trades)} closed"
-                        )
-                    except Exception:
-                        pass
+                             link.polymarket_title[:40])
 
                 # ── Exit Manager: check all open trades ───────────
                 self._tennis_check_exits()
@@ -1143,10 +1132,40 @@ class SportsOrchestrator:
     async def _cricket_signal_loop(self):
         """Cricket paper-only signal processing loop."""
         last_health_log = time.time()
+        # v4.6.5: ESPN→Poly mapping cache (Poly event_id → ESPN event_id)
+        cricket_espn_map: dict[str, str] = {}
+
         while not self._shutdown:
             try:
                 for match_id, link in list(self.cricket_links.items()):
-                    state = self.cricket_feed.games.get(match_id)
+                    # v4.6.5: Map Polymarket ID to ESPN ID by team names
+                    espn_id = cricket_espn_map.get(match_id)
+                    state = None
+
+                    if espn_id:
+                        state = self.cricket_feed.games.get(espn_id)
+
+                    if not state:
+                        # Fuzzy match by team names in the Polymarket title
+                        title_lower = link.polymarket_title.lower()
+                        best_match = None
+                        for eid, cs in self.cricket_feed.games.items():
+                            # Check if both team names appear in the Poly title
+                            ta = cs.team_a.lower().split()[-1] if cs.team_a else ""
+                            tb = cs.team_b.lower().split()[-1] if cs.team_b else ""
+                            if ta and tb and ta in title_lower and tb in title_lower:
+                                best_match = (eid, cs)
+                                break
+                            # Also try full team name
+                            if cs.team_a.lower() in title_lower or cs.team_b.lower() in title_lower:
+                                best_match = (eid, cs)
+                        if best_match:
+                            espn_id, state = best_match
+                            cricket_espn_map[match_id] = espn_id
+                            log.info("CRICKET MAP: %s → ESPN:%s (%s vs %s)",
+                                     link.polymarket_title[:40], espn_id,
+                                     state.team_a, state.team_b)
+
                     if not state:
                         continue
 
