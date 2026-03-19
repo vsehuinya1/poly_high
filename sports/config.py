@@ -136,7 +136,7 @@ TENNIS_SERVE_WIN_P    = 0.64      # ATP average service point win rate
 TENNIS_PANIC_EDGE     = 0.06      # min edge for panic discount trigger
 TENNIS_REVERSION_EDGE = 0.08      # min edge for set mean reversion trigger (raised from 0.05 — sub-0.08 edges produce near-zero R)
 TENNIS_PRICE_CAP      = 0.85      # no entries above this market price
-TENNIS_STALENESS_S    = 3.0       # max state age for execution
+TENNIS_STALENESS_S    = 30.0      # v4.6.2: was 3.0 — too tight, killed ALL signals via stale cascade
 TENNIS_COOLDOWN_S     = 120.0     # cooldown after position exit (seconds)
 TENNIS_FEED_POLL_S    = 3.0       # feed poll interval (seconds)
 TENNIS_FEED_STALL_S   = 60.0      # feed stall detection threshold
@@ -152,8 +152,8 @@ TENNIS_ENTRY_MIN_EDGE      = 0.06   # edge must persist above this
 TENNIS_EDGE_DECAY_THRESH   = 0.30   # cancel if edge drops >30% from initial
 TENNIS_ENTRY_MAX_DELAY_S   = 90     # discard if not filled by 90s
 TENNIS_MAX_SIGNALS_HR      = 10     # max signals per match per rolling hour
-TENNIS_STALE_DISABLE_COUNT = 5      # consecutive stale events before auto-disable
-TENNIS_STALE_DISABLE_S     = 300    # auto-disable duration (5 minutes)
+TENNIS_STALE_DISABLE_COUNT = 20     # v4.6.2: was 5 — too aggressive, disabled matches permanently
+TENNIS_STALE_DISABLE_S     = 60     # v4.6.2: was 300 — 1min disable instead of 5min
 
 # ── Cricket (Paper-Only Research Mode) ───────────────────────────────
 CRICKET_PAPER_ONLY         = True   # NEVER allow live execution

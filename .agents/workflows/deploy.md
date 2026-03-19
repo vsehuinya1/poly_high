@@ -4,29 +4,25 @@ description: Deploy code changes to VPS and restart the sports engine
 
 # Deploy to VPS
 
-// turbo-all
+Run this in your terminal (not through the scaffold):
 
-1. Commit all changes:
 ```bash
-cd /Users/MartinOile/Desktop/poly_high && git add -A && git commit -m "deploy" && git push origin main
+cd /Users/MartinOile/Desktop/poly_high && ./deploy.sh "your commit message"
 ```
 
-2. Pull on VPS:
+This script handles the full pipeline:
+1. `git add -A && git commit && git push`
+2. `git fetch && git reset --hard` on VPS
+3. Kill old engines
+4. Start new engine with timestamped log
+5. Wait 15s and verify startup
+
+If you need to run a single command on the VPS:
 ```bash
-sshpass -p '12345vse' ssh -o StrictHostKeyChecking=no root@161.97.185.65 'cd /root/poly_high_sports && git fetch origin main && git reset --hard origin/main'
+./vps.sh "grep STATUS logs/latest.log | tail -1"
 ```
 
-3. Kill existing engine:
+For a full status check:
 ```bash
-sshpass -p '12345vse' ssh -o StrictHostKeyChecking=no root@161.97.185.65 'kill $(pgrep -f "python3.*sports.main") 2>/dev/null; sleep 2; echo killed'
-```
-
-4. Start new engine:
-```bash
-sshpass -p '12345vse' ssh -o StrictHostKeyChecking=no root@161.97.185.65 'cd /root/poly_high_sports && nohup /usr/bin/python3 -u -m sports.main > logs/sports_latest.log 2>&1 & echo started=$!'
-```
-
-5. Verify startup:
-```bash
-sshpass -p '12345vse' ssh -o StrictHostKeyChecking=no root@161.97.185.65 'sleep 8 && grep "STATUS" /root/poly_high_sports/logs/sports_latest.log | tail -1'
+./status.sh
 ```
