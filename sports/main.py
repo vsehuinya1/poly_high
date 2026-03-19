@@ -795,23 +795,33 @@ class SportsOrchestrator:
         """
         # Log health summary every hour
         last_health_log = time.time()
+        last_diag_log = 0  # v4.6.2 diagnostic
 
         while not self._shutdown:
             try:
+                # v4.6.2: diagnostic counters
+                diag = {"total": 0, "no_state": 0, "not_live": 0, "no_fav": 0,
+                        "no_book": 0, "guard_skip": 0, "no_signal": 0,
+                        "guard_block": 0, "signal_ok": 0}
+
                 for match_id, link in list(self.tennis_links.items()):
+                    diag["total"] += 1
                     state = self.tennis_states.get(match_id)
                     if not state:
+                        diag["no_state"] += 1
                         continue
 
                     # Only process live matches (state updated by score feed)
                     if state.sets_a == 0 and state.sets_b == 0 and state.games_a == 0 and state.games_b == 0:
                         # State never updated — match not live yet
+                        diag["not_live"] += 1
                         continue
 
                     # Get current market price for the favorite
                     fav_token = link.home_token_id if state.pregame_favorite_id == link.home_team else link.away_token_id
                     fav_book = self.poly_feed.books.get(fav_token)
                     if not fav_book or fav_book.mid <= 0:
+                        diag["no_book"] += 1
                         continue
 
                     market_price = fav_book.mid
@@ -823,6 +833,7 @@ class SportsOrchestrator:
                     if not self.tennis_guard.should_evaluate(
                         match_id, state_key=state_key, edge=0.0
                     ):
+                        diag["guard_skip"] += 1
                         continue
 
                     # Run Strategy B evaluation (with price floor + dedup built in)
@@ -830,6 +841,7 @@ class SportsOrchestrator:
                         state, market_price, selection_id=fav_token
                     )
                     if signal is None:
+                        diag["no_signal"] += 1
                         continue
 
                     # Log signal
@@ -840,8 +852,11 @@ class SportsOrchestrator:
                     # Check execution guards
                     decision = self.tennis_guard.can_execute(signal, state)
                     if not decision.can_execute:
+                        diag["guard_block"] += 1
                         log.info("TENNIS BLOCKED | %s | %s", decision.reason, match_id)
                         continue
+
+                    diag["signal_ok"] += 1
 
                     # ── v4.6: Lightweight Entry Timing ───────────────
                     pending_key = (match_id, fav_token, "BUY")
@@ -977,6 +992,16 @@ class SportsOrchestrator:
 
                 # ── Exit Manager: check all open trades ───────────
                 self._tennis_check_exits()
+
+                # v4.6.2: diagnostic log every 60s
+                now_diag = time.time()
+                if now_diag - last_diag_log >= 60:
+                    last_diag_log = now_diag
+                    log.info("TENNIS_DIAG | total=%d no_state=%d not_live=%d no_book=%d "
+                             "guard_skip=%d no_signal=%d guard_block=%d signal_ok=%d",
+                             diag["total"], diag["no_state"], diag["not_live"],
+                             diag["no_book"], diag["guard_skip"], diag["no_signal"],
+                             diag["guard_block"], diag["signal_ok"])
 
                 # ── Track WS reconnects + hourly health summary ───
                 self.tennis_guard.stats.ws_reconnects = self.poly_feed.reconnect_count
