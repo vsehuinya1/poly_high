@@ -1149,16 +1149,24 @@ class SportsOrchestrator:
                         # Fuzzy match by team names in the Polymarket title
                         title_lower = link.polymarket_title.lower()
                         best_match = None
+                        best_score = 0
                         for eid, cs in self.cricket_feed.games.items():
-                            # Check if both team names appear in the Poly title
-                            ta = cs.team_a.lower().split()[-1] if cs.team_a else ""
-                            tb = cs.team_b.lower().split()[-1] if cs.team_b else ""
-                            if ta and tb and ta in title_lower and tb in title_lower:
-                                best_match = (eid, cs)
-                                break
-                            # Also try full team name
-                            if cs.team_a.lower() in title_lower or cs.team_b.lower() in title_lower:
-                                best_match = (eid, cs)
+                            if not cs.team_a or not cs.team_b:
+                                continue
+                            ta_full = cs.team_a.lower()
+                            tb_full = cs.team_b.lower()
+                            ta_last = ta_full.split()[-1]
+                            tb_last = tb_full.split()[-1]
+                            # Require BOTH teams to match (full name or last-word)
+                            a_match = (ta_full in title_lower or ta_last in title_lower)
+                            b_match = (tb_full in title_lower or tb_last in title_lower)
+                            if a_match and b_match:
+                                # Score: prefer full name matches over last-word
+                                score = (2 if ta_full in title_lower else 1) + \
+                                        (2 if tb_full in title_lower else 1)
+                                if score > best_score:
+                                    best_match = (eid, cs)
+                                    best_score = score
                         if best_match:
                             espn_id, state = best_match
                             cricket_espn_map[match_id] = espn_id
