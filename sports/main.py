@@ -67,6 +67,7 @@ from cricket import (
     CricketState, CricketFeed, CricketStrategy,
     CricketExecutionGuard, CricketCSVLogger,
 )
+from cricket.exit_manager import CricketExitManager
 from sports.config import (
     CRICKET_PAPER_ONLY, CRICKET_TRADE_SIZE, CRICKET_MAX_SPREAD,
     CRICKET_MOMENTUM_RR_THRESH, CRICKET_MOMENTUM_EDGE,
@@ -419,6 +420,7 @@ class SportsOrchestrator:
             trade_size_usd=CRICKET_TRADE_SIZE,
         )
         self.cricket_logger = CricketCSVLogger(DATA_DIR)
+        self.cricket_exit_mgr = CricketExitManager(data_dir=DATA_DIR)
         self.cricket_links: dict[str, GameMarketLink] = {}  # match_id → link
         self.cricket_states: dict[str, CricketState] = {}  # match_id → latest state
 
@@ -605,8 +607,10 @@ class SportsOrchestrator:
             self.tick_recorder.record_tick,
             self.micro_scanner.on_book_update,
         ]
-        # Register token labels for queryability
-        for link in list(self.links.values()) + list(self.tennis_links.values()):
+        # Register token labels for queryability (all sports including cricket)
+        all_links = (list(self.links.values()) + list(self.tennis_links.values())
+                     + list(self.cricket_links.values()))
+        for link in all_links:
             for tid in link.all_token_ids:
                 self.tick_recorder.set_label(tid, link.polymarket_title, link.sport)
                 self.micro_scanner.register_token(tid, link.polymarket_title, link.sport)
@@ -1204,7 +1208,23 @@ class SportsOrchestrator:
                         if decision.can_execute:
                             # Record paper entry
                             self.cricket_guard.record_entry(match_id)
-                            log.info("CRICKET PAPER ENTRY | %s | %s", sig.signal_type, match_id)
+                            score_str = str(state) if state else ""
+                            log.info("CRICKET PAPER ENTRY | %s | edge=%.4f | mkt=%.4f | %s",
+                                     sig.signal_type, sig.edge, market_price,
+                                     link.polymarket_title[:40])
+                            
+                            # Register with exit manager for MAE/MFE tracking
+                            self.cricket_exit_mgr.register_trade(
+                                match_id=match_id,
+                                selection_id=link.home_token_id or (link.all_token_ids[0] if link.all_token_ids else ""),
+                                signal_type=sig.signal_type,
+                                entry_price=market_price,
+                                fair_value=sig.fair_price,
+                                edge=sig.edge,
+                                entry_score=score_str,
+                                spread=book.spread,
+                                match_title=link.polymarket_title,
+                            )
                             
                             # Log state every time a signal fires
                             self.cricket_logger.log_state(state, market_price)
@@ -1222,10 +1242,18 @@ class SportsOrchestrator:
                             except Exception:
                                 pass
 
+                # Check open paper trades for MAE/MFE updates + exits
+                self.cricket_exit_mgr.check_all(
+                    books=self.poly_feed.books,
+                    match_states={mid: self.cricket_feed.games.get(cricket_espn_map.get(mid, ""))
+                                  for mid in self.cricket_exit_mgr.open_trades}
+                )
+
                 # Hourly health log
                 now = time.time()
                 if now - last_health_log >= 3600:
                     self.cricket_guard.stats.log_summary()
+                    log.info("CRICKET EXIT SUMMARY: %s", self.cricket_exit_mgr.summary())
                     last_health_log = now
 
             except Exception as e:
