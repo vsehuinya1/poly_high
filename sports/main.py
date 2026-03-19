@@ -684,13 +684,18 @@ class SportsOrchestrator:
         await asyncio.sleep(5)
         await self.tennis_score_feed.start()
         log.info("Tennis score polling started")
+        last_score_diag = 0  # v4.6.3 diagnostic
 
         while not self._shutdown:
             try:
                 count = await self.tennis_score_feed.poll_once()
 
+                # v4.6.3: diagnostic counters for score feed
+                sd = {"total": 0, "no_fs": 0, "not_live_fs": 0, "no_old_state": 0, "updated": 0}
+
                 # For each Polymarket tennis link, find matching Flashscore match
                 for poly_id, link in list(self.tennis_links.items()):
+                    sd["total"] += 1
                     # Try cached mapping first
                     fs_id = self._tennis_fs_map.get(poly_id)
                     fs_match = None
@@ -709,13 +714,20 @@ class SportsOrchestrator:
                                      link.polymarket_title[:40], fs_match.match_id,
                                      fs_match.player_a, fs_match.player_b)
 
-                    if not fs_match or not fs_match.is_live:
+                    if not fs_match:
+                        sd["no_fs"] += 1
+                        continue
+                    if not fs_match.is_live:
+                        sd["not_live_fs"] += 1
                         continue
 
                     # Update TennisState from Flashscore data
                     old_state = self.tennis_states.get(poly_id)
                     if not old_state:
+                        sd["no_old_state"] += 1
                         continue
+
+                    sd["updated"] += 1
 
                     # Determine which Flashscore player maps to which Poly player
                     from tennis.matching import tennis_name_match_score
@@ -781,6 +793,18 @@ class SportsOrchestrator:
                                  pt_a.value, pt_b.value, server_id[:10])
 
                     self.tennis_states[poly_id] = new_state
+
+                # v4.6.3: score feed diagnostic every 60s
+                now_sd = time.time()
+                if now_sd - last_score_diag >= 60:
+                    last_score_diag = now_sd
+                    # Count how many states have non-zero scores
+                    live_count = sum(1 for s in self.tennis_states.values()
+                                    if s.sets_a > 0 or s.sets_b > 0 or s.games_a > 0 or s.games_b > 0)
+                    log.info("TENNIS_SCORE_DIAG | poly=%d mapped=%d no_fs=%d not_live_fs=%d updated=%d | states_with_scores=%d/%d",
+                             sd["total"], sd["total"] - sd["no_fs"], sd["no_fs"],
+                             sd["not_live_fs"], sd["updated"],
+                             live_count, len(self.tennis_states))
 
             except Exception as e:
                 log.error("tennis score poll error: %s", e)
