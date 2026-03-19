@@ -578,7 +578,7 @@ class SportsOrchestrator:
             )
             # Try to identify home/away/draw tokens if possible
             for o in cm.outcomes:
-                t = o.name.lower()
+                t = o.outcome_label.lower()
                 if "yes" in t or "win" in t: link.home_token_id = o.token_id
             
             self.cricket_links[cm.event_id] = link
