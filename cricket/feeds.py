@@ -198,6 +198,8 @@ class CricketFeed:
         self.games: dict[str, CricketState] = {}
         self._last_poll_ts = 0.0
         self._poll_count = 0
+        # League IDs discovered dynamically (bilateral series, qualifiers, etc.)
+        self._dynamic_leagues: set[str] = set()
 
     async def fetch_live_scores(
         self,
@@ -214,7 +216,9 @@ class CricketFeed:
         now = time.time()
         total_live = 0
 
-        for league_code in ESPN_CRICKET_LEAGUES:
+        # Poll ALL leagues: static + dynamically discovered
+        all_leagues = list(ESPN_CRICKET_LEAGUES) + list(self._dynamic_leagues)
+        for league_code in all_leagues:
             url = f"{ESPN_CRICKET_BASE}/{league_code}/scoreboard"
 
             try:
@@ -400,8 +404,13 @@ class CricketFeed:
                                 )
 
                                 # Also fetch full scoreboard for this league
-                                # if we haven't already
+                                # if we haven't already — AND add to dynamic polling
                                 if league_id and league_id not in ESPN_CRICKET_LEAGUES:
+                                    if league_id not in self._dynamic_leagues:
+                                        self._dynamic_leagues.add(league_id)
+                                        log.info("CRICKET_DYNAMIC_LEAGUE | added %s (%s) for continuous polling",
+                                                 league_id, league_name)
+                                    # Initial fetch for matches not yet in self.games
                                     try:
                                         full_url = f"{ESPN_CRICKET_BASE}/{league_id}/scoreboard"
                                         async with session.get(
