@@ -1126,15 +1126,16 @@ class SignalEngine:
 
 
             # HARD STOP-LOSS — sport-specific threshold
+            # v4.7.2: disabled for football (0% WR across 31 trades, −$807)
             stop_price = sl_ticks * 0.01
-            if adverse >= stop_price:
+            if adverse >= stop_price and not is_football:
                 exit_reason = "stop_loss"
 
-            # v4.3: MOMENTUM EXIT — football only, early trend detection
-            elif is_football and time_since_entry <= FOOTBALL_FAST_MOVE_S \
-                    and adverse_ticks >= FOOTBALL_FAST_MOVE_TICKS:
-                exit_reason = "momentum_exit"
-                pos.momentum_exit_triggered = True
+            # v4.3: MOMENTUM EXIT — disabled in v4.7.2 (0% WR, 20 trades, −$296)
+            # elif is_football and time_since_entry <= FOOTBALL_FAST_MOVE_S \
+            #         and adverse_ticks >= FOOTBALL_FAST_MOVE_TICKS:
+            #     exit_reason = "momentum_exit"
+            #     pos.momentum_exit_triggered = True
 
             # Convergence — allowed during hold window (edge closed = good exit)
             elif abs(current_edge) < EXIT_CONVERGENCE:
