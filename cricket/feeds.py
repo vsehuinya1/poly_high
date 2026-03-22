@@ -59,6 +59,10 @@ CRICKET_POLL_INTERVAL_S = 30  # poll every 30 seconds
 def _parse_innings_data(event_data: dict) -> dict:
     """Parse innings details from ESPN competition data.
 
+    v4.7.3: Primary source is now linescores (overs, runs, wickets,
+    isBatting). Falls back to score_str / status_detail parsing when
+    linescores are absent.
+
     Returns dict with:
         batting_team, bowling_team, innings,
         runs, wickets, overs, balls,
@@ -106,68 +110,126 @@ def _parse_innings_data(event_data: dict) -> dict:
             "order": c.get("order", 0),
         }
 
-    # Parse the current innings state from situation/note
-    situation = comp.get("situation", {}) or {}
-    status_detail = event_data.get("status", {}).get("type", {}).get("detail", "")
-    note = comp.get("notes", [{}])
-
-    # Try to extract innings info from situation
-    last_batting = situation.get("lastBattingTeam", {}) or {}
-    batting_team_id = last_batting.get("id", "")
-
-    # Extract runs/wickets/overs from the score display
-    # ESPN format: "180/5 (16.3 ov)"
+    # ── PRIMARY: parse from linescores (reliable for all leagues) ──
+    # Each competitor has linescores[] with {runs, wickets, overs, isBatting}
+    batting_found_via_ls = False
+    innings_with_batting = 0
     for tid, ts in team_scores.items():
-        score_text = ts.get("score_str", "")
-        if "/" in score_text:
-            # Parse "180/5"
-            parts = score_text.split("/")
-            try:
-                runs = int(parts[0])
-                wickets = int(parts[1].split()[0]) if parts[1] else 0
-            except (ValueError, IndexError):
-                runs = 0
-                wickets = 0
-
-            # If this team is currently batting, use their score
-            if tid == batting_team_id or (not batting_team_id):
-                result["runs"] = runs
-                result["wickets"] = wickets
+        for ls in ts.get("linescores", []):
+            if ls.get("isBatting"):
+                batting_found_via_ls = True
                 result["batting_team"] = ts["name"]
+                result["runs"] = ls.get("runs", 0) or 0
+                result["wickets"] = ls.get("wickets", 0) or 0
+                ov = ls.get("overs", 0) or 0
+                result["overs"] = float(ov)
+                # Convert overs to balls: 6.5 → 6*6 + 5 = 41
+                over_int = int(result["overs"])
+                balls_part = round((result["overs"] - over_int) * 10)
+                result["balls"] = over_int * 6 + balls_part
+                innings_with_batting = ls.get("period", 1) or 1
+                break
 
-    # Find bowling team
-    for tid, ts in team_scores.items():
-        if ts["name"] != result["batting_team"]:
-            result["bowling_team"] = ts["name"]
-            break
+    # Find bowling team (the one NOT batting)
+    if batting_found_via_ls:
+        for tid, ts in team_scores.items():
+            if ts["name"] != result["batting_team"]:
+                result["bowling_team"] = ts["name"]
+                break
 
-    # Parse overs from status detail (e.g., "India 120/3 (14.2 ov)")
-    if "ov)" in status_detail:
+    # ── FALLBACK: parse from score_str + situation (old logic) ──────
+    if not batting_found_via_ls:
+        situation = comp.get("situation", {}) or {}
+        last_batting = situation.get("lastBattingTeam", {}) or {}
+        batting_team_id = last_batting.get("id", "")
+
+        # ESPN format: "180/5" or "180/5 (16.3 ov)"
+        for tid, ts in team_scores.items():
+            score_text = ts.get("score_str", "")
+            if "/" in score_text:
+                parts = score_text.split("/")
+                try:
+                    runs = int(parts[0])
+                    wickets = int(parts[1].split()[0]) if parts[1] else 0
+                except (ValueError, IndexError):
+                    runs = 0
+                    wickets = 0
+
+                if tid == batting_team_id or (not batting_team_id):
+                    result["runs"] = runs
+                    result["wickets"] = wickets
+                    result["batting_team"] = ts["name"]
+
+        for tid, ts in team_scores.items():
+            if ts["name"] != result["batting_team"]:
+                result["bowling_team"] = ts["name"]
+                break
+
+    # ── Parse overs from status_detail as secondary source ─────────
+    status_detail = event_data.get("status", {}).get("type", {}).get("detail", "")
+    if result["overs"] == 0 and "ov)" in status_detail:
         try:
             ov_part = status_detail.split("(")[1].split("ov)")[0].strip()
+            # Handle "6.5/20" format too
+            if "/" in ov_part:
+                ov_part = ov_part.split("/")[0].strip()
             result["overs"] = float(ov_part)
-            # Convert overs to balls: 14.3 → 14*6 + 3 = 87
             over_int = int(result["overs"])
             balls_part = round((result["overs"] - over_int) * 10)
             result["balls"] = over_int * 6 + balls_part
         except (IndexError, ValueError):
             pass
+    # Also try parsing overs from score_str: "57/1 (6.5/20 ov)"
+    if result["overs"] == 0:
+        for tid, ts in team_scores.items():
+            score_text = ts.get("score_str", "")
+            if "ov)" in score_text:
+                try:
+                    ov_part = score_text.split("(")[1].split("ov)")[0].strip()
+                    if "/" in ov_part:
+                        ov_part = ov_part.split("/")[0].strip()
+                    result["overs"] = float(ov_part)
+                    over_int = int(result["overs"])
+                    balls_part = round((result["overs"] - over_int) * 10)
+                    result["balls"] = over_int * 6 + balls_part
+                except (IndexError, ValueError):
+                    pass
 
-    # Determine innings number
-    # If both teams have linescores, 2nd innings is in progress
-    teams_with_scores = sum(1 for ts in team_scores.values()
-                           if ts.get("score_str", "0") not in ("0", ""))
-    if teams_with_scores >= 2:
+    # ── Determine innings number ───────────────────────────────────
+    # Use linescores period if available, else count teams with scores
+    if innings_with_batting >= 2:
         result["innings"] = 2
-        # First innings total from the other team
+    else:
+        # Check if both teams have non-zero linescores
+        teams_batting_ls = sum(
+            1 for ts in team_scores.values()
+            for ls in ts.get("linescores", [])
+            if (ls.get("runs", 0) or 0) > 0
+        )
+        teams_with_scores = sum(1 for ts in team_scores.values()
+                               if ts.get("score_str", "0") not in ("0", "", " "))
+        if teams_batting_ls >= 2 or teams_with_scores >= 2:
+            result["innings"] = 2
+
+    # First innings total (from the bowling team's completed innings)
+    if result["innings"] == 2:
         for tid, ts in team_scores.items():
             if ts["name"] != result["batting_team"]:
-                try:
-                    first_score = ts["score_str"].split("/")[0]
-                    result["first_innings_total"] = int(first_score)
-                    result["target_score"] = result["first_innings_total"] + 1
-                except (ValueError, IndexError):
-                    pass
+                # Try linescores first
+                for ls in ts.get("linescores", []):
+                    r = ls.get("runs", 0) or 0
+                    if r > 0:
+                        result["first_innings_total"] = r
+                        result["target_score"] = r + 1
+                        break
+                # Fallback to score_str
+                if result["first_innings_total"] == 0:
+                    try:
+                        first_score = ts["score_str"].split("/")[0]
+                        result["first_innings_total"] = int(first_score)
+                        result["target_score"] = result["first_innings_total"] + 1
+                    except (ValueError, IndexError):
+                        pass
 
     # Calculate run rate
     if result["overs"] > 0:
