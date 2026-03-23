@@ -111,23 +111,43 @@ def _parse_innings_data(event_data: dict) -> dict:
         }
 
     # ── PRIMARY: parse from linescores (reliable for all leagues) ──
-    # Each competitor has linescores[] with {runs, wickets, overs, isBatting}
+    # v4.7.4: ESPN marks BOTH innings as isBatting=True (one per team).
+    # During 2nd innings, the completed 1st innings entry has isCurrent=0
+    # and the active 2nd innings entry has isCurrent=1.
+    # Must prioritize isCurrent=1 to avoid tracking the wrong team.
     batting_found_via_ls = False
     innings_with_batting = 0
+
+    def _extract_from_ls(ls_entry, team_name):
+        nonlocal batting_found_via_ls, innings_with_batting
+        batting_found_via_ls = True
+        result["batting_team"] = team_name
+        result["runs"] = ls_entry.get("runs", 0) or 0
+        result["wickets"] = ls_entry.get("wickets", 0) or 0
+        ov = ls_entry.get("overs", 0) or 0
+        result["overs"] = float(ov)
+        over_int = int(result["overs"])
+        balls_part = round((result["overs"] - over_int) * 10)
+        result["balls"] = over_int * 6 + balls_part
+        innings_with_batting = ls_entry.get("period", 1) or 1
+
+    # Pass 1: prefer isCurrent=1 AND isBatting=True (active innings)
     for tid, ts in team_scores.items():
         for ls in ts.get("linescores", []):
-            if ls.get("isBatting"):
-                batting_found_via_ls = True
-                result["batting_team"] = ts["name"]
-                result["runs"] = ls.get("runs", 0) or 0
-                result["wickets"] = ls.get("wickets", 0) or 0
-                ov = ls.get("overs", 0) or 0
-                result["overs"] = float(ov)
-                # Convert overs to balls: 6.5 → 6*6 + 5 = 41
-                over_int = int(result["overs"])
-                balls_part = round((result["overs"] - over_int) * 10)
-                result["balls"] = over_int * 6 + balls_part
-                innings_with_batting = ls.get("period", 1) or 1
+            if ls.get("isBatting") and ls.get("isCurrent"):
+                _extract_from_ls(ls, ts["name"])
+                break
+        if batting_found_via_ls:
+            break
+
+    # Pass 2: fallback — any isBatting=True (single-innings or pre-transition)
+    if not batting_found_via_ls:
+        for tid, ts in team_scores.items():
+            for ls in ts.get("linescores", []):
+                if ls.get("isBatting"):
+                    _extract_from_ls(ls, ts["name"])
+                    break
+            if batting_found_via_ls:
                 break
 
     # Find bowling team (the one NOT batting)
