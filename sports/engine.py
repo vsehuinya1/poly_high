@@ -1009,11 +1009,36 @@ class SignalEngine:
 
         # ── All conditions met — execute delayed entry ────────────
         entry_delay_actual = elapsed_pending
-        confirm_count_actual = pending["confirm_count"]
+        confirmation_ticks_count = pending["confirm_count"]
         del self._pending_entries[pending_key]  # consumed
+        
+        # --- Q5 PROXY FILTER ---
+        edge_at_entry = abs(signal.edge)
+        score = edge_at_entry + confirmation_ticks_count
+        
+        MIN_EDGE = 0.15  # Goldilocks threshold directly from Q5 optimization
+        MIN_CONFIRMATION = 2
+        
+        if edge_at_entry >= MIN_EDGE and confirmation_ticks_count >= MIN_CONFIRMATION:
+            log.info({
+                "edge": edge_at_entry,
+                "confirmation": confirmation_ticks_count,
+                "score": score,
+                "decision": "ENTER"
+            })
+        else:
+            log.info({
+                "edge": edge_at_entry,
+                "confirmation": confirmation_ticks_count,
+                "score": score,
+                "decision": "SKIP"
+            })
+            self._blocks["BLOCK_Q5_PROXY"] = self._blocks.get("BLOCK_Q5_PROXY", 0) + 1
+            return
+            
         log.info("DELAYED_ENTRY_EXECUTED | %s | %s | delay=%.0fs confirm=%d edge=%.3f",
                  gs_str, signal.direction, entry_delay_actual,
-                 confirm_count_actual, abs(signal.edge))
+                 confirmation_ticks_count, abs(signal.edge))
 
         # ── Size Calculation ──────────────────────────────────────
         # size = abs(edge) * 1000, clamped [50, 300]
