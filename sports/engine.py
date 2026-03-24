@@ -770,7 +770,11 @@ class SignalEngine:
 
         # 1c. v4.5: NBA Q1 block + quarter-end block
         if sport_lower == "nba":
-            quarter = getattr(game_state, 'period', 0) or 0
+            quarter_val = getattr(game_state, 'period', 0) or 0
+            try:
+                quarter = int(quarter_val)
+            except (ValueError, TypeError):
+                quarter = 0
             elapsed_min = game_state.elapsed_minutes or 0
             # Block all Q1 entries (odds too noisy)
             if NBA_Q1_BLOCK and quarter <= 1 and elapsed_min < 12:
@@ -1020,19 +1024,11 @@ class SignalEngine:
         MIN_CONFIRMATION = 2
         
         if edge_at_entry >= MIN_EDGE and confirmation_ticks_count >= MIN_CONFIRMATION:
-            log.info({
-                "edge": edge_at_entry,
-                "confirmation": confirmation_ticks_count,
-                "score": score,
-                "decision": "ENTER"
-            })
+            log.info("Q5_PROXY_ENTER | edge=%.3f confirm=%d score=%.3f decision=ENTER",
+                     edge_at_entry, confirmation_ticks_count, score)
         else:
-            log.info({
-                "edge": edge_at_entry,
-                "confirmation": confirmation_ticks_count,
-                "score": score,
-                "decision": "SKIP"
-            })
+            log.info("Q5_PROXY_SKIP | edge=%.3f confirm=%d score=%.3f decision=SKIP",
+                     edge_at_entry, confirmation_ticks_count, score)
             self._blocks["BLOCK_Q5_PROXY"] = self._blocks.get("BLOCK_Q5_PROXY", 0) + 1
             return
             
