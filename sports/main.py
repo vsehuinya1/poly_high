@@ -678,7 +678,7 @@ class SportsOrchestrator:
                               self.poly_feed.message_count)
 
             except Exception as e:
-                log.error("signal processing error: %s", e)
+                log.exception("signal processing error:")
 
             await asyncio.sleep(POLYMARKET_SNAPSHOT_S)
 
