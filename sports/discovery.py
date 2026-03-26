@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 import aiohttp
 
-from sports.config import GAMMA_API_URL, SPORTS_SLUG_PATTERNS
+from sports.config import GAMMA_API_URL, SPORTS_SLUG_PATTERNS, FOOTBALL_ALLOWED_COMPETITIONS
 
 log = logging.getLogger("sports.discovery")
 
@@ -162,6 +162,14 @@ def classify_market(slug: str, title: str) -> tuple[str, str]:
     if s.startswith("chm-"):
         return ("football", "Championship")
 
+    # Football qualifiers / internationals (v4.8)
+    if "wcq-" in s or "world-cup-qualif" in s or "world cup qualif" in t:
+        return ("football", "World Cup Qualifiers")
+    if "ecq-" in s or "euro-qualif" in s or "euro qualif" in t:
+        return ("football", "Euro Qualifiers")
+    if "afcon" in s or "afcon" in t or "africa-cup" in s or "africa cup" in t:
+        return ("football", "AFCON Qualifiers")
+
     # Cricket — Polymarket slug prefix detection (primary path)
     if s.startswith("crint-"):
         return ("cricket", "International")
@@ -184,6 +192,20 @@ def classify_market(slug: str, title: str) -> tuple[str, str]:
         return ("cricket", "International")
 
     return ("unknown", "Unknown")
+
+
+def is_football_friendly(slug: str, title: str) -> bool:
+    """Check if a football market is a friendly / exhibition match."""
+    s = slug.lower()
+    t = title.lower()
+    friendly_patterns = [
+        "friendly", "friendlies", "exhibition",
+        "club-friendly", "international-friendly",
+    ]
+    for p in friendly_patterns:
+        if p in s or p in t:
+            return True
+    return False
 
 
 def is_single_game_market(event: dict) -> bool:
@@ -314,6 +336,25 @@ async def discover_sports_markets(session: aiohttp.ClientSession) -> list[SportM
             sport, league = classify_market(slug, title)
             if sport not in ("nba", "football", "tennis", "cricket"):
                 continue
+
+            # ── Football competition whitelist + friendly block (v4.8) ──
+            if sport == "football":
+                is_international = league in (
+                    "World Cup Qualifiers", "Euro Qualifiers",
+                    "AFCON Qualifiers", "Champions League",
+                    "Europa League", "FIFA World Cup",
+                )
+
+                if is_football_friendly(slug, title):
+                    log.info("FOOTBALL_SKIP_FRIENDLY | %s | league=%s", title, league)
+                    continue
+
+                if league not in FOOTBALL_ALLOWED_COMPETITIONS:
+                    log.info("FOOTBALL_COMP_BLOCKED | %s | league=%s", title, league)
+                    continue
+
+                log.info("FOOTBALL_COMP_OK | sport=football | competition=%s | is_international=%s | %s",
+                         league, is_international, title)
 
             # Process sub-markets within the event
             sub_markets = event.get("markets", [])

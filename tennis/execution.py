@@ -60,6 +60,7 @@ class TennisHealthStats:
         self.exit_stagnation: int = 0
         self.exit_match_end: int = 0
         self.exit_timeout: int = 0
+        self.exit_hard_stop: int = 0
         self.spread_capture_entries: int = 0
         self.runner_v2_trades: int = 0
         self.avg_R_multiple: float = 0.0
@@ -94,6 +95,7 @@ class TennisHealthStats:
         log.info("  Exit stagnation:         %d", self.exit_stagnation)
         log.info("  Exit match end:          %d", self.exit_match_end)
         log.info("  Exit timeout:            %d", self.exit_timeout)
+        log.info("  Exit hard stop:          %d", self.exit_hard_stop)
         log.info("  Spread capture entries:  %d", self.spread_capture_entries)
         log.info("  Runner V2 trades:        %d", self.runner_v2_trades)
         log.info("  Avg R-multiple:          %+.4f", self.avg_R_multiple)
@@ -123,6 +125,7 @@ class TennisHealthStats:
             "exit_stagnation": self.exit_stagnation,
             "exit_match_end": self.exit_match_end,
             "exit_timeout": self.exit_timeout,
+            "exit_hard_stop": self.exit_hard_stop,
             "spread_capture_entries": self.spread_capture_entries,
             "runner_v2_trades": self.runner_v2_trades,
             "avg_R_multiple": self.avg_R_multiple,
@@ -138,6 +141,7 @@ class TennisHealthStats:
         self.exit_stagnation = exit_stats.get("exit_stagnation", 0)
         self.exit_match_end = exit_stats.get("exit_match_end", 0)
         self.exit_timeout = exit_stats.get("exit_timeout", 0)
+        self.exit_hard_stop = exit_stats.get("exit_hard_stop", 0)
         self.spread_capture_entries = exit_stats.get("spread_capture_entries", 0)
         self.runner_v2_trades = exit_stats.get("runner_v2_trades", 0)
         self.avg_R_multiple = exit_stats.get("avg_R_multiple", 0.0)

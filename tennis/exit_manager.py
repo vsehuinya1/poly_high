@@ -116,6 +116,8 @@ class TennisExitManager:
     STAGNATION_TIMEOUT_S = 1800.0    # 30min stagnation safeguard
     STAGNATION_MFE_MIN = 0.03        # exit stagnant trades below this MFE
 
+    HARD_STOP_PRICE = 0.05            # absolute floor (5%) — catastrophic protection
+
     TIMEOUT_S = 7200.0               # 2 hours hard timeout
     SPREAD_CAPTURE_THRESHOLD = 0.04  # wide spread logging threshold
     SNAPSHOT_TIMES = [
@@ -275,6 +277,16 @@ class TennisExitManager:
                          mkt, trade.peak_price)
 
             # ── Exit conditions ──────────────────────────────
+
+            # -1. HARD STOP (catastrophic protection)
+            if mkt <= self.HARD_STOP_PRICE:
+                if get_spread:
+                    trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
+                trade.mid_price_exit = mkt
+                self._close_trade(trade, exit_price=mkt,
+                                  exit_reason="EXIT_HARD_STOP",
+                                  exit_score=score)
+                continue
 
             # 0. Runner V2 trailing stop (confirmed reversal)
             if trade.runner_v2_active:
@@ -454,6 +466,7 @@ class TennisExitManager:
         stagnation = sum(1 for t in closed if t.exit_reason == "EXIT_STAGNATION")
         match_end = sum(1 for t in closed if t.exit_reason == "EXIT_MATCH_END")
         timeout = sum(1 for t in closed if t.exit_reason == "EXIT_TIMEOUT")
+        hard_stop = sum(1 for t in closed if t.exit_reason == "EXIT_HARD_STOP")
         spread_captures = sum(1 for t in closed if t.spread_capture)
         runner_trades = sum(1 for t in closed if t.runner_v2_active)
         r_values = [t.R_multiple for t in closed if t.R_multiple is not None]
@@ -471,6 +484,7 @@ class TennisExitManager:
             "exit_stagnation": stagnation,
             "exit_match_end": match_end,
             "exit_timeout": timeout,
+            "exit_hard_stop": hard_stop,
             "spread_capture_entries": spread_captures,
             "runner_v2_trades": runner_trades,
             "avg_R_multiple": avg_r,

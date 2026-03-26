@@ -27,6 +27,21 @@ ESPN_LEAGUES = [
     "uefa.europa.conf", # Conference League
 ]
 
+# ── Football Competition Whitelist (v4.8) ────────────────────────────
+# Only these competitions are allowed for trading.
+# Maps to the 'league' field returned by classify_market() in discovery.py.
+FOOTBALL_ALLOWED_COMPETITIONS = [
+    "Premier League", "EPL",
+    "La Liga",
+    "Bundesliga",
+    "Ligue 1",
+    "Champions League",
+    "Europa League",
+    "World Cup Qualifiers",
+    "Euro Qualifiers",
+    "AFCON Qualifiers",
+]
+
 # ── NBA ──────────────────────────────────────────────────────────────
 NBA_SCOREBOARD_URL = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
 NCAA_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard?limit=100"
@@ -196,6 +211,11 @@ SPORTS_SLUG_PATTERNS = [
     "sa-",    # Serie A
     "ere-",   # Eredivisie
     "chm-",   # Championship
+    # Football qualifiers / internationals (v4.8)
+    "wcq-",   # World Cup Qualifiers
+    "ecq-",   # Euro Qualifiers
+    "afcon-", # AFCON / AFCON Qualifiers
+    "qualifier", "qualifiers",
     # Tennis
     "tennis", "atp-", "wta-",
     "australian-open", "french-open", "wimbledon", "us-open",
