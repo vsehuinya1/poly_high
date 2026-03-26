@@ -1016,21 +1016,27 @@ class SignalEngine:
         confirmation_ticks_count = pending["confirm_count"]
         del self._pending_entries[pending_key]  # consumed
         
-        # --- Q5 PROXY FILTER ---
+        # --- Q5 PROXY FILTER (NBA/other only — football bypasses) ---
         edge_at_entry = abs(signal.edge)
-        score = edge_at_entry + confirmation_ticks_count
         
-        MIN_EDGE = 0.15  # Goldilocks threshold directly from Q5 optimization
-        MIN_CONFIRMATION = 2
-        
-        if edge_at_entry >= MIN_EDGE and confirmation_ticks_count >= MIN_CONFIRMATION:
-            log.info("Q5_PROXY_ENTER | edge=%.3f confirm=%d score=%.3f decision=ENTER",
-                     edge_at_entry, confirmation_ticks_count, score)
+        if sport_lower == "football":
+            # v4.7.9: Football bypasses Q5 — was killing all FB entries since v4.7.5
+            log.info("FB_ENTRY_DECISION | %s | %s | edge=%.3f confirm=%d delay=%.0fs decision=ENTER",
+                     gs_str, signal.direction, edge_at_entry,
+                     confirmation_ticks_count, elapsed_pending)
         else:
-            log.info("Q5_PROXY_SKIP | edge=%.3f confirm=%d score=%.3f decision=SKIP",
-                     edge_at_entry, confirmation_ticks_count, score)
-            self._blocks["BLOCK_Q5_PROXY"] = self._blocks.get("BLOCK_Q5_PROXY", 0) + 1
-            return
+            score = edge_at_entry + confirmation_ticks_count
+            MIN_EDGE = 0.15  # Goldilocks threshold directly from Q5 optimization
+            MIN_CONFIRMATION = 2
+            
+            if edge_at_entry >= MIN_EDGE and confirmation_ticks_count >= MIN_CONFIRMATION:
+                log.info("Q5_PROXY_ENTER | edge=%.3f confirm=%d score=%.3f decision=ENTER",
+                         edge_at_entry, confirmation_ticks_count, score)
+            else:
+                log.info("Q5_PROXY_SKIP | edge=%.3f confirm=%d score=%.3f decision=SKIP",
+                         edge_at_entry, confirmation_ticks_count, score)
+                self._blocks["BLOCK_Q5_PROXY"] = self._blocks.get("BLOCK_Q5_PROXY", 0) + 1
+                return
             
         log.info("DELAYED_ENTRY_EXECUTED | %s | %s | delay=%.0fs confirm=%d edge=%.3f",
                  gs_str, signal.direction, entry_delay_actual,
@@ -1159,11 +1165,13 @@ class SignalEngine:
             #     pos.momentum_exit_triggered = True
 
             # Convergence — allowed during hold window (edge closed = good exit)
-            elif abs(current_edge) < EXIT_CONVERGENCE:
+            # v4.7.9: disabled for football (timeout-only exit strategy)
+            elif abs(current_edge) < EXIT_CONVERGENCE and not is_football:
                 exit_reason = "convergence"
 
             # edge_flip — only after sport-specific hold window
-            elif current_edge < -flip_thresh and time_since_entry >= min_hold:
+            # v4.7.9: disabled for football (timeout-only exit strategy)
+            elif current_edge < -flip_thresh and time_since_entry >= min_hold and not is_football:
                 exit_reason = "edge_flip"
 
             # game_end and timeout override everything (absolute exits)
