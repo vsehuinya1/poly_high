@@ -122,6 +122,11 @@ def classify_market(slug: str, title: str) -> tuple[str, str]:
     if "tennis" in s or "tennis" in t:
         return ("tennis", "Tennis")
 
+    # Cricket early guard — must precede football to avoid
+    # "Indian Premier League" matching as EPL football
+    if "ipl-" in s or "indian premier league" in t:
+        return ("cricket", "IPL")
+
     # Football leagues
     if "epl-" in s or "premier-league" in s or "premier league" in t:
         return ("football", "EPL")
