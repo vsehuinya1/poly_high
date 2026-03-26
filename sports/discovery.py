@@ -361,6 +361,21 @@ async def discover_sports_markets(session: aiohttp.ClientSession) -> list[SportM
                 log.info("FOOTBALL_COMP_OK | sport=football | competition=%s | is_international=%s | %s",
                          league, is_international, title)
 
+            # ── Cricket prop filter — match-winner markets only (v4.9) ──
+            if sport == "cricket":
+                title_lower = title.lower()
+                CRICKET_PROP_KEYWORDS = [
+                    "toss", "top batter", "top bowler", "runs",
+                    "wickets", "over", "man of the match",
+                    "first ball", "sixes", "fours", "boundaries",
+                ]
+                has_vs = " vs " in title_lower or " vs. " in title_lower
+                is_prop = any(kw in title_lower for kw in CRICKET_PROP_KEYWORDS)
+                if not has_vs or is_prop:
+                    log.info("CRICKET_PROP_SKIP | %s | has_vs=%s is_prop=%s",
+                             title, has_vs, is_prop)
+                    continue
+
             # Process sub-markets within the event
             sub_markets = event.get("markets", [])
             if not sub_markets:

@@ -423,6 +423,9 @@ class SportsOrchestrator:
         self.cricket_exit_mgr = CricketExitManager(data_dir=DATA_DIR)
         self.cricket_links: dict[str, GameMarketLink] = {}  # match_id → link
         self.cricket_states: dict[str, CricketState] = {}  # match_id → latest state
+        self._cricket_price_buf: dict[str, list[float]] = {}  # match_id → last N mid prices
+        self._cricket_last_trade_ts: dict[str, float] = {}    # match_id → last trade timestamp
+        self._cricket_prev_spread: dict[str, float] = {}      # match_id → previous spread
 
     async def discover(self) -> list[SportMarket]:
         """Discover active sports markets on Polymarket."""
@@ -1134,16 +1137,189 @@ class SportsOrchestrator:
         except Exception:
             pass
 
+    # ── Cricket helpers (v4.9) ─────────────────────────────────────
+
+    @staticmethod
+    def _parse_cricket_teams(poly_title: str) -> tuple[str, str]:
+        """Parse team names from a Polymarket cricket market title.
+
+        Examples:
+            'Indian Premier League: Mumbai Indians vs Kolkata Knight Riders'
+            → ('mumbai indians', 'kolkata knight riders')
+
+            'Legends Cricket League: Daredevils Delhi vs Royal Riders Punjab'
+            → ('daredevils delhi', 'royal riders punjab')
+
+            'T20 World Cup, Sub Regional Africa, Qualifier B: Ghana vs Saint Helena'
+            → ('ghana', 'saint helena')
+        """
+        title = poly_title
+        # 1. Remove league prefix before last ":"
+        if ":" in title:
+            title = title.rsplit(":", 1)[-1].strip()
+        # 2. Remove prop suffix after " - "
+        if " - " in title:
+            title = title.split(" - ", 1)[0].strip()
+        # 3. Split on " vs. " or " vs "
+        for sep in [" vs. ", " vs "]:
+            if sep in title.lower():
+                idx = title.lower().index(sep)
+                team_a = title[:idx].strip().lower()
+                team_b = title[idx + len(sep):].strip().lower()
+                return (team_a, team_b)
+        return ("", "")
+
+    @staticmethod
+    def _normalize_team(name: str) -> str:
+        """Normalize a team name for comparison: lowercase, strip spaces."""
+        return name.lower().strip()
+
+    @staticmethod
+    def _teams_match(poly_name: str, espn_name: str) -> bool:
+        """Check if a Poly team name matches an ESPN team name.
+
+        Uses substring containment in both directions.
+        'mumbai indians' matches 'Mumbai Indians'
+        'kolkata' matches 'Kolkata Knight Riders'
+        """
+        pn = poly_name.lower().strip()
+        en = espn_name.lower().strip()
+        if not pn or not en:
+            return False
+        return pn in en or en in pn
+
+    def _cricket_fallback_signals(
+        self,
+        match_id: str,
+        book,
+        link,
+    ) -> list[dict]:
+        """Generate fallback signals from pure price microstructure.
+
+        Returns list of signal dicts with:
+            signal_type: MEAN_REVERT | MOMENTUM
+            direction: LONG | SHORT
+            edge: abs(price_move)
+            confidence: consecutive_ticks
+            market_price: current mid
+        """
+        mid = book.mid
+        if mid <= 0:
+            return []
+
+        # Update price buffer
+        buf = self._cricket_price_buf.setdefault(match_id, [])
+        buf.append(mid)
+        if len(buf) > 60:  # keep last 60 ticks
+            self._cricket_price_buf[match_id] = buf[-60:]
+            buf = self._cricket_price_buf[match_id]
+
+        # ── Hard safety filters ──────────────────────────────────
+        if len(buf) < 10:
+            return []
+        if mid >= 0.90 or mid <= 0.10:
+            return []
+        if book.spread > 0.05:
+            return []
+
+        signals = []
+
+        # ── MEAN_REVERT: single-tick jump ≥ 0.05 ─────────────────
+        if len(buf) >= 2:
+            tick_move = buf[-1] - buf[-2]
+            if abs(tick_move) >= 0.05:
+                # Continuation filter: check if 2-3 prior ticks were
+                # already moving in the same direction as the jump.
+                # If so, this is momentum — NOT an overshoot to fade.
+                prior_same_dir = 0
+                for k in range(len(buf) - 2, max(0, len(buf) - 5), -1):
+                    if k == 0:
+                        break
+                    prior_delta = buf[k] - buf[k - 1]
+                    if prior_delta == 0:
+                        break
+                    if (prior_delta > 0 and tick_move > 0) or \
+                       (prior_delta < 0 and tick_move < 0):
+                        prior_same_dir += 1
+                    else:
+                        break
+
+                if prior_same_dir >= 2:
+                    log.info(
+                        "CRICKET_SKIP_CONTINUATION | move=%.4f | "
+                        "prior_same_dir=%d | %s",
+                        tick_move, prior_same_dir, match_id,
+                    )
+                else:
+                    # Fade the move
+                    direction = "LONG" if tick_move < 0 else "SHORT"
+                    signals.append({
+                        "signal_type": "MEAN_REVERT",
+                        "direction": direction,
+                        "edge": abs(tick_move),
+                        "confidence": 1,
+                        "market_price": mid,
+                        "move": tick_move,
+                        "ticks": 1,
+                    })
+
+        # ── MOMENTUM: ≥ 5 consecutive same-direction ticks, ≥ 0.03 ──
+        if len(buf) >= 6:
+            consecutive = 1
+            for i in range(len(buf) - 1, max(0, len(buf) - 21), -1):
+                if i == 0:
+                    break
+                delta = buf[i] - buf[i - 1]
+                prev_delta = buf[min(i + 1, len(buf) - 1)] - buf[i] if i < len(buf) - 1 else delta
+                if delta == 0:
+                    break
+                if i == len(buf) - 1:
+                    # First iteration — just record direction
+                    consecutive = 1
+                    continue
+                # Check same direction as the latest tick
+                latest_delta = buf[-1] - buf[-2]
+                if latest_delta == 0:
+                    break
+                if (delta > 0 and latest_delta > 0) or (delta < 0 and latest_delta < 0):
+                    consecutive += 1
+                else:
+                    break
+
+            if consecutive >= 5:
+                total_move = buf[-1] - buf[-consecutive]
+                if abs(total_move) >= 0.03:
+                    # Follow the move
+                    direction = "LONG" if total_move > 0 else "SHORT"
+                    signals.append({
+                        "signal_type": "MOMENTUM",
+                        "direction": direction,
+                        "edge": abs(total_move),
+                        "confidence": consecutive,
+                        "market_price": mid,
+                        "move": total_move,
+                        "ticks": consecutive,
+                    })
+
+        return signals
+
     async def _cricket_signal_loop(self):
-        """Cricket paper-only signal processing loop."""
+        """Cricket signal processing loop (v4.9).
+
+        Two signal paths:
+          1. DLS-based signals — when ESPN state is available
+          2. Fallback price-based signals — when ESPN mapping fails
+        """
         last_health_log = time.time()
-        # v4.6.5: ESPN→Poly mapping cache (Poly event_id → ESPN event_id)
+        last_map_attempt: dict[str, float] = {}  # match_id → last attempt ts
+        MAP_RETRY_S = 120.0  # retry mapping every 2 min
+        # v4.9: deterministic mapping cache
         cricket_espn_map: dict[str, str] = {}
 
         while not self._shutdown:
             try:
                 for match_id, link in list(self.cricket_links.items()):
-                    # v4.6.5: Map Polymarket ID to ESPN ID by team names
+                    # ── Deterministic Poly→ESPN mapping (v4.9) ────
                     espn_id = cricket_espn_map.get(match_id)
                     state = None
 
@@ -1151,94 +1327,266 @@ class SportsOrchestrator:
                         state = self.cricket_feed.games.get(espn_id)
 
                     if not state:
-                        # Fuzzy match by team names in the Polymarket title
-                        title_lower = link.polymarket_title.lower()
-                        best_match = None
-                        best_score = 0
-                        # Words that should not be used for last-word matching
-                        GENERIC_WORDS = {"women", "men", "a", "b", "xi", "under",
-                                         "u19", "u23", "colts", "emerging", "select"}
-                        for eid, cs in self.cricket_feed.games.items():
-                            if not cs.team_a or not cs.team_b:
-                                continue
-                            ta_full = cs.team_a.lower()
-                            tb_full = cs.team_b.lower()
-                            ta_last = ta_full.split()[-1]
-                            tb_last = tb_full.split()[-1]
-                            # Full-name match (higher confidence)
-                            a_full = ta_full in title_lower
-                            b_full = tb_full in title_lower
-                            # Last-word match (only if not a generic suffix)
-                            a_last = (ta_last in title_lower) if ta_last not in GENERIC_WORDS else False
-                            b_last = (tb_last in title_lower) if tb_last not in GENERIC_WORDS else False
-                            a_match = a_full or a_last
-                            b_match = b_full or b_last
-                            if a_match and b_match:
-                                # Score: full-name match = 2pts, last-word = 1pt
-                                score = (2 if a_full else 1) + (2 if b_full else 1)
-                                if score > best_score:
-                                    best_match = (eid, cs)
-                                    best_score = score
-                        if best_match:
-                            espn_id, state = best_match
-                            cricket_espn_map[match_id] = espn_id
-                            log.info("CRICKET MAP: %s → ESPN:%s (%s vs %s)",
-                                     link.polymarket_title[:40], espn_id,
-                                     state.team_a, state.team_b)
+                        # Rate-limit mapping attempts
+                        now_map = time.time()
+                        last_try = last_map_attempt.get(match_id, 0)
+                        if now_map - last_try < MAP_RETRY_S and last_try > 0:
+                            pass  # skip re-mapping, fall through to fallback
+                        else:
+                            last_map_attempt[match_id] = now_map
+                            # Parse teams from Poly title
+                            poly_a, poly_b = self._parse_cricket_teams(
+                                link.polymarket_title
+                            )
+                            if poly_a and poly_b:
+                                espn_candidates = []
+                                for eid, cs in self.cricket_feed.games.items():
+                                    if not cs.team_a or not cs.team_b:
+                                        continue
+                                    espn_candidates.append(
+                                        f"{cs.team_a} vs {cs.team_b}"
+                                    )
+                                    a_match = (
+                                        self._teams_match(poly_a, cs.team_a) or
+                                        self._teams_match(poly_a, cs.team_b)
+                                    )
+                                    b_match = (
+                                        self._teams_match(poly_b, cs.team_a) or
+                                        self._teams_match(poly_b, cs.team_b)
+                                    )
+                                    if a_match and b_match:
+                                        espn_id = eid
+                                        state = cs
+                                        cricket_espn_map[match_id] = espn_id
+                                        log.info(
+                                            'CRICKET_MAP_SUCCESS | poly="%s" '
+                                            '| espn="%s" | teams=%s vs %s',
+                                            link.polymarket_title[:60],
+                                            espn_id, cs.team_a, cs.team_b,
+                                        )
+                                        break
 
-                    if not state:
-                        continue
+                                if not state:
+                                    log.info(
+                                        'CRICKET_MAP_FAIL | poly="%s" '
+                                        '| parsed=[%s vs %s] '
+                                        '| candidates=%s',
+                                        link.polymarket_title[:60],
+                                        poly_a, poly_b,
+                                        espn_candidates[:5],
+                                    )
+                            else:
+                                log.info(
+                                    'CRICKET_MAP_FAIL | poly="%s" '
+                                    '| parse_failed=True',
+                                    link.polymarket_title[:60],
+                                )
 
-                    # Get market price for the batting team
+                    # ── Get book data ─────────────────────────────
                     book = self.poly_feed.books.get(link.home_token_id)
                     if not book or book.mid <= 0:
                         continue
-                    
                     market_price = book.mid
-                    
-                    # Evaluate strategy
-                    signals = self.cricket_strategy.evaluate(state, market_price)
-                    for sig in signals:
-                        # Log and check guards
-                        self.cricket_logger.log_signal(sig)
-                        
-                        decision = self.cricket_guard.can_execute(
-                            sig, spread=book.spread, data_age_s=time.time() - book.timestamp
+
+                    # ════════════════════════════════════════════════
+                    #  PATH 1: DLS-based signals (ESPN state available)
+                    # ════════════════════════════════════════════════
+                    if state:
+                        signals = self.cricket_strategy.evaluate(
+                            state, market_price
                         )
-                        
+                        for sig in signals:
+                            self.cricket_logger.log_signal(sig)
+                            decision = self.cricket_guard.can_execute(
+                                sig,
+                                spread=book.spread,
+                                data_age_s=time.time() - book.timestamp,
+                            )
+                            if decision.can_execute:
+                                self.cricket_guard.record_entry(match_id)
+                                score_str = str(state)
+                                log.info(
+                                    "CRICKET PAPER ENTRY | %s | "
+                                    "edge=%.4f | mkt=%.4f | %s",
+                                    sig.signal_type, sig.edge,
+                                    market_price,
+                                    link.polymarket_title[:40],
+                                )
+                                token_id = link.home_token_id or (
+                                    link.all_token_ids[0]
+                                    if link.all_token_ids else ""
+                                )
+                                self.cricket_exit_mgr.register_trade(
+                                    match_id=match_id,
+                                    selection_id=token_id,
+                                    signal_type=sig.signal_type,
+                                    entry_price=market_price,
+                                    fair_value=sig.fair_price,
+                                    edge=sig.edge,
+                                    entry_score=score_str,
+                                    spread=book.spread,
+                                    match_title=link.polymarket_title,
+                                )
+                                self.cricket_logger.log_state(
+                                    state, market_price
+                                )
+                                try:
+                                    await self.engine.tg.send(
+                                        f"🏏 <b>Cricket Signal (PAPER)</b>\n"
+                                        f"Type: {sig.signal_type}\n"
+                                        f"Edge: {sig.edge:+.4f}\n"
+                                        f"Mkt: {market_price:.3f} | "
+                                        f"Fair: {sig.fair_price:.3f}\n"
+                                        f"Match: {link.polymarket_title}\n"
+                                        f"Score: {state}"
+                                    )
+                                except Exception:
+                                    pass
+                        continue  # DLS path done, skip fallback
+
+                    # ════════════════════════════════════════════════
+                    #  PATH 2: Fallback price-based signals
+                    # ════════════════════════════════════════════════
+
+                    # Per-market cooldown (120s)
+                    CRICKET_FB_COOLDOWN_S = 120.0
+                    now_cd = time.time()
+                    last_trade = self._cricket_last_trade_ts.get(
+                        match_id, 0
+                    )
+                    if now_cd - last_trade < CRICKET_FB_COOLDOWN_S:
+                        # Still update price buffer but skip signals
+                        buf = self._cricket_price_buf.setdefault(
+                            match_id, []
+                        )
+                        buf.append(book.mid)
+                        if len(buf) > 60:
+                            self._cricket_price_buf[match_id] = buf[-60:]
+                        log.debug(
+                            "CRICKET_SKIP_COOLDOWN | market=%s | "
+                            "remaining=%.0fs",
+                            link.polymarket_title[:40],
+                            CRICKET_FB_COOLDOWN_S - (now_cd - last_trade),
+                        )
+                        continue
+
+                    fb_signals = self._cricket_fallback_signals(
+                        match_id, book, link
+                    )
+
+                    # Filter: spread-widening check for MOMENTUM
+                    prev_spread = self._cricket_prev_spread.get(
+                        match_id, book.spread
+                    )
+                    self._cricket_prev_spread[match_id] = book.spread
+
+                    filtered_signals = []
+                    for fb in fb_signals:
+                        if fb["signal_type"] == "MOMENTUM" and \
+                           book.spread > prev_spread:
+                            log.info(
+                                "CRICKET_SKIP_SPREAD_WIDEN | "
+                                "spread_now=%.4f | spread_prev=%.4f | %s",
+                                book.spread, prev_spread,
+                                link.polymarket_title[:40],
+                            )
+                            continue
+                        filtered_signals.append(fb)
+
+                    for fb in filtered_signals:
+                        log.info(
+                            "CRICKET_SIGNAL_FALLBACK | type=%s | "
+                            "direction=%s | move=%.4f | ticks=%d | "
+                            "price=%.4f | title=\"%s\"",
+                            fb["signal_type"], fb["direction"],
+                            fb["move"], fb["ticks"],
+                            fb["market_price"],
+                            link.polymarket_title[:50],
+                        )
+
+                        # Build a CricketSignal-compatible object for
+                        # the execution guard pipeline
+                        from cricket.state import CricketState, CricketModelOutput
+                        dummy_state = CricketState(
+                            match_id=match_id, format="t20",
+                            team_a=link.home_team or "A",
+                            team_b=link.away_team or "B",
+                            batting_team=link.home_team or "A",
+                            bowling_team=link.away_team or "B",
+                            innings=2, runs=0, wickets=0,
+                            overs=0.0, balls=0,
+                            run_rate=0.0, required_run_rate=0.0,
+                            target_score=0, first_innings_total=0,
+                            timestamp=time.time(),
+                        )
+                        dummy_model = CricketModelOutput(
+                            p_batting=0.5, p_bowling=0.5,
+                            resource_pct=0.0, par_score=0.0,
+                        )
+                        from cricket.strategy import CricketSignal
+                        sig = CricketSignal(
+                            timestamp=time.time(),
+                            match_id=match_id,
+                            signal_type=f"FALLBACK_{fb['signal_type']}",
+                            edge=fb["edge"],
+                            fair_price=(
+                                market_price + fb["edge"]
+                                if fb["direction"] == "LONG"
+                                else market_price - fb["edge"]
+                            ),
+                            market_price=market_price,
+                            state_snapshot=dummy_state,
+                            model_output=dummy_model,
+                            is_tradeable=True,
+                        )
+
+                        decision = self.cricket_guard.can_execute(
+                            sig,
+                            spread=book.spread,
+                            data_age_s=time.time() - book.timestamp,
+                        )
+
                         if decision.can_execute:
-                            # Record paper entry
                             self.cricket_guard.record_entry(match_id)
-                            score_str = str(state) if state else ""
-                            log.info("CRICKET PAPER ENTRY | %s | edge=%.4f | mkt=%.4f | %s",
-                                     sig.signal_type, sig.edge, market_price,
-                                     link.polymarket_title[:40])
-                            
-                            # Register with exit manager for MAE/MFE tracking
+                            self._cricket_last_trade_ts[match_id] = time.time()
+                            log.info(
+                                "CRICKET PAPER ENTRY | %s | "
+                                "direction=%s | edge=%.4f | "
+                                "mkt=%.4f | %s",
+                                fb["signal_type"], fb["direction"],
+                                fb["edge"], market_price,
+                                link.polymarket_title[:40],
+                            )
+                            log.info(
+                                "CRICKET_TRADE_DECISION | type=%s | "
+                                "direction=%s | entry_price=%.4f",
+                                fb["signal_type"], fb["direction"],
+                                market_price,
+                            )
+                            token_id = link.home_token_id or (
+                                link.all_token_ids[0]
+                                if link.all_token_ids else ""
+                            )
                             self.cricket_exit_mgr.register_trade(
                                 match_id=match_id,
-                                selection_id=link.home_token_id or (link.all_token_ids[0] if link.all_token_ids else ""),
-                                signal_type=sig.signal_type,
+                                selection_id=token_id,
+                                signal_type=f"FALLBACK_{fb['signal_type']}",
                                 entry_price=market_price,
                                 fair_value=sig.fair_price,
-                                edge=sig.edge,
-                                entry_score=score_str,
+                                edge=fb["edge"],
+                                entry_score=f"{fb['direction']} {fb['signal_type']}",
                                 spread=book.spread,
                                 match_title=link.polymarket_title,
                             )
-                            
-                            # Log state every time a signal fires
-                            self.cricket_logger.log_state(state, market_price)
-                            
-                            # Telegram alert (paper-only)
                             try:
                                 await self.engine.tg.send(
-                                    f"🏏 <b>Cricket Signal (PAPER)</b>\n"
-                                    f"Type: {sig.signal_type}\n"
-                                    f"Edge: {sig.edge:+.4f}\n"
-                                    f"Mkt: {market_price:.3f} | Fair: {sig.fair_price:.3f}\n"
-                                    f"Match: {link.polymarket_title}\n"
-                                    f"Score: {state}"
+                                    f"🏏 <b>Cricket Fallback (PAPER)</b>\n"
+                                    f"Type: {fb['signal_type']}\n"
+                                    f"Direction: {fb['direction']}\n"
+                                    f"Edge: {fb['edge']:.4f} | "
+                                    f"Move: {fb['move']:+.4f}\n"
+                                    f"Mkt: {market_price:.3f}\n"
+                                    f"Match: {link.polymarket_title}"
                                 )
                             except Exception:
                                 pass
@@ -1246,15 +1594,22 @@ class SportsOrchestrator:
                 # Check open paper trades for MAE/MFE updates + exits
                 self.cricket_exit_mgr.check_all(
                     books=self.poly_feed.books,
-                    match_states={mid: self.cricket_feed.games.get(cricket_espn_map.get(mid, ""))
-                                  for mid in self.cricket_exit_mgr.open_trades}
+                    match_states={
+                        mid: self.cricket_feed.games.get(
+                            cricket_espn_map.get(mid, "")
+                        )
+                        for mid in self.cricket_exit_mgr.open_trades
+                    },
                 )
 
                 # Hourly health log
                 now = time.time()
                 if now - last_health_log >= 3600:
                     self.cricket_guard.stats.log_summary()
-                    log.info("CRICKET EXIT SUMMARY: %s", self.cricket_exit_mgr.summary())
+                    log.info(
+                        "CRICKET EXIT SUMMARY: %s",
+                        self.cricket_exit_mgr.summary(),
+                    )
                     last_health_log = now
 
             except Exception as e:
