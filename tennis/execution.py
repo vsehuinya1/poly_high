@@ -56,14 +56,15 @@ class TennisHealthStats:
         # Exit lifecycle counters (fed by ExitManager)
         self.trades_opened: int = 0
         self.trades_closed: int = 0
-        self.exit_convergence: int = 0
+        self.exit_runner_v2: int = 0
+        self.exit_stagnation: int = 0
         self.exit_match_end: int = 0
         self.exit_timeout: int = 0
-        self.exit_runner_trail: int = 0
         self.spread_capture_entries: int = 0
-        self.runner_mode_trades: int = 0
+        self.runner_v2_trades: int = 0
         self.avg_R_multiple: float = 0.0
         self.avg_runner_R: float = 0.0
+        self.avg_capture_ratio: float = 0.0
         self._start_time: float = time.time()
 
     def log_summary(self) -> None:
@@ -86,17 +87,18 @@ class TennisHealthStats:
         log.info("  Trades executed:         %d", self.trades_executed)
         log.info("  WS reconnects:           %d", self.ws_reconnects)
         log.info("  Max staleness (ms):      %.0f", self.max_staleness_ms)
-        log.info("  --- Exit Lifecycle ---")
+        log.info("  --- Exit Lifecycle (Runner V2) ---")
         log.info("  Trades opened:           %d", self.trades_opened)
         log.info("  Trades closed:           %d", self.trades_closed)
-        log.info("  Exit convergence:        %d", self.exit_convergence)
+        log.info("  Exit runner V2:          %d", self.exit_runner_v2)
+        log.info("  Exit stagnation:         %d", self.exit_stagnation)
         log.info("  Exit match end:          %d", self.exit_match_end)
         log.info("  Exit timeout:            %d", self.exit_timeout)
-        log.info("  Exit runner trail:       %d", self.exit_runner_trail)
         log.info("  Spread capture entries:  %d", self.spread_capture_entries)
-        log.info("  Runner mode trades:      %d", self.runner_mode_trades)
+        log.info("  Runner V2 trades:        %d", self.runner_v2_trades)
         log.info("  Avg R-multiple:          %+.4f", self.avg_R_multiple)
         log.info("  Avg runner R:            %+.4f", self.avg_runner_R)
+        log.info("  Avg capture ratio:       %.4f", self.avg_capture_ratio)
         log.info("=" * 60)
 
     def as_dict(self) -> dict:
@@ -117,28 +119,30 @@ class TennisHealthStats:
             "max_staleness_ms": self.max_staleness_ms,
             "trades_opened": self.trades_opened,
             "trades_closed": self.trades_closed,
-            "exit_convergence": self.exit_convergence,
+            "exit_runner_v2": self.exit_runner_v2,
+            "exit_stagnation": self.exit_stagnation,
             "exit_match_end": self.exit_match_end,
             "exit_timeout": self.exit_timeout,
-            "exit_runner_trail": self.exit_runner_trail,
             "spread_capture_entries": self.spread_capture_entries,
-            "runner_mode_trades": self.runner_mode_trades,
+            "runner_v2_trades": self.runner_v2_trades,
             "avg_R_multiple": self.avg_R_multiple,
             "avg_runner_R": self.avg_runner_R,
+            "avg_capture_ratio": self.avg_capture_ratio,
         }
 
     def merge_exit_stats(self, exit_stats: dict) -> None:
         """Merge stats from TennisExitManager into health counters."""
         self.trades_opened = exit_stats.get("trades_opened", 0)
         self.trades_closed = exit_stats.get("trades_closed", 0)
-        self.exit_convergence = exit_stats.get("exit_convergence", 0)
+        self.exit_runner_v2 = exit_stats.get("exit_runner_v2", 0)
+        self.exit_stagnation = exit_stats.get("exit_stagnation", 0)
         self.exit_match_end = exit_stats.get("exit_match_end", 0)
         self.exit_timeout = exit_stats.get("exit_timeout", 0)
-        self.exit_runner_trail = exit_stats.get("exit_runner_trail", 0)
         self.spread_capture_entries = exit_stats.get("spread_capture_entries", 0)
-        self.runner_mode_trades = exit_stats.get("runner_mode_trades", 0)
+        self.runner_v2_trades = exit_stats.get("runner_v2_trades", 0)
         self.avg_R_multiple = exit_stats.get("avg_R_multiple", 0.0)
         self.avg_runner_R = exit_stats.get("avg_runner_R", 0.0)
+        self.avg_capture_ratio = exit_stats.get("avg_capture_ratio", 0.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -1,13 +1,15 @@
 """
-Tennis Exit Manager — lifecycle tracking for paper trades.
+Tennis Exit Manager — Runner V2 (tick-based trailing).
 
 Tracks open paper trades, detects exit conditions, captures
 post-entry price snapshots, and logs complete lifecycle to CSV.
 
-v1.1 — 2026-03-06
-  - Spread capture logging (paper PnL uses adjusted entry)
-  - Runner mode (trailing stop after +0.20 gain)
-  - T+60 snapshot
+v3.0 — 2026-03-26  Runner V2
+  - REMOVED convergence exit entirely (harmful — cuts winners)
+  - Runner V2: MFE-threshold activation (5%), loose 50% trail
+  - Confirmed reversal: exit only after 2+ consecutive adverse ticks
+  - Stagnation safeguard: 30min + MFE < 0.03
+  - Enhanced logging: capture_ratio, time_to_mfe
 """
 import csv
 import logging
@@ -44,10 +46,15 @@ class TennisPaperTrade:
     _snapshot_15_done: bool = field(default=False, repr=False)
     _snapshot_30_done: bool = field(default=False, repr=False)
     _snapshot_60_done: bool = field(default=False, repr=False)
-    # Runner mode (v1.1)
-    runner_mode: bool = False
+    # Runner V2 fields
+    runner_v2_active: bool = False
     peak_price: float = 0.0
     runner_exit_triggered: bool = False
+    consecutive_adverse_ticks: int = 0
+    last_tick_price: float = 0.0
+    mfe_timestamp: float = 0.0         # when peak MFE was reached
+    # Legacy compat — kept for CSV schema but always True under V2
+    runner_mode: bool = False
     # Exit data
     exit_price: Optional[float] = None
     exit_timestamp: Optional[float] = None
@@ -76,20 +83,40 @@ class TennisPaperTrade:
     def age_minutes(self) -> float:
         return (time.time() - self.entry_timestamp) / 60.0
 
+    @property
+    def capture_ratio(self) -> float:
+        """Ratio of realized gain to MFE. 1.0 = perfect exit at peak."""
+        if self.mfe <= 0 or self.exit_price is None:
+            return 0.0
+        realized = self.exit_price - self.entry_price
+        return max(0.0, realized / self.mfe)
+
+    @property
+    def time_to_mfe_seconds(self) -> float:
+        """Seconds from entry to when MFE was reached."""
+        if self.mfe_timestamp and self.entry_timestamp:
+            return self.mfe_timestamp - self.entry_timestamp
+        return 0.0
+
 
 class TennisExitManager:
     """Manages tennis paper trade lifecycle: snapshots, exits, CSV logging.
+
+    Runner V2 — tick-based trailing exit system.
+    NO convergence exit. Trails only after meaningful MFE.
 
     Non-blocking — designed to run inside the existing async polling loop.
     Call check_all() on every tick.
     """
 
-    CONVERGENCE_THRESHOLD = 0.01   # exit when abs(fair - mkt) < this
-    TIMEOUT_S = 7200.0             # 2 hours
-    RUNNER_TRIGGER = 0.20          # price gain to activate runner mode
-    RUNNER_TRAIL_PCT = 0.30        # trailing stop = 30% of (peak - entry)
-    RUNNER_TRAIL_MIN = 0.02        # minimum trail distance
-    RUNNER_TRAIL_MAX = 0.05        # maximum trail distance
+    # ── Runner V2 Parameters ─────────────────────────────────────
+    RUNNER_V2_MFE_THRESHOLD = 0.05   # 5% MFE before any exit logic activates
+    RUNNER_V2_TRAIL_PCT = 0.50       # give back up to 50% of gains
+    RUNNER_V2_CONFIRM_TICKS = 2      # consecutive adverse ticks to confirm reversal
+    STAGNATION_TIMEOUT_S = 1800.0    # 30min stagnation safeguard
+    STAGNATION_MFE_MIN = 0.03        # exit stagnant trades below this MFE
+
+    TIMEOUT_S = 7200.0               # 2 hours hard timeout
     SPREAD_CAPTURE_THRESHOLD = 0.04  # wide spread logging threshold
     SNAPSHOT_TIMES = [
         (5 * 60,   "price_t5",  "_snapshot_5_done"),
@@ -145,6 +172,7 @@ class TennisExitManager:
             adjusted_entry_price=adjusted,
             peak_price=entry_price,
             min_price_seen=entry_price,
+            mfe_timestamp=time.time(),
             # Execution metrics
             spread_at_signal=spread_at_signal,
             spread_at_entry=spread,
@@ -180,6 +208,13 @@ class TennisExitManager:
     ):
         """Check all open trades for snapshots and exit conditions.
 
+        Runner V2 logic:
+          1. Track MFE in real time
+          2. Activate trailing ONLY after MFE >= 5%
+          3. Dynamic trail at 50% of MFE
+          4. Exit on confirmed reversal (2+ consecutive adverse ticks)
+          5. Stagnation safeguard (30min + MFE < 3%)
+
         Args:
             get_market_price: fn(match_id, selection_id) → float or None
             get_fair_value: fn(match_id) → float or None
@@ -213,6 +248,7 @@ class TennisExitManager:
             adverse = trade.entry_price - mkt
             if favorable > trade.mfe:
                 trade.mfe = favorable
+                trade.mfe_timestamp = now  # update time-to-MFE
             if adverse > trade.mae:
                 trade.mae = adverse
 
@@ -222,61 +258,41 @@ class TennisExitManager:
             if mkt < trade.min_price_seen or trade.min_price_seen == 0:
                 trade.min_price_seen = mkt
 
-            price_gain = mkt - trade.entry_price
-            if not trade.runner_mode and price_gain >= self.RUNNER_TRIGGER:
-                trade.runner_mode = True
-                log.info("EXIT_MGR RUNNER | %s | activated at mkt=%.4f (gain=%.4f, peak=%.4f)",
-                         match_id, mkt, price_gain, trade.peak_price)
+            # ── Runner V2: Track consecutive adverse ticks ────
+            if trade.last_tick_price > 0:
+                if mkt < trade.last_tick_price:
+                    trade.consecutive_adverse_ticks += 1
+                else:
+                    trade.consecutive_adverse_ticks = 0
+            trade.last_tick_price = mkt
+
+            # ── Runner V2: Activate trailing after MFE threshold ──
+            if not trade.runner_v2_active and trade.mfe >= self.RUNNER_V2_MFE_THRESHOLD:
+                trade.runner_v2_active = True
+                trade.runner_mode = True  # legacy compat
+                log.info("EXIT_MGR RUNNER_V2 ACTIVATED | %s | mfe=%.4f >= %.4f | mkt=%.4f peak=%.4f",
+                         match_id, trade.mfe, self.RUNNER_V2_MFE_THRESHOLD,
+                         mkt, trade.peak_price)
 
             # ── Exit conditions ──────────────────────────────
 
-            # 0. Runner trailing stop (dynamic, overrides convergence)
-            if trade.runner_mode:
-                trail_distance = max(
-                    self.RUNNER_TRAIL_MIN,
-                    min(self.RUNNER_TRAIL_MAX,
-                        (trade.peak_price - trade.entry_price) * self.RUNNER_TRAIL_PCT),
-                )
-                if mkt <= trade.peak_price - trail_distance:
+            # 0. Runner V2 trailing stop (confirmed reversal)
+            if trade.runner_v2_active:
+                trail_level = trade.mfe * self.RUNNER_V2_TRAIL_PCT
+                exit_threshold = trade.entry_price + trail_level
+
+                if (mkt <= exit_threshold
+                        and trade.consecutive_adverse_ticks >= self.RUNNER_V2_CONFIRM_TICKS):
                     trade.runner_exit_triggered = True
-                    # Capture spread at exit
                     if get_spread:
                         trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
                     trade.mid_price_exit = mkt
                     self._close_trade(trade, exit_price=mkt,
-                                      exit_reason="EXIT_RUNNER_TRAIL",
-                                      exit_score=score)
-                    continue
-                # Skip convergence exit — let runner run
-            else:
-                # 1. Momentum-aware convergence
-                if fair is not None and mkt >= fair:
-                    overshoot_pct = (mkt - fair) / fair if fair > 0 else 0
-                    if overshoot_pct > 0.03 and mkt > trade.entry_price:
-                        # Price is OVERSHOOTING fair value — switch to runner
-                        trade.runner_mode = True
-                        log.info("EXIT_MGR CONVERGENCE_TO_RUNNER | %s | mkt=%.4f > fair=%.4f (overshoot=%.1f%%)",
-                                 match_id, mkt, fair, overshoot_pct * 100)
-                    else:
-                        # Price hit fair value and stopped — exit as convergence
-                        if get_spread:
-                            trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
-                        trade.mid_price_exit = mkt
-                        self._close_trade(trade, exit_price=mkt,
-                                          exit_reason="EXIT_CONVERGENCE",
-                                          exit_score=score)
-                        continue
-                elif fair is not None and abs(fair - mkt) < self.CONVERGENCE_THRESHOLD:
-                    # Original convergence: within threshold of fair value
-                    if get_spread:
-                        trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
-                    trade.mid_price_exit = mkt
-                    self._close_trade(trade, exit_price=mkt,
-                                      exit_reason="EXIT_CONVERGENCE",
+                                      exit_reason="EXIT_RUNNER_V2",
                                       exit_score=score)
                     continue
 
-            # 2. Match end (always applies)
+            # 1. Match end (always applies)
             if is_match_finished(match_id):
                 if get_spread:
                     trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
@@ -286,7 +302,18 @@ class TennisExitManager:
                                   exit_score=score)
                 continue
 
-            # 3. Timeout — 2 hours (always applies)
+            # 2. Stagnation safeguard — 30min with tiny MFE
+            if (elapsed >= self.STAGNATION_TIMEOUT_S
+                    and trade.mfe < self.STAGNATION_MFE_MIN):
+                if get_spread:
+                    trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
+                trade.mid_price_exit = mkt
+                self._close_trade(trade, exit_price=mkt,
+                                  exit_reason="EXIT_STAGNATION",
+                                  exit_score=score)
+                continue
+
+            # 3. Hard timeout — 2 hours (always applies)
             if elapsed >= self.TIMEOUT_S:
                 if get_spread:
                     trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
@@ -319,10 +346,13 @@ class TennisExitManager:
         self.closed_trades.append(trade)
 
         log.info(
-            "EXIT_MGR CLOSE | %s | %s | entry=%.4f → exit=%.4f | R=%+.4f | %s | %.0fs",
+            "EXIT_MGR CLOSE | %s | %s | entry=%.4f → exit=%.4f | R=%+.4f | "
+            "mfe=%.4f capture=%.2f | %s | %.0fs",
             trade.match_id, trade.exit_reason,
             trade.entry_price, exit_price,
-            trade.R_multiple, trade.exit_score,
+            trade.R_multiple,
+            trade.mfe, trade.capture_ratio,
+            trade.exit_score,
             trade.duration_seconds,
         )
 
@@ -350,12 +380,14 @@ class TennisExitManager:
                 "match_id", "player", "trigger", "entry_price", "fair_entry",
                 "edge_entry", "spread", "spread_capture", "adjusted_entry_price",
                 "price_t5", "price_t15", "price_t30", "price_t60",
-                "runner_mode", "peak_price",
+                "runner_v2_active", "peak_price",
                 "exit_price", "exit_reason", "R_multiple",
                 "entry_score", "exit_score", "duration_seconds",
                 "timestamp_entry", "timestamp_exit",
-                # v2.0 fields
+                # v3.0 fields
                 "mfe", "mae", "min_price_seen",
+                "capture_ratio", "time_to_mfe",
+                "consecutive_adverse_ticks",
                 "spread_at_signal", "spread_at_entry", "spread_at_exit",
                 "mid_price_signal", "mid_price_entry", "mid_price_exit",
             ])
@@ -365,7 +397,7 @@ class TennisExitManager:
         """Write one complete lifecycle row to CSV."""
         self._ensure_csv()
         self._csv_writer.writerow([
-            "2",  # schema_version
+            "3",  # schema_version — Runner V2
             t.match_id,
             t.player,
             t.trigger_type,
@@ -379,7 +411,7 @@ class TennisExitManager:
             f"{t.price_t15:.4f}" if t.price_t15 is not None else "",
             f"{t.price_t30:.4f}" if t.price_t30 is not None else "",
             f"{t.price_t60:.4f}" if t.price_t60 is not None else "",
-            "1" if t.runner_mode else "0",
+            "1" if t.runner_v2_active else "0",
             f"{t.peak_price:.4f}",
             f"{t.exit_price:.4f}" if t.exit_price is not None else "",
             t.exit_reason or "",
@@ -389,10 +421,13 @@ class TennisExitManager:
             f"{t.duration_seconds:.0f}",
             f"{t.entry_timestamp:.3f}",
             f"{t.exit_timestamp:.3f}" if t.exit_timestamp else "",
-            # v2.0 fields
+            # v3.0 fields
             f"{t.mfe:.4f}",
             f"{t.mae:.4f}",
             f"{t.min_price_seen:.4f}",
+            f"{t.capture_ratio:.4f}",
+            f"{t.time_to_mfe_seconds:.1f}",
+            str(t.consecutive_adverse_ticks),
             f"{t.spread_at_signal:.4f}",
             f"{t.spread_at_entry:.4f}",
             f"{t.spread_at_exit:.4f}",
@@ -415,27 +450,30 @@ class TennisExitManager:
     def stats(self) -> dict:
         """Return exit stats for health dashboard integration."""
         closed = self.closed_trades
-        convergence = sum(1 for t in closed if t.exit_reason == "EXIT_CONVERGENCE")
+        runner_v2 = sum(1 for t in closed if t.exit_reason == "EXIT_RUNNER_V2")
+        stagnation = sum(1 for t in closed if t.exit_reason == "EXIT_STAGNATION")
         match_end = sum(1 for t in closed if t.exit_reason == "EXIT_MATCH_END")
         timeout = sum(1 for t in closed if t.exit_reason == "EXIT_TIMEOUT")
-        runner_trail = sum(1 for t in closed if t.exit_reason == "EXIT_RUNNER_TRAIL")
         spread_captures = sum(1 for t in closed if t.spread_capture)
-        runner_trades = sum(1 for t in closed if t.runner_mode)
+        runner_trades = sum(1 for t in closed if t.runner_v2_active)
         r_values = [t.R_multiple for t in closed if t.R_multiple is not None]
-        runner_r = [t.R_multiple for t in closed if t.runner_mode and t.R_multiple is not None]
+        runner_r = [t.R_multiple for t in closed if t.runner_v2_active and t.R_multiple is not None]
+        capture_ratios = [t.capture_ratio for t in closed if t.mfe > 0]
         avg_r = sum(r_values) / len(r_values) if r_values else 0.0
         avg_runner_r = sum(runner_r) / len(runner_r) if runner_r else 0.0
+        avg_capture = sum(capture_ratios) / len(capture_ratios) if capture_ratios else 0.0
 
         return {
             "trades_opened": len(self.open_trades) + len(closed),
             "trades_closed": len(closed),
             "trades_open": len(self.open_trades),
-            "exit_convergence": convergence,
+            "exit_runner_v2": runner_v2,
+            "exit_stagnation": stagnation,
             "exit_match_end": match_end,
             "exit_timeout": timeout,
-            "exit_runner_trail": runner_trail,
             "spread_capture_entries": spread_captures,
-            "runner_mode_trades": runner_trades,
+            "runner_v2_trades": runner_trades,
             "avg_R_multiple": avg_r,
             "avg_runner_R": avg_runner_r,
+            "avg_capture_ratio": avg_capture,
         }
