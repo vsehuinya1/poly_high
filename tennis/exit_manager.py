@@ -117,8 +117,9 @@ class TennisExitManager:
     STAGNATION_MFE_MIN = 0.03        # exit stagnant trades below this MFE
 
     HARD_STOP_PRICE = 0.05            # absolute floor (5%) — catastrophic protection
+    STOP_LOSS_R = 0.15                 # v3.1: stop-loss at -15% of entry price
 
-    TIMEOUT_S = 7200.0               # 2 hours hard timeout
+    TIMEOUT_S = 2700.0                 # v3.1: 45 minutes hard timeout (was 2h)
     SPREAD_CAPTURE_THRESHOLD = 0.04  # wide spread logging threshold
     SNAPSHOT_TIMES = [
         (5 * 60,   "price_t5",  "_snapshot_5_done"),
@@ -285,6 +286,22 @@ class TennisExitManager:
                 trade.mid_price_exit = mkt
                 self._close_trade(trade, exit_price=mkt,
                                   exit_reason="EXIT_HARD_STOP",
+                                  exit_score=score)
+                continue
+
+            # -0.5 STOP-LOSS (v3.1): exit if price dropped >= 15% below entry
+            stop_price = trade.entry_price * (1.0 - self.STOP_LOSS_R)
+            if mkt <= stop_price:
+                if get_spread:
+                    trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
+                trade.mid_price_exit = mkt
+                log.info(
+                    "EXIT_MGR STOP_LOSS | %s | entry=%.4f stop=%.4f mkt=%.4f | R=%.4f",
+                    match_id, trade.entry_price, stop_price, mkt,
+                    (mkt - trade.entry_price) / trade.entry_price,
+                )
+                self._close_trade(trade, exit_price=mkt,
+                                  exit_reason="EXIT_STOP_LOSS",
                                   exit_score=score)
                 continue
 
@@ -467,6 +484,7 @@ class TennisExitManager:
         match_end = sum(1 for t in closed if t.exit_reason == "EXIT_MATCH_END")
         timeout = sum(1 for t in closed if t.exit_reason == "EXIT_TIMEOUT")
         hard_stop = sum(1 for t in closed if t.exit_reason == "EXIT_HARD_STOP")
+        stop_loss = sum(1 for t in closed if t.exit_reason == "EXIT_STOP_LOSS")
         spread_captures = sum(1 for t in closed if t.spread_capture)
         runner_trades = sum(1 for t in closed if t.runner_v2_active)
         r_values = [t.R_multiple for t in closed if t.R_multiple is not None]
@@ -485,6 +503,7 @@ class TennisExitManager:
             "exit_match_end": match_end,
             "exit_timeout": timeout,
             "exit_hard_stop": hard_stop,
+            "exit_stop_loss": stop_loss,
             "spread_capture_entries": spread_captures,
             "runner_v2_trades": runner_trades,
             "avg_R_multiple": avg_r,
