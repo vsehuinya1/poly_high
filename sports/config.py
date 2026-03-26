@@ -84,7 +84,7 @@ MAX_SCORE_DIFF        = 15       # |home - away| must be <= this
 EDGE_TRADE_THRESHOLD  = 0.10     # min edge to open a trade (base — overridden per sport)
 FOOTBALL_EDGE_TRADE   = 0.15     # v4.5: higher entry edge for football (was 0.10)
 NBA_EDGE_TRADE        = 0.10     # v4.5: NBA keeps 0.10
-NBA_DISABLED          = False    # v4.6: re-enabled — delayed entry replaces disable
+NBA_DISABLED          = True     # v4.9: disabled — no paper trades, no notifications
 
 # ── Entry Timing Engine (v4.6) ──────────────────────────────────
 ENTRY_DELAY_NBA_S     = 120      # NBA/NCAA: 120s before entry

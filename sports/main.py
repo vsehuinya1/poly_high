@@ -1619,7 +1619,7 @@ class SportsOrchestrator:
 
     async def _status_printer_loop(self):
         """Periodically print system status + Telegram updates."""
-        tg_interval = 0  # send Telegram every 5th iteration (5 min)
+        tg_interval = 0  # send Telegram every 15th iteration (15 min)
         while not self._shutdown:
             try:
                 live_football = sum(
@@ -1667,7 +1667,7 @@ class SportsOrchestrator:
 
                 # Band stats every 5 minutes
                 tg_interval += 1
-                if tg_interval >= 5:
+                if tg_interval >= 15:
                     # Log per-game band rejects
                     for gid, gts in self.engine._game_states.items():
                         if gts.band_rejects > 0:
