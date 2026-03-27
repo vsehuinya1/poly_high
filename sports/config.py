@@ -164,7 +164,8 @@ TENNIS_FEED_STALL_S   = 60.0      # feed stall detection threshold
 TENNIS_FEED_HEALTH_S  = 60.0      # feed health log interval
 
 # Tennis execution hardening (v2.0)
-TENNIS_PRICE_FLOOR         = 0.15   # v4.5.4: lowered from 0.30 — backtest proved 0.30 kills +6R winners
+TENNIS_PRICE_FLOOR         = 0.20   # v3.1: raised from 0.15 — align with exit floor strategy
+TENNIS_PRICE_FLOOR_BYPASS  = 0.15   # v3.2: high-edge trades bypass floor if max_edge >= this
 
 # Tennis Entry Timing — Lightweight (v4.6)
 TENNIS_ENTRY_DELAY_S       = 30     # 30s delay before entry

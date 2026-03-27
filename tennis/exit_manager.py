@@ -4,6 +4,12 @@ Tennis Exit Manager — Runner V2 (tick-based trailing).
 Tracks open paper trades, detects exit conditions, captures
 post-entry price snapshots, and logs complete lifecycle to CSV.
 
+v3.2 — 2026-03-27  Refined exit priority
+  - Stop-loss -15% is PRIMARY risk control (consistent R-cap)
+  - Tick stop SECONDARY with dynamic cap: min(10, entry*0.15/tick)
+  - Exit price floor (EXIT_PRICE_FLOOR=0.18)
+  - Early no-MFE exit (12min window, 2% threshold)
+  - Runner V2 activation lowered from 5% to 3% MFE
 v3.0 — 2026-03-26  Runner V2
   - REMOVED convergence exit entirely (harmful — cuts winners)
   - Runner V2: MFE-threshold activation (5%), loose 50% trail
@@ -71,6 +77,7 @@ class TennisPaperTrade:
     mid_price_exit: float = 0.0
     mfe: float = 0.0               # max favorable excursion (absolute)
     mae: float = 0.0               # max adverse excursion (absolute)
+    mae_ticks: int = 0             # max adverse excursion in ticks (1 tick = $0.01)
     min_price_seen: float = 0.0    # worst price seen during trade
 
     @property
@@ -110,7 +117,7 @@ class TennisExitManager:
     """
 
     # ── Runner V2 Parameters ─────────────────────────────────────
-    RUNNER_V2_MFE_THRESHOLD = 0.05   # 5% MFE before any exit logic activates
+    RUNNER_V2_MFE_THRESHOLD = 0.03   # 3% MFE before any exit logic activates (was 0.05)
     RUNNER_V2_TRAIL_PCT = 0.50       # give back up to 50% of gains
     RUNNER_V2_CONFIRM_TICKS = 2      # consecutive adverse ticks to confirm reversal
     STAGNATION_TIMEOUT_S = 1800.0    # 30min stagnation safeguard
@@ -118,6 +125,13 @@ class TennisExitManager:
 
     HARD_STOP_PRICE = 0.05            # absolute floor (5%) — catastrophic protection
     STOP_LOSS_R = 0.15                 # v3.1: stop-loss at -15% of entry price
+
+    # v3.2 — Tighter loss control
+    TICK_SIZE = 0.01                    # Polymarket tick size ($0.01)
+    MAX_ADVERSE_TICKS = 10             # tick-based stop (secondary — microstructure protection)
+    EXIT_PRICE_FLOOR_VAL = 0.18        # exit if market drops below this
+    EARLY_EXIT_WINDOW_S = 720.0        # 12 minutes — early no-MFE window
+    MIN_MFE_EARLY = 0.02               # min MFE required within early window
 
     TIMEOUT_S = 2700.0                 # v3.1: 45 minutes hard timeout (was 2h)
     SPREAD_CAPTURE_THRESHOLD = 0.04  # wide spread logging threshold
@@ -254,6 +268,7 @@ class TennisExitManager:
                 trade.mfe_timestamp = now  # update time-to-MFE
             if adverse > trade.mae:
                 trade.mae = adverse
+                trade.mae_ticks = round(adverse / 0.01)
 
             # ── Peak / Min tracking ───────────────────────────
             if mkt > trade.peak_price:
@@ -279,17 +294,7 @@ class TennisExitManager:
 
             # ── Exit conditions ──────────────────────────────
 
-            # -1. HARD STOP (catastrophic protection)
-            if mkt <= self.HARD_STOP_PRICE:
-                if get_spread:
-                    trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
-                trade.mid_price_exit = mkt
-                self._close_trade(trade, exit_price=mkt,
-                                  exit_reason="EXIT_HARD_STOP",
-                                  exit_score=score)
-                continue
-
-            # -0.5 STOP-LOSS (v3.1): exit if price dropped >= 15% below entry
+            # -1. STOP-LOSS (PRIMARY risk control — flat -15% cap)
             stop_price = trade.entry_price * (1.0 - self.STOP_LOSS_R)
             if mkt <= stop_price:
                 if get_spread:
@@ -302,6 +307,50 @@ class TennisExitManager:
                 )
                 self._close_trade(trade, exit_price=mkt,
                                   exit_reason="EXIT_STOP_LOSS",
+                                  exit_score=score)
+                continue
+
+            # -0.5 TICK STOP (SECONDARY — microstructure protection)
+            # Dynamic cap: never looser than the flat -15% stop
+            dynamic_tick_limit = min(
+                self.MAX_ADVERSE_TICKS,
+                int(trade.entry_price * self.STOP_LOSS_R / self.TICK_SIZE),
+            )
+            if dynamic_tick_limit > 0 and trade.mae_ticks >= dynamic_tick_limit:
+                if get_spread:
+                    trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
+                trade.mid_price_exit = mkt
+                log.info(
+                    "EXIT_MGR TICK_STOP | %s | mae_ticks=%d >= %d (dynamic, max=%d) | entry=%.4f mkt=%.4f",
+                    match_id, trade.mae_ticks, dynamic_tick_limit,
+                    self.MAX_ADVERSE_TICKS, trade.entry_price, mkt,
+                )
+                self._close_trade(trade, exit_price=mkt,
+                                  exit_reason="EXIT_TICK_STOP",
+                                  exit_score=score)
+                continue
+
+            # 0. PRICE FLOOR EXIT
+            if mkt <= self.EXIT_PRICE_FLOOR_VAL:
+                if get_spread:
+                    trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
+                trade.mid_price_exit = mkt
+                log.info(
+                    "EXIT_MGR PRICE_FLOOR | %s | mkt=%.4f <= %.4f",
+                    match_id, mkt, self.EXIT_PRICE_FLOOR_VAL,
+                )
+                self._close_trade(trade, exit_price=mkt,
+                                  exit_reason="EXIT_PRICE_FLOOR",
+                                  exit_score=score)
+                continue
+
+            # 0.5 HARD STOP (catastrophic protection — last resort)
+            if mkt <= self.HARD_STOP_PRICE:
+                if get_spread:
+                    trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
+                trade.mid_price_exit = mkt
+                self._close_trade(trade, exit_price=mkt,
+                                  exit_reason="EXIT_HARD_STOP",
                                   exit_score=score)
                 continue
 
@@ -331,7 +380,23 @@ class TennisExitManager:
                                   exit_score=score)
                 continue
 
-            # 2. Stagnation safeguard — 30min with tiny MFE
+            # 2. Early No-MFE exit — fast failure detection (v3.1)
+            if (elapsed <= self.EARLY_EXIT_WINDOW_S
+                    and trade.mfe < self.MIN_MFE_EARLY
+                    and elapsed > 60):  # grace period: skip first 60s
+                if get_spread:
+                    trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
+                trade.mid_price_exit = mkt
+                log.info(
+                    "EXIT_MGR NO_MFE | %s | elapsed=%.0fs mfe=%.4f < %.4f",
+                    match_id, elapsed, trade.mfe, self.MIN_MFE_EARLY,
+                )
+                self._close_trade(trade, exit_price=mkt,
+                                  exit_reason="EXIT_NO_MFE",
+                                  exit_score=score)
+                continue
+
+            # 3. Stagnation safeguard — 30min with tiny MFE
             if (elapsed >= self.STAGNATION_TIMEOUT_S
                     and trade.mfe < self.STAGNATION_MFE_MIN):
                 if get_spread:
@@ -342,7 +407,7 @@ class TennisExitManager:
                                   exit_score=score)
                 continue
 
-            # 3. Hard timeout — 2 hours (always applies)
+            # 4. Hard timeout — 45 min (always applies)
             if elapsed >= self.TIMEOUT_S:
                 if get_spread:
                     trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
@@ -414,7 +479,7 @@ class TennisExitManager:
                 "entry_score", "exit_score", "duration_seconds",
                 "timestamp_entry", "timestamp_exit",
                 # v3.0 fields
-                "mfe", "mae", "min_price_seen",
+                "mfe", "mae", "mae_ticks", "min_price_seen",
                 "capture_ratio", "time_to_mfe",
                 "consecutive_adverse_ticks",
                 "spread_at_signal", "spread_at_entry", "spread_at_exit",
@@ -453,6 +518,7 @@ class TennisExitManager:
             # v3.0 fields
             f"{t.mfe:.4f}",
             f"{t.mae:.4f}",
+            str(t.mae_ticks),
             f"{t.min_price_seen:.4f}",
             f"{t.capture_ratio:.4f}",
             f"{t.time_to_mfe_seconds:.1f}",
@@ -485,6 +551,9 @@ class TennisExitManager:
         timeout = sum(1 for t in closed if t.exit_reason == "EXIT_TIMEOUT")
         hard_stop = sum(1 for t in closed if t.exit_reason == "EXIT_HARD_STOP")
         stop_loss = sum(1 for t in closed if t.exit_reason == "EXIT_STOP_LOSS")
+        tick_stop = sum(1 for t in closed if t.exit_reason == "EXIT_TICK_STOP")
+        price_floor = sum(1 for t in closed if t.exit_reason == "EXIT_PRICE_FLOOR")
+        no_mfe = sum(1 for t in closed if t.exit_reason == "EXIT_NO_MFE")
         spread_captures = sum(1 for t in closed if t.spread_capture)
         runner_trades = sum(1 for t in closed if t.runner_v2_active)
         r_values = [t.R_multiple for t in closed if t.R_multiple is not None]
@@ -504,6 +573,9 @@ class TennisExitManager:
             "exit_timeout": timeout,
             "exit_hard_stop": hard_stop,
             "exit_stop_loss": stop_loss,
+            "exit_tick_stop": tick_stop,
+            "exit_price_floor": price_floor,
+            "exit_no_mfe": no_mfe,
             "spread_capture_entries": spread_captures,
             "runner_v2_trades": runner_trades,
             "avg_R_multiple": avg_r,

@@ -76,10 +76,12 @@ class InflectionStrategy:
 
     def __init__(self, panic_edge_threshold: float = 0.06,
                  reversion_edge_threshold: float = 0.05,
-                 price_floor: float = 0.05):
+                 price_floor: float = 0.05,
+                 price_floor_bypass_edge: float = 0.15):
         self.panic_edge = panic_edge_threshold
         self.reversion_edge = reversion_edge_threshold
         self.price_floor = price_floor
+        self.price_floor_bypass_edge = price_floor_bypass_edge
 
         # ── State dedup tracking ──────────────────────────────────
         # key: (match_id, selection_key) → last state_key that produced a signal
@@ -131,12 +133,23 @@ class InflectionStrategy:
             return None
 
         # ── Guard 1: Dead market / penny book (BEFORE edge calc) ──
+        # Bypass for extreme edge (high-edge cheap trades like Pegula $0.06)
         if market_price < self.price_floor:
-            if state.match_id not in self._dead_market_logged:
-                log.info("DEAD_MARKET | match=%s mkt=%.4f < floor=%.2f — suppressed",
-                         state.match_id, market_price, self.price_floor)
-                self._dead_market_logged.add(state.match_id)
-            return None
+            # Quick edge estimate: need Markov call to know exact edge,
+            # but can fast-check if price is so low that even max possible
+            # edge (1.0 - market_price) exceeds bypass threshold
+            max_possible_edge = 1.0 - market_price
+            if max_possible_edge < self.price_floor_bypass_edge:
+                # Even at fair=1.0, edge wouldn't reach bypass — dead market
+                if state.match_id not in self._dead_market_logged:
+                    log.info("DEAD_MARKET | match=%s mkt=%.4f < floor=%.2f — suppressed",
+                             state.match_id, market_price, self.price_floor)
+                    self._dead_market_logged.add(state.match_id)
+                return None
+            # Otherwise, let it through for model evaluation — edge will
+            # be checked after Markov call and signal returned if large enough
+            log.info("FLOOR_BYPASS | match=%s mkt=%.4f < floor=%.2f but max_edge=%.2f — evaluating",
+                     state.match_id, market_price, self.price_floor, max_possible_edge)
 
         # ── Guard 2: State dedup ──────────────────────────────────
         key = self._state_key(state, selection_id)

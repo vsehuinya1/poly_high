@@ -51,7 +51,7 @@ from sports.config import (
     TENNIS_PANIC_EDGE, TENNIS_REVERSION_EDGE,
     TENNIS_PRICE_CAP, TENNIS_STALENESS_S, TENNIS_COOLDOWN_S,
     TENNIS_FEED_POLL_S,
-    TENNIS_PRICE_FLOOR, TENNIS_MAX_SIGNALS_HR,
+    TENNIS_PRICE_FLOOR, TENNIS_MAX_SIGNALS_HR, TENNIS_PRICE_FLOOR_BYPASS,
     # v4.6 Tennis Entry Timing
     TENNIS_ENTRY_DELAY_S, TENNIS_ENTRY_CONFIRM_TICKS,
     TENNIS_ENTRY_MIN_EDGE, TENNIS_EDGE_DECAY_THRESH, TENNIS_ENTRY_MAX_DELAY_S,
@@ -364,6 +364,7 @@ class SportsOrchestrator:
             panic_edge_threshold=TENNIS_PANIC_EDGE,
             reversion_edge_threshold=TENNIS_REVERSION_EDGE,
             price_floor=TENNIS_PRICE_FLOOR,
+            price_floor_bypass_edge=TENNIS_PRICE_FLOOR_BYPASS,
         )
         self.tennis_guard = TennisExecutionGuard(
             price_cap=TENNIS_PRICE_CAP,
