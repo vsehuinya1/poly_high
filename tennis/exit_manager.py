@@ -4,7 +4,7 @@ Tennis Exit Manager — Runner V2 (tick-based trailing).
 Tracks open paper trades, detects exit conditions, captures
 post-entry price snapshots, and logs complete lifecycle to CSV.
 
-v3.2 — 2026-03-27  Refined exit priority
+v4.9.2 — 2026-03-27  Refined exit priority
   - Stop-loss -15% is PRIMARY risk control (consistent R-cap)
   - Tick stop SECONDARY with dynamic cap: min(10, entry*0.15/tick)
   - Exit price floor (EXIT_PRICE_FLOOR=0.18)
@@ -117,23 +117,23 @@ class TennisExitManager:
     """
 
     # ── Runner V2 Parameters ─────────────────────────────────────
-    RUNNER_V2_MFE_THRESHOLD = 0.03   # 3% MFE before any exit logic activates (was 0.05)
+    RUNNER_V2_MFE_THRESHOLD = 0.03   # v4.9.2: 3% MFE before any exit logic activates (was 0.05)
     RUNNER_V2_TRAIL_PCT = 0.50       # give back up to 50% of gains
     RUNNER_V2_CONFIRM_TICKS = 2      # consecutive adverse ticks to confirm reversal
     STAGNATION_TIMEOUT_S = 1800.0    # 30min stagnation safeguard
     STAGNATION_MFE_MIN = 0.03        # exit stagnant trades below this MFE
 
     HARD_STOP_PRICE = 0.05            # absolute floor (5%) — catastrophic protection
-    STOP_LOSS_R = 0.15                 # v3.1: stop-loss at -15% of entry price
+    STOP_LOSS_R = 0.15                 # v4.9.2: stop-loss at -15% of entry price
 
-    # v3.2 — Tighter loss control
+    # v4.9.2 — Tighter loss control
     TICK_SIZE = 0.01                    # Polymarket tick size ($0.01)
     MAX_ADVERSE_TICKS = 10             # tick-based stop (secondary — microstructure protection)
     EXIT_PRICE_FLOOR_VAL = 0.18        # exit if market drops below this
     EARLY_EXIT_WINDOW_S = 720.0        # 12 minutes — early no-MFE window
     MIN_MFE_EARLY = 0.02               # min MFE required within early window
 
-    TIMEOUT_S = 2700.0                 # v3.1: 45 minutes hard timeout (was 2h)
+    TIMEOUT_S = 2700.0                 # v4.9.2: 45 minutes hard timeout (was 2h)
     SPREAD_CAPTURE_THRESHOLD = 0.04  # wide spread logging threshold
     SNAPSHOT_TIMES = [
         (5 * 60,   "price_t5",  "_snapshot_5_done"),
