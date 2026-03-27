@@ -35,11 +35,17 @@ FOOTBALL_ALLOWED_COMPETITIONS = [
     "La Liga",
     "Bundesliga",
     "Ligue 1",
+    "Serie A",
+    "Eredivisie",
+    "Championship",
     "Champions League",
     "Europa League",
+    "Conference League",
+    "FIFA World Cup",
     "World Cup Qualifiers",
     "Euro Qualifiers",
     "AFCON Qualifiers",
+    "International",
 ]
 
 # ── NBA ──────────────────────────────────────────────────────────────
@@ -216,6 +222,9 @@ SPORTS_SLUG_PATTERNS = [
     "ecq-",   # Euro Qualifiers
     "afcon-", # AFCON / AFCON Qualifiers
     "qualifier", "qualifiers",
+    # International catch-all (v4.8.1)
+    "international-", "friendly-",
+    "fifa-world-cup", "uefa-nations", "caf-",
     # Tennis
     "tennis", "atp-", "wta-",
     "australian-open", "french-open", "wimbledon", "us-open",

@@ -175,6 +175,15 @@ def classify_market(slug: str, title: str) -> tuple[str, str]:
     if "afcon" in s or "afcon" in t or "africa-cup" in s or "africa cup" in t:
         return ("football", "AFCON Qualifiers")
 
+    # International football catch-all (v4.8.1)
+    _INTL_FOOTBALL_KEYWORDS = [
+        "world cup", "qualification", "qualifier", "fifa",
+        "uefa", "caf", "afcon", "international", "friendly",
+    ]
+    if any(kw in t for kw in _INTL_FOOTBALL_KEYWORDS):
+        return ("football", "International")
+
+
     # Cricket — Polymarket slug prefix detection (primary path)
     if s.startswith("crint-"):
         return ("cricket", "International")
@@ -240,13 +249,34 @@ def is_single_game_market(event: dict) -> bool:
     return False
 
 
+def normalize_football_title(title: str) -> str:
+    """Strip competition prefix and market suffix for clean team extraction.
+
+    'FIFA World Cup Qualification: Kenya vs Gabon - 1st Half Winner'
+    → 'Kenya vs Gabon'
+    """
+    t = title
+    if ":" in t:
+        t = t.split(":", 1)[1]
+    if " - " in t:
+        t = t.split(" - ", 1)[0]
+    return t.strip()
+
+
 def parse_teams_from_title(title: str) -> tuple[str, str]:
     """Extract home/away team names from a match title."""
+    # Normalize: strip competition prefix and market suffix
+    cleaned = normalize_football_title(title)
+
     # Common patterns: "Team A vs. Team B", "Team A vs Team B", "Team A v Team B"
     for sep in [" vs. ", " vs ", " v "]:
-        if sep in title:
-            parts = title.split(sep, 1)
-            return (parts[0].strip(), parts[1].strip())
+        if sep in cleaned:
+            parts = cleaned.split(sep, 1)
+            home, away = parts[0].strip(), parts[1].strip()
+            log.info("FOOTBALL_PARSE_SUCCESS | teams=%r", f"{home} vs {away}")
+            return (home, away)
+
+    log.info("FOOTBALL_PARSE_FAIL | title=%r", title)
     return ("", "")
 
 
@@ -341,6 +371,10 @@ async def discover_sports_markets(session: aiohttp.ClientSession) -> list[SportM
             sport, league = classify_market(slug, title)
             if sport not in ("nba", "football", "tennis", "cricket"):
                 continue
+
+            # ── Football discovery logging (v4.8.1) ──
+            if sport == "football":
+                log.info("FOOTBALL_DISCOVERY | title=%r | classified=%r", title, "football")
 
             # ── Football competition whitelist + friendly block (v4.8) ──
             if sport == "football":
