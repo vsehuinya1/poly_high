@@ -348,17 +348,21 @@ class TennisExitManager:
                                   exit_score=score)
                 continue
 
-            # 2. TICK_STOP (SECONDARY — microstructure protection)
-            dynamic_tick_limit = min(
-                self.MAX_ADVERSE_TICKS,
-                int(trade.entry_price * self.STOP_LOSS_R / self.TICK_SIZE),
-            )
-            if dynamic_tick_limit > 0 and trade.mae_ticks >= dynamic_tick_limit:
+            # 2. TICK_STOP (SECONDARY — capped by flat stop-loss)
+            tick_stop_price = trade.entry_price - (self.MAX_ADVERSE_TICKS * self.TICK_SIZE)
+            flat_stop_price = trade.entry_price * (1.0 - self.STOP_LOSS_R)
+            effective_stop_price = max(tick_stop_price, flat_stop_price)
+
+            assert effective_stop_price >= flat_stop_price, \
+                f"Tick stop {effective_stop_price:.4f} exceeded flat stop {flat_stop_price:.4f}"
+
+            if mkt <= effective_stop_price:
                 _capture_spread()
                 log.info(
-                    "EXIT_MGR TICK_STOP | %s | mae_ticks=%d >= %d | entry=%.4f mkt=%.4f",
-                    match_id, trade.mae_ticks, dynamic_tick_limit,
-                    trade.entry_price, mkt,
+                    "EXIT_MGR TICK_STOP | %s | entry=%.4f mkt=%.4f | "
+                    "tick_stop=%.4f flat_stop=%.4f effective=%.4f",
+                    match_id, trade.entry_price, mkt,
+                    tick_stop_price, flat_stop_price, effective_stop_price,
                 )
                 self._close_trade(trade, exit_price=mkt,
                                   exit_reason="EXIT_TICK_STOP",
