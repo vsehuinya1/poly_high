@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 from sports.config import (
-    ENTRY_EDGE_THRESHOLD, EXIT_CONVERGENCE,
+    ENTRY_EDGE_THRESHOLD,
     MAX_POSITION_PER_MARKET, MAX_CONCURRENT_POSITIONS, MAX_DAILY_LOSS,
     DATA_DIR,
     # Execution hygiene (v3.4 — controlled participation)
@@ -1151,6 +1151,7 @@ class SignalEngine:
                 min_hold = MIN_HOLD_S
                 flip_thresh = EDGE_FLIP_THRESHOLD
 
+            exit_reason = None
 
             # HARD STOP-LOSS — sport-specific threshold
             # v4.7.2: disabled for football (0% WR across 31 trades, −$807)
@@ -1164,15 +1165,13 @@ class SignalEngine:
             #     exit_reason = "momentum_exit"
             #     pos.momentum_exit_triggered = True
 
-            # Convergence — allowed during hold window (edge closed = good exit)
-            # v4.7.9: disabled for football (timeout-only exit strategy)
-            elif abs(current_edge) < EXIT_CONVERGENCE and not is_football:
-                exit_reason = "convergence"
+            # v5.0: Convergence exit REMOVED — 33% WR, −2.65 ΣR across 82 trades
+            # Previously: elif abs(current_edge) < EXIT_CONVERGENCE and not is_football:
+            #     exit_reason = "convergence"
 
-            # edge_flip — only after sport-specific hold window
-            # v4.7.9: disabled for football (timeout-only exit strategy)
-            elif current_edge < -flip_thresh and time_since_entry >= min_hold and not is_football:
-                exit_reason = "edge_flip"
+            # v5.0: edge_flip exit REMOVED — subsumed by stop-loss and timeout
+            # Previously: elif current_edge < -flip_thresh and time_since_entry >= min_hold and not is_football:
+            #     exit_reason = "edge_flip"
 
             # game_end and timeout override everything (absolute exits)
             if not game_state.is_live:

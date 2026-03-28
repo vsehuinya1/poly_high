@@ -70,7 +70,7 @@ POLYMARKET_CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 
 # ── Paper Trading Parameters ─────────────────────────────────────────
 ENTRY_EDGE_THRESHOLD  = 0.05     # min 5 cent edge to enter (base — overridden per sport)
-EXIT_CONVERGENCE      = 0.01     # exit when edge < 1 cent
+# EXIT_CONVERGENCE    = 0.01     # v5.0: REMOVED — 33% WR, −2.65 ΣR (never import this)
 MAX_POSITION_PER_MARKET = 500.0  # max $500 per market
 MAX_CONCURRENT_POSITIONS = 10
 MAX_DAILY_LOSS        = 1000.0   # kill-switch

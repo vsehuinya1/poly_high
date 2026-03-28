@@ -4,18 +4,19 @@ Tennis Exit Manager — Runner V2 (tick-based trailing).
 Tracks open paper trades, detects exit conditions, captures
 post-entry price snapshots, and logs complete lifecycle to CSV.
 
+v5.0 — 2026-03-28  Hardened exit system
+  - Hard-locked MFE config: 720s window, 0.02 threshold, 60s grace
+  - Removed ALL convergence exit paths
+  - Strict exit hierarchy: STOP_LOSS → TICK_STOP → RUNNER_V2 → MATCH_END → NO_MFE → STAGNATION → TIMEOUT
+  - Exit reason validation (assert on close)
+  - MFE distribution tracker with periodic logging
+  - Diagnostic TENNIS_EXIT_SUMMARY on every trade close
 v4.9.2 — 2026-03-27  Refined exit priority
   - Stop-loss -15% is PRIMARY risk control (consistent R-cap)
   - Tick stop SECONDARY with dynamic cap: min(10, entry*0.15/tick)
-  - Exit price floor (EXIT_PRICE_FLOOR=0.18)
-  - Early no-MFE exit (12min window, 2% threshold)
-  - Runner V2 activation lowered from 5% to 3% MFE
 v3.0 — 2026-03-26  Runner V2
   - REMOVED convergence exit entirely (harmful — cuts winners)
   - Runner V2: MFE-threshold activation (5%), loose 50% trail
-  - Confirmed reversal: exit only after 2+ consecutive adverse ticks
-  - Stagnation safeguard: 30min + MFE < 0.03
-  - Enhanced logging: capture_ratio, time_to_mfe
 """
 import csv
 import logging
@@ -106,35 +107,48 @@ class TennisPaperTrade:
         return 0.0
 
 
+# v5.0: Only these exit reasons are valid — anything else is a bug
+_VALID_EXIT_REASONS = {
+    "EXIT_STOP_LOSS",
+    "EXIT_TICK_STOP",
+    "EXIT_RUNNER_V2",
+    "EXIT_MATCH_END",
+    "EXIT_NO_MFE",
+    "EXIT_STAGNATION",
+    "EXIT_TIMEOUT",
+    "REPLACED",           # internal: replaced by new trade for same match
+}
+
+
 class TennisExitManager:
     """Manages tennis paper trade lifecycle: snapshots, exits, CSV logging.
 
     Runner V2 — tick-based trailing exit system.
-    NO convergence exit. Trails only after meaningful MFE.
+    Strict exit hierarchy — NO convergence, NO price floor, NO hard stop.
 
     Non-blocking — designed to run inside the existing async polling loop.
     Call check_all() on every tick.
     """
 
     # ── Runner V2 Parameters ─────────────────────────────────────
-    RUNNER_V2_MFE_THRESHOLD = 0.03   # v4.9.2: 3% MFE before any exit logic activates (was 0.05)
+    RUNNER_V2_MFE_THRESHOLD = 0.03   # 3% MFE before trailing activates
     RUNNER_V2_TRAIL_PCT = 0.50       # give back up to 50% of gains
     RUNNER_V2_CONFIRM_TICKS = 2      # consecutive adverse ticks to confirm reversal
     STAGNATION_TIMEOUT_S = 1800.0    # 30min stagnation safeguard
     STAGNATION_MFE_MIN = 0.03        # exit stagnant trades below this MFE
 
-    HARD_STOP_PRICE = 0.05            # absolute floor (5%) — catastrophic protection
-    STOP_LOSS_R = 0.15                 # v4.9.2: stop-loss at -15% of entry price
+    # ── Risk Control ─────────────────────────────────────────────
+    STOP_LOSS_R = 0.15                 # stop-loss at -15% of entry price
+    TICK_SIZE = 0.01                   # Polymarket tick size ($0.01)
+    MAX_ADVERSE_TICKS = 10             # tick-based stop (secondary)
 
-    # v4.9.2 — Tighter loss control
-    TICK_SIZE = 0.01                    # Polymarket tick size ($0.01)
-    MAX_ADVERSE_TICKS = 10             # tick-based stop (secondary — microstructure protection)
-    EXIT_PRICE_FLOOR_VAL = 0.18        # exit if market drops below this
-    EARLY_EXIT_WINDOW_S = 720.0        # 12 minutes — early no-MFE window
-    MIN_MFE_EARLY = 0.02               # min MFE required within early window
+    # ── Early MFE Exit — HARD-LOCKED (validated by MFE analysis) ─
+    EARLY_EXIT_WINDOW_S = 720.0        # 12 minutes — proven optimal
+    MIN_MFE_EARLY = 0.02               # 2% favorable move required
+    EARLY_EXIT_GRACE_S = 60.0          # 60s grace before evaluation starts
 
-    TIMEOUT_S = 2700.0                 # v4.9.2: 45 minutes hard timeout (was 2h)
-    SPREAD_CAPTURE_THRESHOLD = 0.04  # wide spread logging threshold
+    TIMEOUT_S = 2700.0                 # 45 minutes hard timeout
+    SPREAD_CAPTURE_THRESHOLD = 0.04
     SNAPSHOT_TIMES = [
         (5 * 60,   "price_t5",  "_snapshot_5_done"),
         (15 * 60,  "price_t15", "_snapshot_15_done"),
@@ -143,6 +157,14 @@ class TennisExitManager:
     ]
 
     def __init__(self, data_dir: Path, on_close=None):
+        # v5.0: Hard-lock validated MFE configuration
+        assert self.EARLY_EXIT_WINDOW_S == 720.0, \
+            f"EARLY_EXIT_WINDOW_S must be 720, got {self.EARLY_EXIT_WINDOW_S}"
+        assert self.MIN_MFE_EARLY == 0.02, \
+            f"MIN_MFE_EARLY must be 0.02, got {self.MIN_MFE_EARLY}"
+        assert self.EARLY_EXIT_GRACE_S == 60.0, \
+            f"EARLY_EXIT_GRACE_S must be 60, got {self.EARLY_EXIT_GRACE_S}"
+
         self.open_trades: dict[str, TennisPaperTrade] = {}  # match_id → trade
         self.closed_trades: list[TennisPaperTrade] = []
         self._data_dir = data_dir
@@ -151,6 +173,15 @@ class TennisExitManager:
         self._csv_fh = None
         self._csv_initialized = False
         self._on_close = on_close  # callback(trade) for live sell hook
+
+        # v5.0: MFE distribution tracker
+        self._mfe_buckets: dict[str, int] = {
+            "no_mfe": 0,
+            "lt_0.01": 0,
+            "0.01_0.02": 0,
+            "ge_0.02": 0,
+        }
+        self._total_closed = 0
 
     # ── Trade Registration ──────────────────────────────────────
 
@@ -292,69 +323,49 @@ class TennisExitManager:
                          match_id, trade.mfe, self.RUNNER_V2_MFE_THRESHOLD,
                          mkt, trade.peak_price)
 
-            # ── Exit conditions ──────────────────────────────
+            # ═══════════════════════════════════════════════════════
+            #  EXIT HIERARCHY (v5.0 — strict, validated)
+            #  Priority: STOP_LOSS → TICK_STOP → RUNNER_V2 →
+            #            MATCH_END → NO_MFE → STAGNATION → TIMEOUT
+            #  NO convergence. NO price floor. NO hard stop.
+            # ═══════════════════════════════════════════════════════
 
-            # -1. STOP-LOSS (PRIMARY risk control — flat -15% cap)
-            stop_price = trade.entry_price * (1.0 - self.STOP_LOSS_R)
-            if mkt <= stop_price:
+            def _capture_spread():
                 if get_spread:
                     trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
                 trade.mid_price_exit = mkt
+
+            # 1. STOP_LOSS (PRIMARY risk control — flat -15% cap)
+            stop_price = trade.entry_price * (1.0 - self.STOP_LOSS_R)
+            if mkt <= stop_price:
+                _capture_spread()
                 log.info(
-                    "EXIT_MGR STOP_LOSS | %s | entry=%.4f stop=%.4f mkt=%.4f | R=%.4f",
+                    "EXIT_MGR STOP_LOSS | %s | entry=%.4f stop=%.4f mkt=%.4f",
                     match_id, trade.entry_price, stop_price, mkt,
-                    (mkt - trade.entry_price) / trade.entry_price,
                 )
                 self._close_trade(trade, exit_price=mkt,
                                   exit_reason="EXIT_STOP_LOSS",
                                   exit_score=score)
                 continue
 
-            # -0.5 TICK STOP (SECONDARY — microstructure protection)
-            # Dynamic cap: never looser than the flat -15% stop
+            # 2. TICK_STOP (SECONDARY — microstructure protection)
             dynamic_tick_limit = min(
                 self.MAX_ADVERSE_TICKS,
                 int(trade.entry_price * self.STOP_LOSS_R / self.TICK_SIZE),
             )
             if dynamic_tick_limit > 0 and trade.mae_ticks >= dynamic_tick_limit:
-                if get_spread:
-                    trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
-                trade.mid_price_exit = mkt
+                _capture_spread()
                 log.info(
-                    "EXIT_MGR TICK_STOP | %s | mae_ticks=%d >= %d (dynamic, max=%d) | entry=%.4f mkt=%.4f",
+                    "EXIT_MGR TICK_STOP | %s | mae_ticks=%d >= %d | entry=%.4f mkt=%.4f",
                     match_id, trade.mae_ticks, dynamic_tick_limit,
-                    self.MAX_ADVERSE_TICKS, trade.entry_price, mkt,
+                    trade.entry_price, mkt,
                 )
                 self._close_trade(trade, exit_price=mkt,
                                   exit_reason="EXIT_TICK_STOP",
                                   exit_score=score)
                 continue
 
-            # 0. PRICE FLOOR EXIT
-            if mkt <= self.EXIT_PRICE_FLOOR_VAL:
-                if get_spread:
-                    trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
-                trade.mid_price_exit = mkt
-                log.info(
-                    "EXIT_MGR PRICE_FLOOR | %s | mkt=%.4f <= %.4f",
-                    match_id, mkt, self.EXIT_PRICE_FLOOR_VAL,
-                )
-                self._close_trade(trade, exit_price=mkt,
-                                  exit_reason="EXIT_PRICE_FLOOR",
-                                  exit_score=score)
-                continue
-
-            # 0.5 HARD STOP (catastrophic protection — last resort)
-            if mkt <= self.HARD_STOP_PRICE:
-                if get_spread:
-                    trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
-                trade.mid_price_exit = mkt
-                self._close_trade(trade, exit_price=mkt,
-                                  exit_reason="EXIT_HARD_STOP",
-                                  exit_score=score)
-                continue
-
-            # 0. Runner V2 trailing stop (confirmed reversal)
+            # 3. RUNNER_V2 trailing stop (confirmed reversal)
             if trade.runner_v2_active:
                 trail_level = trade.mfe * self.RUNNER_V2_TRAIL_PCT
                 exit_threshold = trade.entry_price + trail_level
@@ -362,56 +373,47 @@ class TennisExitManager:
                 if (mkt <= exit_threshold
                         and trade.consecutive_adverse_ticks >= self.RUNNER_V2_CONFIRM_TICKS):
                     trade.runner_exit_triggered = True
-                    if get_spread:
-                        trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
-                    trade.mid_price_exit = mkt
+                    _capture_spread()
                     self._close_trade(trade, exit_price=mkt,
                                       exit_reason="EXIT_RUNNER_V2",
                                       exit_score=score)
                     continue
 
-            # 1. Match end (always applies)
+            # 4. MATCH_END
             if is_match_finished(match_id):
-                if get_spread:
-                    trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
-                trade.mid_price_exit = mkt
+                _capture_spread()
                 self._close_trade(trade, exit_price=mkt,
                                   exit_reason="EXIT_MATCH_END",
                                   exit_score=score)
                 continue
 
-            # 2. Early No-MFE exit — fast failure detection (v3.1)
-            if (elapsed <= self.EARLY_EXIT_WINDOW_S
-                    and trade.mfe < self.MIN_MFE_EARLY
-                    and elapsed > 60):  # grace period: skip first 60s
-                if get_spread:
-                    trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
-                trade.mid_price_exit = mkt
-                log.info(
-                    "EXIT_MGR NO_MFE | %s | elapsed=%.0fs mfe=%.4f < %.4f",
-                    match_id, elapsed, trade.mfe, self.MIN_MFE_EARLY,
-                )
-                self._close_trade(trade, exit_price=mkt,
-                                  exit_reason="EXIT_NO_MFE",
-                                  exit_score=score)
-                continue
+            # 5. NO_MFE — early failure detection (hard-locked config)
+            #    Only fires after grace period AND within window
+            if elapsed >= self.EARLY_EXIT_GRACE_S:
+                if elapsed <= self.EARLY_EXIT_WINDOW_S:
+                    if trade.mfe < self.MIN_MFE_EARLY:
+                        _capture_spread()
+                        log.info(
+                            "EXIT_MGR NO_MFE | %s | elapsed=%.0fs mfe=%.4f < %.4f",
+                            match_id, elapsed, trade.mfe, self.MIN_MFE_EARLY,
+                        )
+                        self._close_trade(trade, exit_price=mkt,
+                                          exit_reason="EXIT_NO_MFE",
+                                          exit_score=score)
+                        continue
 
-            # 3. Stagnation safeguard — 30min with tiny MFE
+            # 6. STAGNATION — 30min with tiny MFE
             if (elapsed >= self.STAGNATION_TIMEOUT_S
                     and trade.mfe < self.STAGNATION_MFE_MIN):
-                if get_spread:
-                    trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
-                trade.mid_price_exit = mkt
+                _capture_spread()
                 self._close_trade(trade, exit_price=mkt,
                                   exit_reason="EXIT_STAGNATION",
                                   exit_score=score)
                 continue
 
-            # 4. Hard timeout — 45 min (always applies)
+            # 7. TIMEOUT — 45 min hard cap
             if elapsed >= self.TIMEOUT_S:
-                if get_spread:
-                    trade.spread_at_exit = get_spread(match_id, trade.selection_id) or 0.0
-                trade.mid_price_exit = mkt
+                _capture_spread()
                 self._close_trade(trade, exit_price=mkt,
                                   exit_reason="EXIT_TIMEOUT",
                                   exit_score=score)
@@ -422,6 +424,10 @@ class TennisExitManager:
     def _close_trade(self, trade: TennisPaperTrade, exit_price: float,
                      exit_reason: str, exit_score: Optional[str]):
         """Close a trade, compute R, log to CSV, move to closed list."""
+        # v5.0: Validate exit reason
+        assert exit_reason in _VALID_EXIT_REASONS, \
+            f"Invalid exit_reason '{exit_reason}' — must be one of {_VALID_EXIT_REASONS}"
+
         trade.exit_price = exit_price
         trade.exit_timestamp = time.time()
         trade.exit_reason = exit_reason
@@ -435,24 +441,30 @@ class TennisExitManager:
         else:
             trade.R_multiple = 0.0
 
+        elapsed = trade.duration_seconds
+
         # Move from open to closed
         self.open_trades.pop(trade.match_id, None)
         self.closed_trades.append(trade)
 
+        # v5.0: Diagnostic summary log
         log.info(
-            "EXIT_MGR CLOSE | %s | %s | entry=%.4f → exit=%.4f | R=%+.4f | "
-            "mfe=%.4f capture=%.2f | %s | %.0fs",
-            trade.match_id, trade.exit_reason,
-            trade.entry_price, exit_price,
-            trade.R_multiple,
-            trade.mfe, trade.capture_ratio,
-            trade.exit_score,
-            trade.duration_seconds,
+            "TENNIS_EXIT_SUMMARY | "
+            "reason=%s | mfe=%.4f | mae=%.4f | "
+            "time_to_mfe=%.1fs | duration=%.1fs | "
+            "entry=%.4f exit=%.4f R=%+.4f | %s",
+            exit_reason, trade.mfe, trade.mae,
+            trade.time_to_mfe_seconds, elapsed,
+            trade.entry_price, exit_price, trade.R_multiple,
+            trade.match_id,
         )
+
+        # v5.0: Update MFE distribution buckets
+        self._update_mfe_buckets(trade)
 
         self._write_lifecycle_row(trade)
 
-        # v4.4: fire on_close callback for live sell
+        # Fire on_close callback for live sell
         if self._on_close:
             try:
                 self._on_close(trade)
@@ -531,6 +543,31 @@ class TennisExitManager:
             f"{t.mid_price_exit:.4f}",
         ])
 
+    # ── MFE Distribution Tracker (v5.0) ──────────────────────────
+
+    def _update_mfe_buckets(self, trade: TennisPaperTrade):
+        """Update MFE distribution buckets and log every 10 trades."""
+        if trade.mfe <= 0:
+            self._mfe_buckets["no_mfe"] += 1
+        elif trade.mfe < 0.01:
+            self._mfe_buckets["lt_0.01"] += 1
+        elif trade.mfe < 0.02:
+            self._mfe_buckets["0.01_0.02"] += 1
+        else:
+            self._mfe_buckets["ge_0.02"] += 1
+
+        self._total_closed += 1
+        if self._total_closed % 10 == 0:
+            log.info(
+                "TENNIS_MFE_DIST | no_mfe=%d | lt_0.01=%d | "
+                "0.01_0.02=%d | ge_0.02=%d | total=%d",
+                self._mfe_buckets["no_mfe"],
+                self._mfe_buckets["lt_0.01"],
+                self._mfe_buckets["0.01_0.02"],
+                self._mfe_buckets["ge_0.02"],
+                self._total_closed,
+            )
+
     def close(self):
         """Flush and close CSV file handle."""
         if self._csv_fh:
@@ -549,10 +586,8 @@ class TennisExitManager:
         stagnation = sum(1 for t in closed if t.exit_reason == "EXIT_STAGNATION")
         match_end = sum(1 for t in closed if t.exit_reason == "EXIT_MATCH_END")
         timeout = sum(1 for t in closed if t.exit_reason == "EXIT_TIMEOUT")
-        hard_stop = sum(1 for t in closed if t.exit_reason == "EXIT_HARD_STOP")
         stop_loss = sum(1 for t in closed if t.exit_reason == "EXIT_STOP_LOSS")
         tick_stop = sum(1 for t in closed if t.exit_reason == "EXIT_TICK_STOP")
-        price_floor = sum(1 for t in closed if t.exit_reason == "EXIT_PRICE_FLOOR")
         no_mfe = sum(1 for t in closed if t.exit_reason == "EXIT_NO_MFE")
         spread_captures = sum(1 for t in closed if t.spread_capture)
         runner_trades = sum(1 for t in closed if t.runner_v2_active)
@@ -571,14 +606,13 @@ class TennisExitManager:
             "exit_stagnation": stagnation,
             "exit_match_end": match_end,
             "exit_timeout": timeout,
-            "exit_hard_stop": hard_stop,
             "exit_stop_loss": stop_loss,
             "exit_tick_stop": tick_stop,
-            "exit_price_floor": price_floor,
             "exit_no_mfe": no_mfe,
             "spread_capture_entries": spread_captures,
             "runner_v2_trades": runner_trades,
             "avg_R_multiple": avg_r,
             "avg_runner_R": avg_runner_r,
             "avg_capture_ratio": avg_capture,
+            "mfe_buckets": dict(self._mfe_buckets),
         }
