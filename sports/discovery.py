@@ -167,23 +167,6 @@ def classify_market(slug: str, title: str) -> tuple[str, str]:
     if s.startswith("chm-"):
         return ("football", "Championship")
 
-    # Football qualifiers / internationals (v4.8)
-    if "wcq-" in s or "world-cup-qualif" in s or "world cup qualif" in t:
-        return ("football", "World Cup Qualifiers")
-    if "ecq-" in s or "euro-qualif" in s or "euro qualif" in t:
-        return ("football", "Euro Qualifiers")
-    if "afcon" in s or "afcon" in t or "africa-cup" in s or "africa cup" in t:
-        return ("football", "AFCON Qualifiers")
-
-    # International football catch-all (v4.8.1)
-    _INTL_FOOTBALL_KEYWORDS = [
-        "world cup", "qualification", "qualifier", "fifa",
-        "uefa", "caf", "afcon", "international", "friendly",
-    ]
-    if any(kw in t for kw in _INTL_FOOTBALL_KEYWORDS):
-        return ("football", "International")
-
-
     # Cricket — Polymarket slug prefix detection (primary path)
     if s.startswith("crint-"):
         return ("cricket", "International")
@@ -204,6 +187,25 @@ def classify_market(slug: str, title: str) -> tuple[str, str]:
     # Cricket — team-based heuristic (catches "India vs. New Zealand" etc.)
     if _is_cricket_match(title):
         return ("cricket", "International")
+
+
+    # Football qualifiers / internationals (v4.8)
+    if "wcq-" in s or "world-cup-qualif" in s or "world cup qualif" in t:
+        return ("football", "World Cup Qualifiers")
+    if "ecq-" in s or "euro-qualif" in s or "euro qualif" in t:
+        return ("football", "Euro Qualifiers")
+    if "afcon" in s or "afcon" in t or "africa-cup" in s or "africa cup" in t:
+        return ("football", "AFCON Qualifiers")
+
+    # International football catch-all (v4.8.1)
+    _INTL_FOOTBALL_KEYWORDS = [
+        "world cup", "qualification", "qualifier", "fifa",
+        "uefa", "caf", "afcon", "international", "friendly",
+    ]
+    if any(kw in t for kw in _INTL_FOOTBALL_KEYWORDS):
+        return ("football", "International")
+
+    return ("unknown", "Unknown")
 
     return ("unknown", "Unknown")
 

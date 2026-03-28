@@ -349,12 +349,23 @@ class CricketFeed:
 
                 home_team = ""
                 away_team = ""
+                
+                # Try explicit home/away markers first
                 for c in competitors:
                     team_name = c.get("team", {}).get("displayName", "")
                     if c.get("homeAway") == "home":
                         home_team = team_name
-                    else:
+                    elif c.get("homeAway") == "away":
                         away_team = team_name
+                
+                # Positional fallback (common in cricket/IPL neutral games)
+                if not home_team and len(competitors) >= 1:
+                    home_team = competitors[0].get("team", {}).get("displayName", "")
+                if not away_team and len(competitors) >= 2:
+                    away_team = competitors[1].get("team", {}).get("displayName", "")
+                elif not away_team and len(competitors) >= 1 and home_team != competitors[0].get("team", {}).get("displayName", ""):
+                    # just in case only one team is found and it's not the same
+                    away_team = competitors[0].get("team", {}).get("displayName", "")
 
                 # Build venue
                 venue_obj = comp.get("venue", {})
