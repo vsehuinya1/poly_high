@@ -76,7 +76,7 @@ class InflectionStrategy:
 
     def __init__(self, panic_edge_threshold: float = 0.06,
                  reversion_edge_threshold: float = 0.05,
-                 price_floor: float = 0.05,
+                 price_floor: float = 0.20,
                  price_floor_bypass_edge: float = 0.15):
         self.panic_edge = panic_edge_threshold
         self.reversion_edge = reversion_edge_threshold

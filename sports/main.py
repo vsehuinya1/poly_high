@@ -912,6 +912,17 @@ class SportsOrchestrator:
                         signal = pend["signal"]
                         state = pend["state"]
                         del self._tennis_pending[pending_key]
+
+                        # ═══════════════════════════════════════════════
+                        # HARD PRICE BAND GATE (v5.1 — non-bypassable)
+                        # Final check on CURRENT market_price before any
+                        # execution. No trade can pass outside [0.20, 0.80].
+                        # ═══════════════════════════════════════════════
+                        if market_price < 0.20 or market_price > 0.80:
+                            log.warning("TENNIS_SKIP_PRICE_BAND | price=%.4f | %s",
+                                        market_price, link.polymarket_title[:40])
+                            continue
+
                         log.info("TENNIS_DELAYED_ENTRY | delay=%.0fs confirm=%d edge=%.4f | %s",
                                  entry_delay_actual, confirm_at_entry,
                                  current_edge, link.polymarket_title[:40])
@@ -990,6 +1001,13 @@ class SportsOrchestrator:
                         continue
 
                     diag["signal_ok"] += 1
+
+                    # ── v5.1: Price band pre-check (before pending) ──
+                    # Block even creating a pending entry for out-of-band prices.
+                    if market_price < 0.20 or market_price > 0.80:
+                        log.warning("TENNIS_SKIP_PRICE_BAND | price=%.4f | %s (pre-pending)",
+                                    market_price, link.polymarket_title[:40])
+                        continue
 
                     # ── v4.6.5: Create pending entry (first signal tick) ──
                     # The fast-path above (line ~853) handles all subsequent
