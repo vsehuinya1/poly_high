@@ -1042,6 +1042,27 @@ class SignalEngine:
                  gs_str, signal.direction, entry_delay_actual,
                  confirmation_ticks_count, abs(signal.edge))
 
+        # ═══════════════════════════════════════════════════════════
+        # HARD ENTRY SANITY GATE (v5.1 — surgical safety)
+        # This is the FINAL gate before order execution.
+        # ═══════════════════════════════════════════════════════════
+        if entry_price <= 0.05:
+            log.warning("TENNIS_SKIP_INVALID_PRICE | price=%.4f | %s",
+                        entry_price, gs_str)
+            return
+
+        if entry_price < 0.20 or entry_price > 0.80:
+            log.warning("TENNIS_SKIP_PRICE_BAND | price=%.4f | %s",
+                        entry_price, gs_str)
+            return
+
+        assert 0.0 < entry_price < 1.0, f"Invalid tennis price: {entry_price}"
+
+        # Debug guard (temporary — confirm no bad entries pass through)
+        log.info("TENNIS_ENTRY_CHECK | price=%.4f | match=%s | %s %s",
+                 entry_price, link.polymarket_title,
+                 signal.direction, signal.outcome)
+
         # ── Size Calculation ──────────────────────────────────────
         # size = abs(edge) * 1000, clamped [50, 300]
         size = abs(signal.edge) * 1000
@@ -1180,6 +1201,7 @@ class SignalEngine:
                 exit_reason = "timeout"
 
             if exit_reason:
+                assert exit_reason is not None
                 if pos.direction == "BUY":
                     exit_price = book.best_bid if book.best_bid > 0 else current_mid
                 else:
