@@ -4,8 +4,14 @@ Spread Breakout Detector — tick-level microstructure signal.
 Detects spread compression → breakout patterns:
     1. Spread narrows below NARROW_THRESHOLD for NARROW_WINDOW+ ticks
     2. Spread suddenly widens past WIDEN_THRESHOLD
-    3. Direction confirmed by 2 consecutive ticks in same direction
-    4. Entry within price band [0.20, 0.80]
+    3. First impulse: price moves ≥ IMPULSE_THRESHOLD from pre_widen_mid
+    4. Stability: at least 1 tick without reversal
+    5. Continuation: 2 more ticks in same direction
+    6. Entry within price band [0.20, 0.80]
+
+Filters:
+    - Exhaustion: skip if initial move > EXHAUSTION_THRESHOLD (already done)
+    - Snap-back: cancel if price reverses within 2 ticks of impulse
 
 Independent from SET_MEAN_REVERSION. Runs in parallel.
 
@@ -31,9 +37,13 @@ log = logging.getLogger("tennis.spread_breakout")
 NARROW_THRESHOLD = 0.02     # spread must be below this
 NARROW_WINDOW = 5           # for this many consecutive ticks
 WIDEN_THRESHOLD = 0.03      # spread must widen past this to trigger
-CONFIRM_TICKS = 2           # consecutive ticks in same direction
-MIN_PRICE_DELTA = 0.01      # minimum |delta| to establish direction
 PRICE_BAND = (0.20, 0.80)   # entry price range
+
+# Phase 2: Confirmation parameters
+CONFIRM_WINDOW_S = 5.0      # max 5s to complete confirmation
+IMPULSE_THRESHOLD = 0.015   # minimum |delta| for first impulse
+EXHAUSTION_THRESHOLD = 0.04 # skip if instant move > this (already exhausted)
+CONTINUATION_TICKS = 2      # ticks needed in same direction after stability
 
 # Exit Parameters (local to SPREAD_BREAKOUT)
 SB_STOP_LOSS = 0.08         # -8% hard stop
@@ -47,14 +57,26 @@ SB_TIMEOUT_S = 600.0        # 10 min max hold
 
 @dataclass
 class _MarketState:
-    """Tracks spread compression state for a single market."""
-    narrow_count: int = 0           # consecutive ticks with spread < NARROW
-    triggered: bool = False         # breakout detected, awaiting confirmation
-    pre_widen_mid: float = 0.0      # mid price just before the widen
-    confirm_count: int = 0          # consecutive ticks in same direction
-    direction: str = ""             # "UP" or "DOWN"
-    trigger_ts: float = 0.0         # when breakout was triggered
+    """Tracks spread compression + breakout confirmation state."""
+    # Phase 1: compression
+    narrow_count: int = 0
+    pre_widen_mid: float = 0.0
     _narrow_start_logged: bool = False
+
+    # Phase 2: breakout confirmation
+    triggered: bool = False
+    trigger_ts: float = 0.0
+    direction: str = ""             # "UP" or "DOWN"
+
+    # Sub-phases within Phase 2
+    # 0 = awaiting first impulse
+    # 1 = impulse seen, awaiting stability tick
+    # 2 = stable, awaiting continuation ticks
+    phase: int = 0
+    impulse_price: float = 0.0      # price at first impulse
+    ticks_since_impulse: int = 0    # ticks since impulse was detected
+    continuation_count: int = 0     # consecutive continuation ticks
+    last_mid: float = 0.0           # previous tick mid (for reversal check)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -99,6 +121,13 @@ class SpreadBreakoutTrade:
 class SpreadBreakoutDetector:
     """Tick-level spread compression → breakout detector.
 
+    Entry flow (after compression detected):
+        1. Wait for first impulse (≥0.015 from pre_widen_mid)
+        2. Skip if exhaustion (>0.04 instant move)
+        3. Require 1 stability tick (no reversal)
+        4. Require 2 continuation ticks in same direction
+        5. Enter on confirmed second-phase continuation
+
     Call `tick()` on every market tick. Returns a signal dict if entry
     conditions are met, else None.
 
@@ -106,13 +135,10 @@ class SpreadBreakoutDetector:
     """
 
     def __init__(self):
-        # Per-market detection state: token_id → _MarketState
         self._states: dict[str, _MarketState] = {}
-        # Open trades: token_id → SpreadBreakoutTrade
         self._trades: dict[str, SpreadBreakoutTrade] = {}
-        # Cooldown: token_id → last_entry_ts (prevent duplicate entries)
         self._cooldown: dict[str, float] = {}
-        self.COOLDOWN_S = 300.0  # 5 min between entries per market
+        self.COOLDOWN_S = 300.0
 
     @property
     def open_trades(self) -> dict[str, SpreadBreakoutTrade]:
@@ -126,18 +152,10 @@ class SpreadBreakoutDetector:
         spread: float,
         match_title: str = "",
     ) -> Optional[dict]:
-        """Process one tick. Returns signal dict if entry conditions met.
-
-        Returns:
-            dict with keys: trigger, direction, entry_price, match_id,
-            token_id, pre_widen_mid, match_title
-            — or None
-        """
-        # Skip if we already have an open trade for this token
+        """Process one tick. Returns signal dict if entry conditions met."""
         if token_id in self._trades and self._trades[token_id].is_open:
             return None
 
-        # Cooldown check
         last_entry = self._cooldown.get(token_id, 0)
         if time.time() - last_entry < self.COOLDOWN_S:
             return None
@@ -152,29 +170,29 @@ class SpreadBreakoutDetector:
                     log.info("SPREAD_NARROW_START | %s | spread=%.4f | ticks=%d",
                              match_title[:40], spread, st.narrow_count)
                     st._narrow_start_logged = True
-                # Store mid continuously during narrow phase
                 st.pre_widen_mid = mid
             elif st.narrow_count >= NARROW_WINDOW and spread > WIDEN_THRESHOLD:
-                # BREAKOUT: spread was narrow, now it widened
+                # BREAKOUT detected
                 st.triggered = True
                 st.trigger_ts = time.time()
-                st.confirm_count = 0
+                st.phase = 0
                 st.direction = ""
-                log.info("SPREAD_BREAKOUT_TRIGGER | %s | spread=%.4f | "
+                st.last_mid = mid
+                log.info("SPREAD_PRE_WIDEN_CAPTURE | %s | spread=%.4f | "
                          "pre_mid=%.4f | cur_mid=%.4f",
                          match_title[:40], spread, st.pre_widen_mid, mid)
             else:
-                # Reset — spread didn't stay narrow or didn't widen enough
                 if st.narrow_count > 0:
                     st.narrow_count = 0
                     st._narrow_start_logged = False
             return None
 
-        # ── Phase 2: Confirm direction after breakout ──────────────
-        # Timeout: 30s to confirm, else reset
-        if time.time() - st.trigger_ts > 30.0:
-            log.info("SPREAD_BREAKOUT_TIMEOUT | %s | no confirm in 30s",
-                     match_title[:40])
+        # ── Phase 2: Three-stage confirmation ──────────────────────
+
+        # Timeout: 5s to complete all stages
+        if time.time() - st.trigger_ts > CONFIRM_WINDOW_S:
+            log.debug("SPREAD_BREAKOUT_TIMEOUT | %s | phase=%d",
+                      match_title[:40], st.phase)
             self._reset_state(token_id)
             return None
 
@@ -186,49 +204,102 @@ class SpreadBreakoutDetector:
             return None
 
         price_delta = mid - st.pre_widen_mid
-        if abs(price_delta) < MIN_PRICE_DELTA:
-            return None  # no clear direction yet
 
-        tick_dir = "UP" if price_delta > 0 else "DOWN"
+        # ── Stage 0: Awaiting first impulse ────────────────────────
+        if st.phase == 0:
+            if abs(price_delta) >= EXHAUSTION_THRESHOLD:
+                log.info("SPREAD_SKIP_EXHAUSTION | %s | delta=%.4f (>%.2f)",
+                         match_title[:40], price_delta, EXHAUSTION_THRESHOLD)
+                self._reset_state(token_id)
+                return None
 
-        if st.direction == "":
-            st.direction = tick_dir
-            st.confirm_count = 1
-        elif tick_dir == st.direction:
-            st.confirm_count += 1
-        else:
-            # Direction flipped — reset confirmation
-            st.direction = tick_dir
-            st.confirm_count = 1
+            if abs(price_delta) >= IMPULSE_THRESHOLD:
+                st.direction = "UP" if price_delta > 0 else "DOWN"
+                st.impulse_price = mid
+                st.ticks_since_impulse = 0
+                st.phase = 1
+                log.info("SPREAD_FIRST_IMPULSE | %s | dir=%s | delta=%.4f | "
+                         "impulse_price=%.4f",
+                         match_title[:40], st.direction, price_delta, mid)
 
-        if st.confirm_count < CONFIRM_TICKS:
-            log.info("SPREAD_CONFIRM | %s | dir=%s | confirm=%d/%d | "
-                     "delta=%.4f",
-                     match_title[:40], st.direction, st.confirm_count,
-                     CONFIRM_TICKS, price_delta)
+            st.last_mid = mid
             return None
 
-        # ── Confirmed: emit signal ─────────────────────────────────
-        log.info("SPREAD_ENTRY | %s | dir=%s | price=%.4f | "
-                 "pre_mid=%.4f | delta=%.4f",
-                 match_title[:40], st.direction, mid,
-                 st.pre_widen_mid, price_delta)
+        # ── Stage 1: Stability check (1 tick, no reversal) ─────────
+        if st.phase == 1:
+            st.ticks_since_impulse += 1
 
-        signal = {
-            "trigger": "SPREAD_BREAKOUT",
-            "direction": st.direction,
-            "entry_price": mid,
-            "match_id": match_id,
-            "token_id": token_id,
-            "pre_widen_mid": st.pre_widen_mid,
-            "match_title": match_title,
-        }
+            # Check for snap-back reversal
+            if st.direction == "UP" and mid < st.impulse_price - 0.005:
+                log.info("SPREAD_CANCEL_REVERSAL | %s | snap_back dir=%s "
+                         "impulse=%.4f now=%.4f",
+                         match_title[:40], st.direction, st.impulse_price, mid)
+                self._reset_state(token_id)
+                return None
+            if st.direction == "DOWN" and mid > st.impulse_price + 0.005:
+                log.info("SPREAD_CANCEL_REVERSAL | %s | snap_back dir=%s "
+                         "impulse=%.4f now=%.4f",
+                         match_title[:40], st.direction, st.impulse_price, mid)
+                self._reset_state(token_id)
+                return None
 
-        # Record entry for cooldown + exit tracking
-        self._cooldown[token_id] = time.time()
-        self._reset_state(token_id)
+            # Stability confirmed — move to continuation phase
+            st.phase = 2
+            st.continuation_count = 0
+            st.last_mid = mid
+            return None
 
-        return signal
+        # ── Stage 2: Continuation (2 ticks in same direction) ──────
+        if st.phase == 2:
+            # Check direction relative to impulse price
+            if st.direction == "UP":
+                continuing = mid >= st.last_mid - 0.001
+                reversed_ = mid < st.impulse_price - 0.005
+            else:
+                continuing = mid <= st.last_mid + 0.001
+                reversed_ = mid > st.impulse_price + 0.005
+
+            if reversed_:
+                log.info("SPREAD_CANCEL_REVERSAL | %s | continuation_fail "
+                         "dir=%s impulse=%.4f now=%.4f",
+                         match_title[:40], st.direction, st.impulse_price, mid)
+                self._reset_state(token_id)
+                return None
+
+            if continuing:
+                st.continuation_count += 1
+            else:
+                st.continuation_count = 0
+
+            st.last_mid = mid
+
+            if st.continuation_count < CONTINUATION_TICKS:
+                log.debug("SPREAD_CONTINUATION | %s | dir=%s | cont=%d/%d",
+                          match_title[:40], st.direction,
+                          st.continuation_count, CONTINUATION_TICKS)
+                return None
+
+            # ── All stages passed: emit entry signal ───────────────
+            log.info("SPREAD_CONTINUATION_CONFIRMED | %s | dir=%s | "
+                     "price=%.4f | pre_mid=%.4f | impulse=%.4f",
+                     match_title[:40], st.direction, mid,
+                     st.pre_widen_mid, st.impulse_price)
+
+            signal = {
+                "trigger": "SPREAD_BREAKOUT",
+                "direction": st.direction,
+                "entry_price": mid,
+                "match_id": match_id,
+                "token_id": token_id,
+                "pre_widen_mid": st.pre_widen_mid,
+                "match_title": match_title,
+            }
+
+            self._cooldown[token_id] = time.time()
+            self._reset_state(token_id)
+            return signal
+
+        return None
 
     def register_trade(
         self,
