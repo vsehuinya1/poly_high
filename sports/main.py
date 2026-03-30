@@ -61,6 +61,7 @@ from sports.config import (
     CLOB_PROXY_URL,
 )
 from tennis.live_executor import LiveExecutor
+from tennis.spread_breakout import SpreadBreakoutDetector
 
 # Cricket engine imports
 from cricket import (
@@ -406,6 +407,9 @@ class SportsOrchestrator:
         self.tennis_links: dict[str, GameMarketLink] = {}  # match_id → link
         self.tennis_states: dict[str, TennisState] = {}  # match_id → latest state
         self._tennis_fs_map: dict[str, str] = {}  # poly_event_id → flashscore_match_id
+
+        # ── Spread Breakout Detector (v5.2) ────────────────────────
+        self.sb_detector = SpreadBreakoutDetector()
 
         # ── Cricket Engine (Paper Only) ───────────────────────────
         self.cricket_feed = CricketFeed()
@@ -1029,6 +1033,65 @@ class SportsOrchestrator:
                     log.info("TENNIS_PENDING_START | %s | edge=%.4f | mkt=%.4f | %s",
                              signal.trigger_type, signal.edge, market_price,
                              link.polymarket_title[:40])
+
+                # ── Spread Breakout: tick detection (v5.2) ─────────
+                # Runs on ALL live matches with book data, independent
+                # of mean reversion state/dedup. Uses both token sides.
+                for sb_mid, sb_link in list(self.tennis_links.items()):
+                    for sb_tid in [sb_link.home_token_id, sb_link.away_token_id]:
+                        if not sb_tid:
+                            continue
+                        sb_book = self.poly_feed.books.get(sb_tid)
+                        if not sb_book or sb_book.mid <= 0:
+                            continue
+                        sb_spread = sb_book.spread if sb_book.spread else 0
+                        sb_sig = self.sb_detector.tick(
+                            token_id=sb_tid,
+                            match_id=sb_mid,
+                            mid=sb_book.mid,
+                            spread=sb_spread,
+                            match_title=sb_link.polymarket_title,
+                        )
+                        if sb_sig:
+                            # Register trade for exit tracking
+                            player = sb_link.home_team if sb_tid == sb_link.home_token_id else sb_link.away_team
+                            self.sb_detector.register_trade(
+                                token_id=sb_tid,
+                                match_id=sb_mid,
+                                player=player or "?",
+                                entry_price=sb_sig["entry_price"],
+                                direction=sb_sig["direction"],
+                            )
+                            # Telegram notification
+                            try:
+                                await self.engine.tg.send(
+                                    f"🎾 <b>Spread Breakout [PAPER]</b>\n"
+                                    f"Direction: {sb_sig['direction']}\n"
+                                    f"Price: {sb_sig['entry_price']:.4f}\n"
+                                    f"Pre-widen: {sb_sig['pre_widen_mid']:.4f}\n"
+                                    f"Match: {sb_sig['match_title']}"
+                                )
+                            except Exception:
+                                pass
+
+                # ── Spread Breakout: exit checks (v5.2) ────────────
+                def _sb_get_price(tid):
+                    b = self.poly_feed.books.get(tid)
+                    return b.mid if b and b.mid > 0 else None
+
+                sb_closed = self.sb_detector.check_exits(_sb_get_price)
+                for sbt in sb_closed:
+                    try:
+                        r_str = f"{sbt.r_multiple:+.4f}"
+                        await self.engine.tg.send(
+                            f"➖ <b>Spread Breakout Exit [PAPER]</b>\n"
+                            f"Player: {sbt.player}\n"
+                            f"Reason: {sbt.exit_reason}\n"
+                            f"Entry: {sbt.entry_price:.4f} → Exit: {sbt.exit_price:.4f}\n"
+                            f"R: {r_str} | Duration: {sbt.duration_s:.0f}s"
+                        )
+                    except Exception:
+                        pass
 
                 # ── Exit Manager: check all open trades ───────────
                 self._tennis_check_exits()
