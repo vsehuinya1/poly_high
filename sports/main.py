@@ -68,6 +68,7 @@ from cricket import (
     CricketState, CricketFeed, CricketStrategy,
     CricketExecutionGuard, CricketCSVLogger,
 )
+from cricket.tick_strategy import CricketTickDetector
 from cricket.exit_manager import CricketExitManager
 from sports.config import (
     CRICKET_PAPER_ONLY, CRICKET_TRADE_SIZE, CRICKET_MAX_SPREAD,
@@ -431,6 +432,8 @@ class SportsOrchestrator:
         self._cricket_price_buf: dict[str, list[float]] = {}  # match_id → last N mid prices
         self._cricket_last_trade_ts: dict[str, float] = {}    # match_id → last trade timestamp
         self._cricket_prev_spread: dict[str, float] = {}      # match_id → previous spread
+        # v6.0: Tick-based reversion detector (no ESPN dependency)
+        self.cricket_tick_detector = CricketTickDetector()
 
     async def discover(self) -> list[SportMarket]:
         """Discover active sports markets on Polymarket."""
@@ -1524,154 +1527,85 @@ class SportsOrchestrator:
                                     )
                                 except Exception:
                                     pass
-                        continue  # DLS path done, skip fallback
+                        continue  # DLS path done, skip tick path
 
                     # ════════════════════════════════════════════════
-                    #  PATH 2: Fallback price-based signals
+                    #  PATH 2: Tick-based reversion (no ESPN needed)
                     # ════════════════════════════════════════════════
-
-                    # Per-market cooldown (120s)
-                    CRICKET_FB_COOLDOWN_S = 120.0
-                    now_cd = time.time()
-                    last_trade = self._cricket_last_trade_ts.get(
-                        match_id, 0
-                    )
-                    if now_cd - last_trade < CRICKET_FB_COOLDOWN_S:
-                        # Still update price buffer but skip signals
-                        buf = self._cricket_price_buf.setdefault(
-                            match_id, []
-                        )
-                        buf.append(book.mid)
-                        if len(buf) > 60:
-                            self._cricket_price_buf[match_id] = buf[-60:]
-                        log.debug(
-                            "CRICKET_SKIP_COOLDOWN | market=%s | "
-                            "remaining=%.0fs",
-                            link.polymarket_title[:40],
-                            CRICKET_FB_COOLDOWN_S - (now_cd - last_trade),
-                        )
-                        continue
-
-                    fb_signals = self._cricket_fallback_signals(
-                        match_id, book, link
+                    tick_signal = self.cricket_tick_detector.on_tick(
+                        match_id=match_id,
+                        mid=book.mid,
+                        spread=book.spread,
+                        timestamp=book.timestamp,
                     )
 
-                    # Filter: spread-widening check for MOMENTUM
-                    prev_spread = self._cricket_prev_spread.get(
-                        match_id, book.spread
-                    )
-                    self._cricket_prev_spread[match_id] = book.spread
-
-                    filtered_signals = []
-                    for fb in fb_signals:
-                        if fb["signal_type"] == "MOMENTUM" and \
-                           book.spread > prev_spread:
-                            log.info(
-                                "CRICKET_SKIP_SPREAD_WIDEN | "
-                                "spread_now=%.4f | spread_prev=%.4f | %s",
-                                book.spread, prev_spread,
-                                link.polymarket_title[:40],
-                            )
-                            continue
-                        filtered_signals.append(fb)
-
-                    for fb in filtered_signals:
-                        log.info(
-                            "CRICKET_SIGNAL_FALLBACK | type=%s | "
-                            "direction=%s | move=%.4f | ticks=%d | "
-                            "price=%.4f | title=\"%s\"",
-                            fb["signal_type"], fb["direction"],
-                            fb["move"], fb["ticks"],
-                            fb["market_price"],
-                            link.polymarket_title[:50],
+                    if tick_signal:
+                        # Register with the existing cricket exit manager
+                        token_id = link.home_token_id or (
+                            link.all_token_ids[0]
+                            if link.all_token_ids else ""
                         )
-
-                        # Build a CricketSignal-compatible object for
-                        # the execution guard pipeline
-                        from cricket.state import CricketState, CricketModelOutput
-                        dummy_state = CricketState(
-                            match_id=match_id, format="t20",
-                            team_a=link.home_team or "A",
-                            team_b=link.away_team or "B",
-                            batting_team=link.home_team or "A",
-                            bowling_team=link.away_team or "B",
-                            innings=2, runs=0, wickets=0,
-                            overs=0.0, balls=0,
-                            run_rate=0.0, required_run_rate=0.0,
-                            target_score=0, first_innings_total=0,
-                            timestamp=time.time(),
-                        )
-                        dummy_model = CricketModelOutput(
-                            p_batting=0.5, p_bowling=0.5,
-                            resource_pct=0.0, par_score=0.0,
-                        )
-                        from cricket.strategy import CricketSignal
-                        sig = CricketSignal(
-                            timestamp=time.time(),
+                        self.cricket_exit_mgr.register_trade(
                             match_id=match_id,
-                            signal_type=f"FALLBACK_{fb['signal_type']}",
-                            edge=fb["edge"],
-                            fair_price=(
-                                market_price + fb["edge"]
-                                if fb["direction"] == "LONG"
-                                else market_price - fb["edge"]
-                            ),
-                            market_price=market_price,
-                            state_snapshot=dummy_state,
-                            model_output=dummy_model,
-                            is_tradeable=True,
+                            selection_id=token_id,
+                            signal_type=tick_signal.signal_type,
+                            entry_price=tick_signal.entry_price,
+                            fair_value=tick_signal.fair_price,
+                            edge=tick_signal.edge,
+                            entry_score=f"{tick_signal.direction} {tick_signal.signal_type}",
+                            spread=tick_signal.spread,
+                            match_title=link.polymarket_title,
                         )
+                        # Also register in the tick detector for its own exit tracking
+                        self.cricket_tick_detector.register_trade(tick_signal)
+                        self.cricket_guard.record_entry(match_id)
 
-                        decision = self.cricket_guard.can_execute(
-                            sig,
-                            spread=book.spread,
-                            data_age_s=time.time() - book.timestamp,
+                        log.info(
+                            "CRICKET PAPER ENTRY | %s | "
+                            "direction=%s | edge=%.4f | "
+                            "mkt=%.4f | move=%.4f | %s",
+                            tick_signal.signal_type,
+                            tick_signal.direction,
+                            tick_signal.edge,
+                            tick_signal.entry_price,
+                            tick_signal.move,
+                            link.polymarket_title[:40],
                         )
+                        try:
+                            await self.engine.tg.send(
+                                f"🏏 <b>Cricket Tick Signal (PAPER)</b>\n"
+                                f"Type: {tick_signal.signal_type}\n"
+                                f"Dir: {tick_signal.direction}\n"
+                                f"Edge: {tick_signal.edge:+.4f} | "
+                                f"Move: {tick_signal.move:.4f}\n"
+                                f"Mkt: {tick_signal.entry_price:.3f}\n"
+                                f"Match: {link.polymarket_title}"
+                            )
+                        except Exception:
+                            pass
 
-                        if decision.can_execute:
-                            self.cricket_guard.record_entry(match_id)
-                            self._cricket_last_trade_ts[match_id] = time.time()
-                            log.info(
-                                "CRICKET PAPER ENTRY | %s | "
-                                "direction=%s | edge=%.4f | "
-                                "mkt=%.4f | %s",
-                                fb["signal_type"], fb["direction"],
-                                fb["edge"], market_price,
-                                link.polymarket_title[:40],
-                            )
-                            log.info(
-                                "CRICKET_TRADE_DECISION | type=%s | "
-                                "direction=%s | entry_price=%.4f",
-                                fb["signal_type"], fb["direction"],
-                                market_price,
-                            )
-                            token_id = link.home_token_id or (
-                                link.all_token_ids[0]
-                                if link.all_token_ids else ""
-                            )
-                            self.cricket_exit_mgr.register_trade(
-                                match_id=match_id,
-                                selection_id=token_id,
-                                signal_type=f"FALLBACK_{fb['signal_type']}",
-                                entry_price=market_price,
-                                fair_value=sig.fair_price,
-                                edge=fb["edge"],
-                                entry_score=f"{fb['direction']} {fb['signal_type']}",
-                                spread=book.spread,
-                                match_title=link.polymarket_title,
-                            )
-                            try:
-                                await self.engine.tg.send(
-                                    f"🏏 <b>Cricket Fallback (PAPER)</b>\n"
-                                    f"Type: {fb['signal_type']}\n"
-                                    f"Direction: {fb['direction']}\n"
-                                    f"Edge: {fb['edge']:.4f} | "
-                                    f"Move: {fb['move']:+.4f}\n"
-                                    f"Mkt: {market_price:.3f}\n"
-                                    f"Match: {link.polymarket_title}"
-                                )
-                            except Exception:
-                                pass
+                # ── Tick detector exit checks ─────────────────────────
+                def _get_cricket_price(mid):
+                    lnk = self.cricket_links.get(mid)
+                    if not lnk:
+                        return None
+                    tid = lnk.home_token_id or (
+                        lnk.all_token_ids[0] if lnk.all_token_ids else ""
+                    )
+                    bk = self.poly_feed.books.get(tid)
+                    if not bk or bk.mid <= 0:
+                        return None
+                    return (bk.mid, bk.spread)
+
+                tick_exits = self.cricket_tick_detector.check_exits(_get_cricket_price)
+                for (exit_mid, exit_sig_type, exit_entry, exit_price, exit_reason) in tick_exits:
+                    pnl = exit_price - exit_entry
+                    log.info(
+                        "CRICKET_TICK_CLOSED | %s | %s | "
+                        "entry=%.4f exit=%.4f pnl=%+.4f",
+                        exit_sig_type, exit_reason,
+                        exit_entry, exit_price, pnl,
+                    )
 
                 # Check open paper trades for MAE/MFE updates + exits
                 self.cricket_exit_mgr.check_all(
