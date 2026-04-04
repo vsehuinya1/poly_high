@@ -310,6 +310,16 @@ class SpreadBreakoutDetector:
         direction: str,
     ):
         """Register an executed SPREAD_BREAKOUT trade for exit tracking."""
+        # ═══ GLOBAL EDGE GUARD (v6.1 — inside function, non-bypassable) ═══
+        from sports.guards import validate_trade_execution
+        can_exec, block_reason = validate_trade_execution(
+            edge=0.01,  # Spread breakout has no explicit edge — use minimum
+            price=entry_price, sport="tennis_sb",
+            context=f"SPREAD_BREAKOUT {direction} | {match_id}",
+        )
+        if not can_exec:
+            return
+
         self._trades[token_id] = SpreadBreakoutTrade(
             match_id=match_id,
             token_id=token_id,

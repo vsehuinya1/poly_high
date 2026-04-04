@@ -322,6 +322,16 @@ class CricketTickDetector:
 
     def register_trade(self, signal: CricketTickSignal) -> None:
         """Register an active trade for exit tracking."""
+        # ═══ GLOBAL EDGE GUARD (v6.1 — inside function, non-bypassable) ═══
+        from sports.guards import validate_trade_execution
+        can_exec, block_reason = validate_trade_execution(
+            edge=signal.edge, price=signal.entry_price,
+            sport="cricket_tick",
+            context=f"{signal.signal_type} {signal.direction} | {signal.match_id}",
+        )
+        if not can_exec:
+            return
+
         if signal.direction == "LONG":
             target = signal.entry_price + (
                 DRIFT_TARGET if "DRIFT" in signal.signal_type else SPIKE_TARGET

@@ -112,6 +112,15 @@ class CricketExitManager:
         entry_delay_s: float = 0.0,
     ):
         """Register a new paper trade."""
+        # ═══ GLOBAL EDGE GUARD (v6.1 — inside function, non-bypassable) ═══
+        from sports.guards import validate_trade_execution
+        can_exec, block_reason = validate_trade_execution(
+            edge=edge, price=entry_price, sport="cricket",
+            context=f"{signal_type} | {match_id}",
+        )
+        if not can_exec:
+            return
+
         trade = CricketPaperTrade(
             match_id=match_id,
             selection_id=selection_id,

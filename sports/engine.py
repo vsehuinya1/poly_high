@@ -1065,7 +1065,7 @@ class SignalEngine:
         # No trade can EVER execute with edge <= 0.
         # ═══════════════════════════════════════════════════════════
         can_exec, block_reason = validate_trade_execution(
-            edge=abs(signal.edge),
+            edge=signal.edge,
             price=entry_price,
             sport=link.sport or "unknown",
             context=f"{signal.direction} {signal.outcome} | {link.polymarket_title[:50]}",

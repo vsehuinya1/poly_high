@@ -187,6 +187,15 @@ class TennisExitManager:
         mid_price_entry: float = 0.0,
     ) -> TennisPaperTrade:
         """Register a new paper trade after a signal is accepted."""
+        # ═══ GLOBAL EDGE GUARD (v6.1 — inside function, non-bypassable) ═══
+        from sports.guards import validate_trade_execution
+        can_exec, block_reason = validate_trade_execution(
+            edge=edge, price=entry_price, sport="tennis",
+            context=f"{trigger_type} | {player} | {match_id}",
+        )
+        if not can_exec:
+            return None
+
         # Spread capture: log-only adjusted entry for paper PnL
         spread_capture = spread > self.SPREAD_CAPTURE_THRESHOLD
         adjusted = entry_price - 0.01 if spread_capture else entry_price
