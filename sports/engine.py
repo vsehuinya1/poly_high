@@ -14,6 +14,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+from sports.guards import validate_trade_execution
+
 from sports.config import (
     ENTRY_EDGE_THRESHOLD,
     MAX_POSITION_PER_MARKET, MAX_CONCURRENT_POSITIONS, MAX_DAILY_LOSS,
@@ -1057,6 +1059,20 @@ class SignalEngine:
             return
 
         assert 0.0 < entry_price < 1.0, f"Invalid tennis price: {entry_price}"
+
+        # ═══════════════════════════════════════════════════════════
+        # GLOBAL EDGE GUARD (v6.0 — non-bypassable)
+        # No trade can EVER execute with edge <= 0.
+        # ═══════════════════════════════════════════════════════════
+        can_exec, block_reason = validate_trade_execution(
+            edge=abs(signal.edge),
+            price=entry_price,
+            sport=link.sport or "unknown",
+            context=f"{signal.direction} {signal.outcome} | {link.polymarket_title[:50]}",
+        )
+        if not can_exec:
+            self._blocks[block_reason] = self._blocks.get(block_reason, 0) + 1
+            return
 
         # Debug guard (temporary — confirm no bad entries pass through)
         log.info("TENNIS_ENTRY_CHECK | price=%.4f | match=%s | %s %s",

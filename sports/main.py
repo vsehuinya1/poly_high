@@ -60,6 +60,7 @@ from sports.config import (
     TENNIS_MIN_ORDER_USD, POLY_PRIVATE_KEY, POLY_FUNDER_ADDRESS,
     CLOB_PROXY_URL,
 )
+from sports.guards import validate_trade_execution
 from tennis.live_executor import LiveExecutor
 from tennis.spread_breakout import SpreadBreakoutDetector
 
@@ -936,6 +937,16 @@ class SportsOrchestrator:
                         diag["signal_ok"] += 1
 
                         # Jump to entry execution (reuse signal + state)
+                        # ═══ GLOBAL EDGE GUARD (v6.0) ═══
+                        can_exec, block_reason = validate_trade_execution(
+                            edge=current_edge,
+                            price=market_price,
+                            sport="tennis",
+                            context=f"{signal.trigger_type} | {link.polymarket_title[:50]}",
+                        )
+                        if not can_exec:
+                            continue
+
                         self.tennis_guard.record_entry(
                             match_id, state_key=self.tennis_strategy._state_key(state, fav_token),
                             edge=current_edge
@@ -1056,6 +1067,17 @@ class SportsOrchestrator:
                             match_title=sb_link.polymarket_title,
                         )
                         if sb_sig:
+                            # ═══ GLOBAL EDGE GUARD (v6.0) ═══
+                            sb_edge = sb_sig.get("edge", 0)
+                            can_exec, block_reason = validate_trade_execution(
+                                edge=sb_edge if sb_edge > 0 else abs(sb_sig["entry_price"] - sb_sig.get("pre_widen_mid", sb_sig["entry_price"])),
+                                price=sb_sig["entry_price"],
+                                sport="tennis_sb",
+                                context=f"SPREAD_BREAKOUT {sb_sig['direction']} | {sb_link.polymarket_title[:50]}",
+                            )
+                            if not can_exec:
+                                continue
+
                             # Register trade for exit tracking
                             player = sb_link.home_team if sb_tid == sb_link.home_token_id else sb_link.away_team
                             self.sb_detector.register_trade(
@@ -1488,6 +1510,16 @@ class SportsOrchestrator:
                                 data_age_s=time.time() - book.timestamp,
                             )
                             if decision.can_execute:
+                                # ═══ GLOBAL EDGE GUARD (v6.0) ═══
+                                can_exec, block_reason = validate_trade_execution(
+                                    edge=sig.edge,
+                                    price=market_price,
+                                    sport="cricket",
+                                    context=f"{sig.signal_type} | {link.polymarket_title[:50]}",
+                                )
+                                if not can_exec:
+                                    continue
+
                                 self.cricket_guard.record_entry(match_id)
                                 score_str = str(state)
                                 log.info(
@@ -1540,6 +1572,16 @@ class SportsOrchestrator:
                     )
 
                     if tick_signal:
+                        # ═══ GLOBAL EDGE GUARD (v6.0) ═══
+                        can_exec, block_reason = validate_trade_execution(
+                            edge=tick_signal.edge,
+                            price=tick_signal.entry_price,
+                            sport="cricket_tick",
+                            context=f"{tick_signal.signal_type} {tick_signal.direction} | {link.polymarket_title[:50]}",
+                        )
+                        if not can_exec:
+                            continue
+
                         # Register with the existing cricket exit manager
                         token_id = link.home_token_id or (
                             link.all_token_ids[0]
