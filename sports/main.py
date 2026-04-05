@@ -1489,9 +1489,36 @@ class SportsOrchestrator:
                                     link.polymarket_title[:60],
                                 )
 
-                    # ── Get book data ─────────────────────────────
-                    book = self.poly_feed.books.get(link.home_token_id)
+                    # ── Get book data (try all token IDs) ─────────
+                    book = None
+                    used_token_id = link.home_token_id
+                    # Try home token first, then all others
+                    candidate_ids = [link.home_token_id] + [
+                        t for t in (link.all_token_ids or [])
+                        if t != link.home_token_id
+                    ]
+                    for tid in candidate_ids:
+                        if not tid:
+                            continue
+                        b = self.poly_feed.books.get(tid)
+                        if b and b.mid > 0:
+                            book = b
+                            used_token_id = tid
+                            break
+
                     if not book or book.mid <= 0:
+                        # Periodic log: which cricket markets have no book
+                        if not hasattr(self, '_cricket_nobook_log'):
+                            self._cricket_nobook_log = {}
+                        now_t = time.time()
+                        if now_t - self._cricket_nobook_log.get(match_id, 0) > 120:
+                            self._cricket_nobook_log[match_id] = now_t
+                            log.info(
+                                "CRICKET_NO_BOOK | %s | tokens=%s | %s",
+                                match_id,
+                                [t[:8] + '...' if t and len(t) > 8 else t for t in candidate_ids[:3]],
+                                link.polymarket_title[:50],
+                            )
                         continue
                     market_price = book.mid
 
