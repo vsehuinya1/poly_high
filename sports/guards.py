@@ -5,6 +5,8 @@ Non-bypassable validation that runs DIRECTLY before any trade execution.
 All sports, all paths, no exceptions.
 
 v1.0 — 2026-04-04  Initial: edge > 0, price band, sanity checks.
+v1.1 — 2026-04-05  Fix: use abs(edge) — edge sign encodes direction,
+                    not quality. Negative edge = SELL direction is valid.
 """
 import logging
 
@@ -22,8 +24,11 @@ def validate_trade_execution(
 
     Must be called DIRECTLY before register_trade / buy / sell.
 
+    Edge sign convention: positive = BUY, negative = SELL.
+    The MAGNITUDE must be > 0 for any trade.
+
     Args:
-        edge:    Computed edge (must be > 0 for execution).
+        edge:    Computed edge (sign = direction, abs = magnitude).
         price:   Entry price (market mid).
         sport:   Sport identifier (for logging).
         context: Human-readable context (match title, signal type, etc.).
@@ -32,16 +37,17 @@ def validate_trade_execution(
         (can_execute: bool, reason: str)
         reason is empty if can_execute is True.
     """
-    # 1. Edge must be strictly positive
-    if edge is None or edge <= 0:
+    # 1. Edge magnitude must be non-zero (abs handles signed edges)
+    abs_edge = abs(edge) if edge is not None else 0.0
+    if edge is None or abs_edge < 0.001:
         log.error(
-            "BLOCK_NEGATIVE_EDGE | edge=%.4f | sport=%s | %s",
+            "BLOCK_ZERO_EDGE | edge=%.4f | sport=%s | %s",
             edge if edge is not None else -999.0, sport, context,
         )
-        return False, "BLOCK_NEGATIVE_EDGE"
+        return False, "BLOCK_ZERO_EDGE"
 
-    # 2. Edge sanity — catch calculation bugs (edge > 100% is nonsense)
-    if edge >= 1.0:
+    # 2. Edge sanity — catch calculation bugs (|edge| > 100% is nonsense)
+    if abs_edge >= 1.0:
         log.error(
             "BLOCK_INSANE_EDGE | edge=%.4f | sport=%s | %s",
             edge, sport, context,

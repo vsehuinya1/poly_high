@@ -31,23 +31,23 @@ MAX_TICK_HISTORY = 600  # ~10 min at 1 tick/s
 # Guards
 PRICE_FLOOR = 0.20
 PRICE_CEIL = 0.80
-MAX_SPREAD = 0.05
-STALE_TICK_S = 30.0     # skip if no tick movement in 30s
+MAX_SPREAD = 0.08
+STALE_TICK_S = 60.0     # skip if no tick movement in 60s
 
 # Drift Reversion
-DRIFT_MIN_MOVE = 0.05   # min net price move
+DRIFT_MIN_MOVE = 0.03   # min net price move (lowered from 0.05)
 DRIFT_WINDOW_S = 600.0  # 10 minutes lookback
-DRIFT_SMOOTH_RATIO = 0.60  # net/range > 0.60 means "smooth drift" (not choppy)
+DRIFT_SMOOTH_RATIO = 0.55  # net/range > 0.55 means "smooth drift"
 
 # Spike Reversion
-SPIKE_MIN_MOVE = 0.03   # min price jump
+SPIKE_MIN_MOVE = 0.02   # min price jump (lowered from 0.03)
 SPIKE_WINDOW_S = 60.0   # must occur within 60s
-SPIKE_MAX_SPREAD = 0.04 # only trade if spread ≤ this at spike time
+SPIKE_MAX_SPREAD = 0.06 # only trade if spread ≤ this at spike time
 
 # Exits
 STOP_LOSS_R = 0.08      # -8% of entry price
-DRIFT_TARGET = 0.035    # midpoint of 0.03–0.05 range
-SPIKE_TARGET = 0.04
+DRIFT_TARGET = 0.025    # target (lowered from 0.035)
+SPIKE_TARGET = 0.03     # target (lowered from 0.04)
 DRIFT_TIMEOUT_S = 900.0  # 15 minutes
 SPIKE_TIMEOUT_S = 300.0  # 5 minutes
 
@@ -200,16 +200,18 @@ class CricketTickDetector:
         # Periodic skip logging (every 60s)
         if timestamp - self._last_skip_log > 60.0:
             total_skips = sum(self._skip_counts.values())
-            if total_skips > 0:
-                log.info(
-                    "CRICKET_TICK_SKIPS | no_move=%d | spread=%d | "
-                    "band=%d | cooldown=%d",
-                    self._skip_counts["no_move"],
-                    self._skip_counts["spread"],
-                    self._skip_counts["band"],
-                    self._skip_counts["cooldown"],
-                )
-                self._skip_counts = {k: 0 for k in self._skip_counts}
+            # Always log tick counts so we can confirm detector is running
+            total_ticks = sum(len(b) for b in self._ticks.values())
+            log.info(
+                "CRICKET_TICK_DIAG | markets=%d | total_ticks=%d | "
+                "skips: no_move=%d spread=%d band=%d cooldown=%d",
+                len(self._ticks), total_ticks,
+                self._skip_counts["no_move"],
+                self._skip_counts["spread"],
+                self._skip_counts["band"],
+                self._skip_counts["cooldown"],
+            )
+            self._skip_counts = {k: 0 for k in self._skip_counts}
             self._last_skip_log = timestamp
 
         return None

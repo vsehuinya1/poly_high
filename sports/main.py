@@ -1559,10 +1559,10 @@ class SportsOrchestrator:
                                     )
                                 except Exception:
                                     pass
-                        continue  # DLS path done, skip tick path
+                        # DLS path done — but ALWAYS fall through to tick detector
 
                     # ════════════════════════════════════════════════
-                    #  PATH 2: Tick-based reversion (no ESPN needed)
+                    #  PATH 2: Tick-based reversion (ALWAYS runs)
                     # ════════════════════════════════════════════════
                     tick_signal = self.cricket_tick_detector.on_tick(
                         match_id=match_id,
