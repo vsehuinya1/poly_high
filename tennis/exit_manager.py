@@ -188,13 +188,15 @@ class TennisExitManager:
     ) -> TennisPaperTrade:
         """Register a new paper trade after a signal is accepted."""
         # ═══ GLOBAL EDGE GUARD (v6.1 — inside function, non-bypassable) ═══
-        from sports.guards import validate_trade_execution
+        from sports.guards import validate_trade_execution, circuit_breaker
         can_exec, block_reason = validate_trade_execution(
             edge=edge, price=entry_price, sport="tennis",
             context=f"{trigger_type} | {player} | {match_id}",
         )
         if not can_exec:
+            circuit_breaker.record_signal_result(was_blocked=True)
             return None
+        circuit_breaker.record_signal_result(was_blocked=False)
 
         # Spread capture: log-only adjusted entry for paper PnL
         spread_capture = spread > self.SPREAD_CAPTURE_THRESHOLD
@@ -435,6 +437,21 @@ class TennisExitManager:
             trade.entry_price, exit_price, trade.R_multiple,
             trade.match_id,
         )
+
+        # v7.0: MISSED_RUNNER — log trades that had high MFE but exited poorly
+        if trade.mfe >= 0.05 and trade.R_multiple < 0.05:
+            log.warning(
+                "MISSED_RUNNER | mfe=%.4f exit_R=%+.4f | "
+                "exit_reason=%s | duration=%.0fs | "
+                "runner_active=%s | %s",
+                trade.mfe, trade.R_multiple,
+                exit_reason, elapsed,
+                trade.runner_v2_active, trade.match_id,
+            )
+
+        # v7.0: Feed circuit breaker with trade outcome
+        from sports.guards import circuit_breaker
+        circuit_breaker.record_trade_outcome(trade.R_multiple)
 
         # v5.0: Update MFE distribution buckets
         self._update_mfe_buckets(trade)

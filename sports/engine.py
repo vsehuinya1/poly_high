@@ -14,7 +14,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-from sports.guards import validate_trade_execution
+from sports.guards import validate_trade_execution, circuit_breaker
 
 from sports.config import (
     ENTRY_EDGE_THRESHOLD,
@@ -1016,6 +1016,7 @@ class SignalEngine:
         # ── All conditions met — execute delayed entry ────────────
         entry_delay_actual = elapsed_pending
         confirmation_ticks_count = pending["confirm_count"]
+        signal_edge_at_detection = pending.get("initial_edge")  # v7.0: capture before deletion
         del self._pending_entries[pending_key]  # consumed
         
         # --- Q5 PROXY FILTER (NBA/other only — football bypasses) ---
@@ -1061,14 +1062,19 @@ class SignalEngine:
         assert 0.0 < entry_price < 1.0, f"Invalid tennis price: {entry_price}"
 
         # ═══════════════════════════════════════════════════════════
-        # GLOBAL EDGE GUARD (v6.0 — non-bypassable)
-        # No trade can EVER execute with edge <= 0.
+        # GLOBAL EDGE GUARD (v7.0 — non-bypassable, full validation)
+        # Checks: edge>0, price band, staleness, empty book,
+        #         edge drift, circuit breaker.
         # ═══════════════════════════════════════════════════════════
         can_exec, block_reason = validate_trade_execution(
             edge=signal.edge,
             price=entry_price,
             sport=link.sport or "unknown",
             context=f"{signal.direction} {signal.outcome} | {link.polymarket_title[:50]}",
+            book_age=book_age,
+            book_bid=book.best_bid if book else 0.0,
+            book_ask=book.best_ask if book else 0.0,
+            signal_edge=signal_edge_at_detection,
         )
         if not can_exec:
             self._blocks[block_reason] = self._blocks.get(block_reason, 0) + 1
@@ -1245,6 +1251,10 @@ class SignalEngine:
                 pos.edge_at_exit = current_edge
                 pos.stop_loss_triggered = (exit_reason == "stop_loss")
                 self.daily_pnl += pnl
+
+                # v7.0: Feed circuit breaker with trade outcome
+                r_mult = pnl / pos.size_usd if pos.size_usd > 0 else 0.0
+                circuit_breaker.record_trade_outcome(r_mult)
 
                 # Per-game PnL + cooldown tracking
                 gts = self._get_game_state(game_state.game_id)
