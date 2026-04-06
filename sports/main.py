@@ -1589,13 +1589,14 @@ class SportsOrchestrator:
                         # DLS path done — but ALWAYS fall through to tick detector
 
                     # ════════════════════════════════════════════════
-                    #  PATH 2: Tick-based reversion (ALWAYS runs)
+                    #  PATH 2: Tick-based continuation (ALWAYS runs)
                     # ════════════════════════════════════════════════
                     tick_signal = self.cricket_tick_detector.on_tick(
                         match_id=match_id,
                         mid=book.mid,
                         spread=book.spread,
                         timestamp=book.timestamp,
+                        market_title=link.polymarket_title,
                     )
 
                     if tick_signal:
@@ -1669,12 +1670,24 @@ class SportsOrchestrator:
                 tick_exits = self.cricket_tick_detector.check_exits(_get_cricket_price)
                 for (exit_mid, exit_sig_type, exit_entry, exit_price, exit_reason) in tick_exits:
                     pnl = exit_price - exit_entry
+                    r_mult = pnl / 0.06 if 0.06 > 0 else 0  # SL = 0.06
                     log.info(
                         "CRICKET_TICK_CLOSED | %s | %s | "
-                        "entry=%.4f exit=%.4f pnl=%+.4f",
+                        "entry=%.4f exit=%.4f pnl=%+.4f R=%+.3f",
                         exit_sig_type, exit_reason,
-                        exit_entry, exit_price, pnl,
+                        exit_entry, exit_price, pnl, r_mult,
                     )
+                    try:
+                        pnl_emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
+                        await self.engine.tg.send(
+                            f"{pnl_emoji} <b>Cricket Trade Closed</b>\n"
+                            f"Type: {exit_sig_type}\n"
+                            f"Exit: {exit_reason}\n"
+                            f"Entry: {exit_entry:.3f} → Exit: {exit_price:.3f}\n"
+                            f"PnL: {pnl:+.4f} | R: {r_mult:+.2f}"
+                        )
+                    except Exception:
+                        pass
 
                 # Check open paper trades for MAE/MFE updates + exits
                 self.cricket_exit_mgr.check_all(

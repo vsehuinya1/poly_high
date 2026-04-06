@@ -1,21 +1,29 @@
 """
-Cricket Tick-Based Reversion Strategy — Pure tick data only.
+Cricket Tick-Based Momentum Strategy — v2.0
 
-Two independent signal types:
-  1. DRIFT_REVERSION  — fade slow moves (≥0.05 over 10min)
-  2. SPIKE_REVERSION  — fade fast spikes (≥0.03 in ≤60s)
+Replaces mean-reversion (v1.0, proven ΣR -2.75) with momentum continuation.
 
-No ESPN, no score data, no match events.
+Two signal types:
+  1. SPIKE_CONTINUATION  — ride confirmed spikes (≥0.04 in ≤60s)
+  2. MOMENTUM_DRIFT      — ride sustained drift (≥0.04 over 120-300s)
+
+IPL-only market filtering. No ESPN, no external feeds.
 Only uses: price (mid), spread, timestamp.
 
-v1.0 — 2026-04-04
+Exit logic:
+  - STOP_LOSS: -0.06
+  - EXIT_RUNNER: MFE ≥ 0.03, trail 0.02
+  - EXIT_MOMENTUM_FAIL: no new high/low for 45s after entry
+  - TIMEOUT: 300s
+
+v2.0 — 2026-04-06  Continuation model (replaces reversion)
 """
 from __future__ import annotations
 
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 log = logging.getLogger("cricket.tick_strategy")
@@ -25,38 +33,50 @@ log = logging.getLogger("cricket.tick_strategy")
 #  Configuration
 # ═══════════════════════════════════════════════════════════════════════
 
-# Ring buffer size (max ticks to keep per market)
+# Ring buffer
 MAX_TICK_HISTORY = 600  # ~10 min at 1 tick/s
 
 # Guards
 PRICE_FLOOR = 0.20
 PRICE_CEIL = 0.80
-MAX_SPREAD = 0.08
-STALE_TICK_S = 60.0     # skip if no tick movement in 60s
+STALE_TICK_S = 60.0
 
-# Drift Reversion
-DRIFT_MIN_MOVE = 0.03   # min net price move (lowered from 0.05)
-DRIFT_WINDOW_S = 600.0  # 10 minutes lookback
-DRIFT_SMOOTH_RATIO = 0.55  # net/range > 0.55 means "smooth drift"
+# Spike Continuation
+SPIKE_MIN_MOVE = 0.04       # minimum price move for spike
+SPIKE_WINDOW_S = 60.0       # spike must occur within 60s
+SPIKE_CONFIRM_MIN_S = 5.0   # wait at least 5s after spike
+SPIKE_CONFIRM_MAX_S = 10.0  # don't wait longer than 10s
+SPIKE_MAX_RETRACE = 0.33    # retrace must be < 33% of spike
+SPIKE_MAX_SPREAD = 0.04     # spread must be ≤ 0.04 at entry
+SPIKE_MIN_CONTRACTION = 2   # spread must contract for ≥ 2 consecutive ticks
 
-# Spike Reversion
-SPIKE_MIN_MOVE = 0.02   # min price jump (lowered from 0.03)
-SPIKE_WINDOW_S = 60.0   # must occur within 60s
-SPIKE_MAX_SPREAD = 0.06 # only trade if spread ≤ this at spike time
+# Momentum Drift
+DRIFT_MIN_MOVE = 0.04       # net move over window
+DRIFT_WINDOW_MIN_S = 120.0  # minimum lookback
+DRIFT_WINDOW_MAX_S = 300.0  # maximum lookback
+DRIFT_SMOOTH_RATIO = 0.60   # net/range > 0.60
+DRIFT_MAX_SPREAD = 0.03     # spread at entry
+DRIFT_CONFIRM_TICKS = 3     # last N ticks same direction
+
+# Edge Calculation
+MIN_EDGE = 0.01             # reject if edge < this
 
 # Exits
-STOP_LOSS_R = 0.08      # -8% of entry price
-DRIFT_TARGET = 0.025    # target (lowered from 0.035)
-SPIKE_TARGET = 0.03     # target (lowered from 0.04)
-DRIFT_TIMEOUT_S = 900.0  # 15 minutes
-SPIKE_TIMEOUT_S = 300.0  # 5 minutes
+STOP_LOSS = 0.06            # initial stop distance
+TIMEOUT_S = 300.0           # 5 minutes
+RUNNER_ACTIVATION = 0.03    # MFE to activate runner
+RUNNER_TRAIL = 0.02         # trail distance once active
+MOMENTUM_FAIL_S = 45.0      # exit if no new extreme for this long
 
-# Cooldown per market
-COOLDOWN_S = 120.0       # 2min between entries on same market
+# Cooldown
+COOLDOWN_S = 120.0
+
+# Market filter
+IPL_KEYWORDS = ["indian premier league"]
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Tick Data Point
+#  Data Types
 # ═══════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -66,70 +86,58 @@ class TickPoint:
     spread: float
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Active Trade
-# ═══════════════════════════════════════════════════════════════════════
-
-@dataclass
-class TickTrade:
-    """Tracks an active tick-strategy trade for exit management."""
-    match_id: str
-    signal_type: str        # DRIFT_REVERSION or SPIKE_REVERSION
-    entry_price: float
-    entry_timestamp: float
-    direction: str          # "LONG" or "SHORT" — direction WE entered
-    target: float           # absolute target price
-    stop: float             # absolute stop price
-    timeout_s: float        # trade-specific timeout
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  Signal Output
-# ═══════════════════════════════════════════════════════════════════════
-
 @dataclass
 class CricketTickSignal:
     """Output from the tick-based detector."""
-    signal_type: str        # DRIFT_REVERSION or SPIKE_REVERSION
+    signal_type: str        # SPIKE_CONTINUATION or MOMENTUM_DRIFT
     match_id: str
-    direction: str          # LONG or SHORT — what WE do (fade the move)
-    move: float             # the observed move magnitude
+    direction: str          # LONG or SHORT — same as move direction
+    move: float             # observed move magnitude
     entry_price: float      # current mid at signal time
-    fair_price: float       # our estimated fair value
-    edge: float             # fair_price - entry_price (signed)
+    fair_price: float       # projected fair value (continuation)
+    edge: float             # projected_move - spread/2
     spread: float           # current spread
 
 
+@dataclass
+class TickTrade:
+    """Active trade with runner tracking."""
+    match_id: str
+    signal_type: str
+    entry_price: float
+    entry_timestamp: float
+    direction: str          # LONG or SHORT
+    stop: float             # absolute stop price
+    timeout_s: float
+    # Runner state
+    mfe: float = 0.0                # best favorable excursion
+    mfe_timestamp: float = 0.0      # when MFE was set
+    runner_active: bool = False
+    trail_price: float = 0.0        # trailing stop price
+    last_extreme_ts: float = 0.0    # last new high/low timestamp
+    tick_count: int = 0
+
+
 # ═══════════════════════════════════════════════════════════════════════
-#  Detector — per-market instance
+#  Detector
 # ═══════════════════════════════════════════════════════════════════════
 
 class CricketTickDetector:
-    """Self-contained tick-based signal detector for cricket markets.
+    """Momentum continuation detector for cricket markets.
 
-    Maintains a ring buffer of recent ticks per market and detects
-    drift and spike reversion patterns. Also manages active trade
-    exits independently.
-
-    Usage:
-        detector = CricketTickDetector()
-        signal = detector.on_tick(match_id, mid, spread, timestamp)
-        if signal:
-            # emit signal and register trade
-            detector.register_trade(signal)
-        exits = detector.check_exits(get_price)
+    Detects spike continuation and momentum drift patterns.
+    Manages runner-style exits with momentum-fail protection.
     """
 
     def __init__(self):
-        # Per-market tick history: match_id → deque of TickPoint
         self._ticks: dict[str, deque[TickPoint]] = {}
-        # Active trades managed by this detector
         self._trades: dict[str, TickTrade] = {}
-        # Cooldown tracking
         self._last_signal_ts: dict[str, float] = {}
-        # Skip-reason counters for periodic logging
+        self._market_titles: dict[str, str] = {}  # match_id → title
         self._skip_counts: dict[str, int] = {
             "no_move": 0, "spread": 0, "band": 0, "cooldown": 0,
+            "not_ipl": 0, "small_spike": 0, "no_contraction": 0,
+            "low_edge": 0, "retrace": 0, "too_early": 0,
         }
         self._last_skip_log = 0.0
 
@@ -141,19 +149,28 @@ class CricketTickDetector:
         mid: float,
         spread: float,
         timestamp: float,
+        market_title: str = "",
     ) -> Optional[CricketTickSignal]:
-        """Process a new tick. Returns a signal if one is detected.
-
-        Called once per loop iteration per cricket market.
-        """
+        """Process a new tick. Returns a signal if one is detected."""
         # Store tick
         if match_id not in self._ticks:
             self._ticks[match_id] = deque(maxlen=MAX_TICK_HISTORY)
         buf = self._ticks[match_id]
         buf.append(TickPoint(timestamp=timestamp, mid=mid, spread=spread))
 
+        # Store title for IPL filtering
+        if market_title:
+            self._market_titles[match_id] = market_title
+
         # ── Guards ────────────────────────────────────────────────
-        # Already have an active trade for this market
+
+        # IPL filter
+        title = self._market_titles.get(match_id, "")
+        if not any(kw in title.lower() for kw in IPL_KEYWORDS):
+            self._skip("not_ipl")
+            return None
+
+        # Active trade for this market
         if match_id in self._trades:
             return None
 
@@ -162,12 +179,12 @@ class CricketTickDetector:
             self._skip("band")
             return None
 
-        # Spread too wide
-        if spread > MAX_SPREAD:
+        # Spread gate (use tighter of the two thresholds)
+        if spread > SPIKE_MAX_SPREAD:
             self._skip("spread")
             return None
 
-        # Staleness — last tick must have changed recently
+        # Staleness
         if len(buf) >= 2:
             last_change_ts = timestamp
             for i in range(len(buf) - 2, -1, -1):
@@ -189,91 +206,169 @@ class CricketTickDetector:
             return None
 
         # ── Check patterns (priority: spike first) ────────────────
-        signal = self._check_spike(match_id, buf, mid, spread, timestamp)
+        signal = self._check_spike_continuation(match_id, buf, mid, spread, timestamp)
         if signal:
             return signal
 
-        signal = self._check_drift(match_id, buf, mid, spread, timestamp)
+        signal = self._check_momentum_drift(match_id, buf, mid, spread, timestamp)
         if signal:
             return signal
 
-        # Periodic skip logging (every 60s)
+        # Periodic diagnostic (every 60s)
         if timestamp - self._last_skip_log > 60.0:
-            total_skips = sum(self._skip_counts.values())
-            # Always log tick counts so we can confirm detector is running
             total_ticks = sum(len(b) for b in self._ticks.values())
             log.info(
                 "CRICKET_TICK_DIAG | markets=%d | total_ticks=%d | "
-                "skips: no_move=%d spread=%d band=%d cooldown=%d",
+                "skips: not_ipl=%d small_spike=%d no_contraction=%d "
+                "low_edge=%d spread=%d band=%d retrace=%d cooldown=%d",
                 len(self._ticks), total_ticks,
-                self._skip_counts["no_move"],
-                self._skip_counts["spread"],
-                self._skip_counts["band"],
-                self._skip_counts["cooldown"],
+                self._skip_counts.get("not_ipl", 0),
+                self._skip_counts.get("small_spike", 0),
+                self._skip_counts.get("no_contraction", 0),
+                self._skip_counts.get("low_edge", 0),
+                self._skip_counts.get("spread", 0),
+                self._skip_counts.get("band", 0),
+                self._skip_counts.get("retrace", 0),
+                self._skip_counts.get("cooldown", 0),
             )
             self._skip_counts = {k: 0 for k in self._skip_counts}
             self._last_skip_log = timestamp
 
         return None
 
-    # ── Pattern: Spike Reversion ──────────────────────────────────
+    # ── Pattern: Spike Continuation ───────────────────────────────
 
-    def _check_spike(
+    def _check_spike_continuation(
         self, match_id: str, buf: deque, mid: float,
         spread: float, now: float,
     ) -> Optional[CricketTickSignal]:
-        """Detect sharp move ≥0.03 within ≤60s and fade it."""
-        if spread > SPIKE_MAX_SPREAD:
-            return None
+        """Detect spike ≥0.04 within ≤60s and ride continuation."""
 
-        # Look back through buffer for a price 60s ago
+        # Find the largest move in the lookback window
+        best_move = 0.0
+        best_origin_idx = -1
+
         for i in range(len(buf) - 2, -1, -1):
             dt = now - buf[i].timestamp
             if dt > SPIKE_WINDOW_S:
                 break
             move = mid - buf[i].mid
-            if abs(move) >= SPIKE_MIN_MOVE:
-                # Fade the spike: if price spiked UP, we go SHORT (sell)
-                # but in Poly terms: if price spiked up, fair value is lower
-                direction = "SHORT" if move > 0 else "LONG"
-                # Fair value = price before spike + small offset
-                fair = buf[i].mid + (0.01 if move > 0 else -0.01)
-                edge = fair - mid if direction == "LONG" else mid - fair
+            if abs(move) > abs(best_move):
+                best_move = move
+                best_origin_idx = i
 
-                self._last_signal_ts[match_id] = now
-                log.info(
-                    "CRICKET_SIGNAL | type=SPIKE_REVERSION | "
-                    "move=%.4f | dir=%s | mid=%.4f | spread=%.4f | "
-                    "fair=%.4f | edge=%.4f | match=%s",
-                    move, direction, mid, spread, fair, edge, match_id,
-                )
-                return CricketTickSignal(
-                    signal_type="SPIKE_REVERSION",
-                    match_id=match_id,
-                    direction=direction,
-                    move=abs(move),
-                    entry_price=mid,
-                    fair_price=fair,
-                    edge=edge,
-                    spread=spread,
-                )
-        return None
+        # Minimum spike size
+        if abs(best_move) < SPIKE_MIN_MOVE:
+            if abs(best_move) >= 0.02:  # log near-misses
+                self._skip("small_spike")
+            return None
 
-    # ── Pattern: Drift Reversion ──────────────────────────────────
+        origin = buf[best_origin_idx]
+        spike_age = now - origin.timestamp
 
-    def _check_drift(
+        # Confirmation delay: must be 5-10s after spike origin
+        if spike_age < SPIKE_CONFIRM_MIN_S:
+            self._skip("too_early")
+            return None
+
+        # Check retrace: price must not have reverted > 33% of spike
+        # Find the spike peak index (highest point for UP, lowest for DOWN)
+        peak_idx = best_origin_idx
+        if best_move > 0:
+            for j in range(best_origin_idx, len(buf)):
+                if buf[j].mid > buf[peak_idx].mid:
+                    peak_idx = j
+        else:
+            for j in range(best_origin_idx, len(buf)):
+                if buf[j].mid < buf[peak_idx].mid:
+                    peak_idx = j
+        peak_price = buf[peak_idx].mid
+
+        # Measure retrace ONLY from peak forward (not from origin)
+        retrace = 0.0
+        for j in range(peak_idx, len(buf)):
+            if best_move > 0:  # spike UP → retrace = peak - current
+                retrace = max(retrace, peak_price - buf[j].mid)
+            else:  # spike DOWN → retrace = current - trough
+                retrace = max(retrace, buf[j].mid - peak_price)
+
+        if retrace > abs(best_move) * SPIKE_MAX_RETRACE:
+            self._skip("retrace")
+            return None
+
+        # Spread contraction check: last N ticks must show contracting spread
+        if len(buf) >= SPIKE_MIN_CONTRACTION + 1:
+            contracting = 0
+            for k in range(len(buf) - SPIKE_MIN_CONTRACTION, len(buf)):
+                if buf[k].spread <= buf[k - 1].spread:
+                    contracting += 1
+            if contracting < SPIKE_MIN_CONTRACTION:
+                self._skip("no_contraction")
+                return None
+        else:
+            self._skip("no_contraction")
+            return None
+
+        # ── SIGNAL CONFIRMED ──────────────────────────────────────
+        # Direction: SAME as spike (momentum, not fade)
+        direction = "LONG" if best_move > 0 else "SHORT"
+
+        # Edge calculation (v2.0)
+        projected_move = max(0.02, min(0.05, abs(best_move) * 0.6))
+        if direction == "LONG":
+            fair = mid + projected_move
+        else:
+            fair = mid - projected_move
+        edge = projected_move - spread / 2.0
+
+        if edge < MIN_EDGE:
+            self._skip("low_edge")
+            log.info(
+                "CRICKET_SKIP_REASON | reason=low_edge | "
+                "projected=%.4f spread=%.4f edge=%.4f < %.4f | %s",
+                projected_move, spread, edge, MIN_EDGE, match_id,
+            )
+            return None
+
+        self._last_signal_ts[match_id] = now
+        log.info(
+            "CRICKET_SIGNAL_CONTINUATION | type=SPIKE_CONTINUATION | "
+            "spike_size=%.4f | delay_s=%.1f | retrace_pct=%.0f%% | "
+            "spread=%.4f | edge=%.4f | projected=%.4f | "
+            "dir=%s | mid=%.4f | %s",
+            abs(best_move), spike_age,
+            (retrace / abs(best_move) * 100) if abs(best_move) > 0 else 0,
+            spread, edge, projected_move,
+            direction, mid, match_id,
+        )
+        return CricketTickSignal(
+            signal_type="SPIKE_CONTINUATION",
+            match_id=match_id,
+            direction=direction,
+            move=abs(best_move),
+            entry_price=mid,
+            fair_price=fair,
+            edge=edge,
+            spread=spread,
+        )
+
+    # ── Pattern: Momentum Drift ───────────────────────────────────
+
+    def _check_momentum_drift(
         self, match_id: str, buf: deque, mid: float,
         spread: float, now: float,
     ) -> Optional[CricketTickSignal]:
-        """Detect smooth drift ≥0.05 over 10min and fade it."""
-        # Find the price from ~10 minutes ago
+        """Detect sustained directional drift ≥0.04 over 120-300s."""
+        if spread > DRIFT_MAX_SPREAD:
+            return None
+
+        # Find tick from 120-300s ago
         old_tick = None
         for i in range(len(buf)):
             dt = now - buf[i].timestamp
-            if dt >= DRIFT_WINDOW_S:
+            if DRIFT_WINDOW_MIN_S <= dt <= DRIFT_WINDOW_MAX_S:
                 old_tick = buf[i]
-            else:
-                break  # buf is chronological; stop once we're within window
+                break
 
         if old_tick is None:
             return None
@@ -282,9 +377,10 @@ class CricketTickDetector:
         if abs(net_move) < DRIFT_MIN_MOVE:
             return None
 
-        # Check smoothness: net_move / total_range > threshold
+        # Smoothness check
         prices_in_window = [
-            t.mid for t in buf if now - t.timestamp <= DRIFT_WINDOW_S
+            t.mid for t in buf
+            if now - t.timestamp <= DRIFT_WINDOW_MAX_S
         ]
         if not prices_in_window:
             return None
@@ -293,24 +389,46 @@ class CricketTickDetector:
             return None
         smoothness = abs(net_move) / total_range
         if smoothness < DRIFT_SMOOTH_RATIO:
-            return None  # too choppy, not a clean drift
+            return None
 
-        # Fade the drift
-        direction = "SHORT" if net_move > 0 else "LONG"
-        # Fair value = midpoint between current and origin
-        fair = (mid + old_tick.mid) / 2.0
-        edge = fair - mid if direction == "LONG" else mid - fair
+        # Confirmation: last 3 ticks same direction
+        if len(buf) >= DRIFT_CONFIRM_TICKS + 1:
+            all_same = True
+            for k in range(len(buf) - DRIFT_CONFIRM_TICKS, len(buf)):
+                delta = buf[k].mid - buf[k - 1].mid
+                if net_move > 0 and delta < 0:
+                    all_same = False
+                    break
+                if net_move < 0 and delta > 0:
+                    all_same = False
+                    break
+            if not all_same:
+                return None
+        else:
+            return None
+
+        # ── SIGNAL CONFIRMED ──────────────────────────────────────
+        direction = "LONG" if net_move > 0 else "SHORT"
+        projected_move = 0.02  # fixed for drift
+        if direction == "LONG":
+            fair = mid + projected_move
+        else:
+            fair = mid - projected_move
+        edge = projected_move - spread / 2.0
+
+        if edge < MIN_EDGE:
+            self._skip("low_edge")
+            return None
 
         self._last_signal_ts[match_id] = now
         log.info(
-            "CRICKET_SIGNAL | type=DRIFT_REVERSION | "
-            "move=%.4f | dir=%s | mid=%.4f | spread=%.4f | "
-            "fair=%.4f | edge=%.4f | smooth=%.2f | match=%s",
-            net_move, direction, mid, spread, fair, edge,
-            smoothness, match_id,
+            "CRICKET_SIGNAL_CONTINUATION | type=MOMENTUM_DRIFT | "
+            "net_move=%.4f | smooth=%.2f | spread=%.4f | "
+            "edge=%.4f | dir=%s | mid=%.4f | %s",
+            net_move, smoothness, spread, edge, direction, mid, match_id,
         )
         return CricketTickSignal(
-            signal_type="DRIFT_REVERSION",
+            signal_type="MOMENTUM_DRIFT",
             match_id=match_id,
             direction=direction,
             move=abs(net_move),
@@ -324,48 +442,43 @@ class CricketTickDetector:
 
     def register_trade(self, signal: CricketTickSignal) -> None:
         """Register an active trade for exit tracking."""
-        # ═══ GLOBAL EDGE GUARD (v6.1 — inside function, non-bypassable) ═══
-        from sports.guards import validate_trade_execution
+        # ═══ GLOBAL EDGE GUARD (v7.0 — inside function, non-bypassable) ═══
+        from sports.guards import validate_trade_execution, circuit_breaker
         can_exec, block_reason = validate_trade_execution(
-            edge=signal.edge, price=signal.entry_price,
+            edge=signal.edge,
+            price=signal.entry_price,
             sport="cricket_tick",
             context=f"{signal.signal_type} {signal.direction} | {signal.match_id}",
         )
         if not can_exec:
+            circuit_breaker.record_signal_result(was_blocked=True)
             return
+        circuit_breaker.record_signal_result(was_blocked=False)
 
+        now = time.time()
         if signal.direction == "LONG":
-            target = signal.entry_price + (
-                DRIFT_TARGET if "DRIFT" in signal.signal_type else SPIKE_TARGET
-            )
-            stop = signal.entry_price * (1.0 - STOP_LOSS_R)
+            stop = signal.entry_price - STOP_LOSS
         else:
-            target = signal.entry_price - (
-                DRIFT_TARGET if "DRIFT" in signal.signal_type else SPIKE_TARGET
-            )
-            stop = signal.entry_price * (1.0 + STOP_LOSS_R)
-
-        timeout = (
-            DRIFT_TIMEOUT_S if "DRIFT" in signal.signal_type
-            else SPIKE_TIMEOUT_S
-        )
+            stop = signal.entry_price + STOP_LOSS
 
         self._trades[signal.match_id] = TickTrade(
             match_id=signal.match_id,
             signal_type=signal.signal_type,
             entry_price=signal.entry_price,
-            entry_timestamp=time.time(),
+            entry_timestamp=now,
             direction=signal.direction,
-            target=target,
             stop=stop,
-            timeout_s=timeout,
+            timeout_s=TIMEOUT_S,
+            mfe=0.0,
+            mfe_timestamp=now,
+            last_extreme_ts=now,
         )
         log.info(
             "CRICKET_TICK_TRADE | %s | %s | entry=%.4f | "
-            "target=%.4f | stop=%.4f | timeout=%ds | %s",
+            "stop=%.4f | timeout=%ds | %s",
             signal.signal_type, signal.direction,
-            signal.entry_price, target, stop,
-            int(timeout), signal.match_id,
+            signal.entry_price, stop,
+            int(TIMEOUT_S), signal.match_id,
         )
 
     # ── Exit Checks ───────────────────────────────────────────────
@@ -373,10 +486,7 @@ class CricketTickDetector:
     def check_exits(
         self, get_price: callable,
     ) -> list[tuple[str, str, float, float, str]]:
-        """Check all active tick-trades for exits.
-
-        Args:
-            get_price: fn(match_id) → (mid, spread) or None
+        """Check all active trades for exits.
 
         Returns:
             List of (match_id, signal_type, entry_price, exit_price, reason)
@@ -393,38 +503,92 @@ class CricketTickDetector:
             if mid <= 0:
                 continue
 
+            trade.tick_count += 1
             elapsed = now - trade.entry_timestamp
             reason = None
 
+            # ── Update MFE and runner state ───────────────────────
             if trade.direction == "LONG":
-                # Stop: price fell below stop
-                if mid <= trade.stop:
-                    reason = "STOP_LOSS"
-                # Target: price rose to target
-                elif mid >= trade.target:
-                    reason = "TARGET"
-            else:  # SHORT
-                # Stop: price rose above stop
-                if mid >= trade.stop:
-                    reason = "STOP_LOSS"
-                # Target: price fell to target
-                elif mid <= trade.target:
-                    reason = "TARGET"
+                favorable = mid - trade.entry_price
+            else:
+                favorable = trade.entry_price - mid
 
-            # Timeout
+            if favorable > trade.mfe:
+                trade.mfe = favorable
+                trade.mfe_timestamp = now
+                trade.last_extreme_ts = now
+
+                # Activate runner once MFE threshold reached
+                if not trade.runner_active and trade.mfe >= RUNNER_ACTIVATION:
+                    trade.runner_active = True
+                    log.info(
+                        "CRICKET_RUNNER_ACTIVE | mfe=%.4f | "
+                        "entry=%.4f mid=%.4f | %s",
+                        trade.mfe, trade.entry_price, mid, match_id,
+                    )
+
+                # Update trailing stop
+                if trade.runner_active:
+                    if trade.direction == "LONG":
+                        trade.trail_price = mid - RUNNER_TRAIL
+                    else:
+                        trade.trail_price = mid + RUNNER_TRAIL
+
+            # ── Exit hierarchy: STOP → RUNNER → MOMENTUM_FAIL → TIMEOUT ──
+
+            # 1. Stop loss
+            if trade.direction == "LONG" and mid <= trade.stop:
+                reason = "EXIT_STOP_LOSS"
+            elif trade.direction == "SHORT" and mid >= trade.stop:
+                reason = "EXIT_STOP_LOSS"
+
+            # 2. Runner trailing stop (only when active)
+            if not reason and trade.runner_active:
+                if trade.direction == "LONG" and mid <= trade.trail_price:
+                    reason = "EXIT_RUNNER"
+                elif trade.direction == "SHORT" and mid >= trade.trail_price:
+                    reason = "EXIT_RUNNER"
+
+            # 3. Momentum fail: no new high/low for 45s after entry
+            if not reason and not trade.runner_active:
+                time_since_extreme = now - trade.last_extreme_ts
+                if time_since_extreme >= MOMENTUM_FAIL_S and elapsed >= MOMENTUM_FAIL_S:
+                    reason = "EXIT_MOMENTUM_FAIL"
+                    log.warning(
+                        "CRICKET_EXIT_MOMENTUM_FAIL | duration=%.0fs | "
+                        "mfe=%.4f | entry=%.4f mid=%.4f | "
+                        "time_since_extreme=%.0fs | %s",
+                        elapsed, trade.mfe, trade.entry_price, mid,
+                        time_since_extreme, match_id,
+                    )
+
+            # 4. Timeout
             if not reason and elapsed >= trade.timeout_s:
-                reason = "TIMEOUT"
+                reason = "EXIT_TIMEOUT"
 
+            # ── Execute exit ──────────────────────────────────────
             if reason:
-                pnl = (mid - trade.entry_price) if trade.direction == "LONG" \
-                    else (trade.entry_price - mid)
+                if trade.direction == "LONG":
+                    pnl = mid - trade.entry_price
+                else:
+                    pnl = trade.entry_price - mid
+
+                r_mult = pnl / STOP_LOSS if STOP_LOSS > 0 else 0
+
                 log.info(
                     "CRICKET_TICK_EXIT | %s | %s | entry=%.4f "
-                    "exit=%.4f | pnl=%+.4f | hold=%.0fs | %s",
+                    "exit=%.4f | pnl=%+.4f R=%+.3f | mfe=%.4f | "
+                    "runner=%s | hold=%.0fs | %s",
                     trade.signal_type, reason,
-                    trade.entry_price, mid, pnl,
+                    trade.entry_price, mid, pnl, r_mult,
+                    trade.mfe, trade.runner_active,
                     elapsed, match_id,
                 )
+
+                # Feed circuit breaker
+                from sports.guards import circuit_breaker
+                circuit_breaker.record_trade_outcome(r_mult)
+
                 exits.append((
                     match_id, trade.signal_type,
                     trade.entry_price, mid, reason,
