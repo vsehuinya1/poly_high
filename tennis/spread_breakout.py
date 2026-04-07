@@ -36,14 +36,15 @@ log = logging.getLogger("tennis.spread_breakout")
 
 NARROW_THRESHOLD = 0.02     # spread must be below this
 NARROW_WINDOW = 5           # for this many consecutive ticks
-WIDEN_THRESHOLD = 0.03      # spread must widen past this to trigger
+WIDEN_THRESHOLD = 0.015     # spread must widen past this to trigger (was 0.03)
 PRICE_BAND = (0.20, 0.80)   # entry price range
 
 # Phase 2: Confirmation parameters
-CONFIRM_WINDOW_S = 5.0      # max 5s to complete confirmation
+CONFIRM_WINDOW_S = 10.0     # max 10s to complete confirmation (was 5s)
 IMPULSE_THRESHOLD = 0.015   # minimum |delta| for first impulse
 EXHAUSTION_THRESHOLD = 0.04 # skip if instant move > this (already exhausted)
 CONTINUATION_TICKS = 2      # ticks needed in same direction after stability
+FALLBACK_NARROW_S = 15.0    # fallback signal after narrow persists this long
 
 # Exit Parameters (local to SPREAD_BREAKOUT)
 SB_STOP_LOSS = 0.08         # -8% hard stop
@@ -62,6 +63,7 @@ class _MarketState:
     narrow_count: int = 0
     pre_widen_mid: float = 0.0
     _narrow_start_logged: bool = False
+    _narrow_start_ts: float = 0.0     # timestamp when narrow started
 
     # Phase 2: breakout confirmation
     triggered: bool = False
@@ -170,9 +172,34 @@ class SpreadBreakoutDetector:
                     log.info("SPREAD_NARROW_START | %s | spread=%.4f | ticks=%d",
                              match_title[:40], spread, st.narrow_count)
                     st._narrow_start_logged = True
+                    st._narrow_start_ts = time.time()
                 st.pre_widen_mid = mid
-            elif st.narrow_count >= NARROW_WINDOW and spread > WIDEN_THRESHOLD:
-                # BREAKOUT detected
+
+                # ── Fallback: emit weak signal if narrow persists ──
+                if (st._narrow_start_ts > 0 and
+                        time.time() - st._narrow_start_ts > FALLBACK_NARROW_S and
+                        PRICE_BAND[0] <= mid <= PRICE_BAND[1]):
+                    log.info("SPREAD_FALLBACK_TIMEOUT | %s | "
+                             "mid=%.4f | narrow_dur=%.0fs",
+                             match_title[:40], mid,
+                             time.time() - st._narrow_start_ts)
+                    signal = {
+                        "trigger": "SPREAD_BREAKOUT",
+                        "direction": "UP" if mid < 0.50 else "DOWN",
+                        "entry_price": mid,
+                        "match_id": match_id,
+                        "token_id": token_id,
+                        "pre_widen_mid": st.pre_widen_mid,
+                        "match_title": match_title,
+                        "strength": "WEAK",
+                        "reason": "fallback_timeout",
+                    }
+                    self._cooldown[token_id] = time.time()
+                    self._reset_state(token_id)
+                    return signal
+
+            elif st.narrow_count >= NARROW_WINDOW and spread > WIDEN_THRESHOLD * 0.7:
+                # BREAKOUT detected (relaxed: 70% of threshold)
                 st.triggered = True
                 st.trigger_ts = time.time()
                 st.phase = 0
@@ -185,14 +212,19 @@ class SpreadBreakoutDetector:
                 if st.narrow_count > 0:
                     st.narrow_count = 0
                     st._narrow_start_logged = False
+                    st._narrow_start_ts = 0.0
             return None
 
         # ── Phase 2: Three-stage confirmation ──────────────────────
 
-        # Timeout: 5s to complete all stages
+        # Timeout: 10s to complete all stages
         if time.time() - st.trigger_ts > CONFIRM_WINDOW_S:
-            log.debug("SPREAD_BREAKOUT_TIMEOUT | %s | phase=%d",
-                      match_title[:40], st.phase)
+            log.info("SPREAD_CONFIRM_FAIL | %s | spread_before=%.4f "
+                     "spread_after=%.4f | delta=%.4f | elapsed=%.1fs | "
+                     "phase=%d",
+                     match_title[:40], st.pre_widen_mid, mid,
+                     mid - st.pre_widen_mid,
+                     time.time() - st.trigger_ts, st.phase)
             self._reset_state(token_id)
             return None
 
