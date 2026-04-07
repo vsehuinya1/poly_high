@@ -257,3 +257,12 @@ NBA_TEAM_MAP = {
     "por": "Portland Trail Blazers", "sac": "Sacramento Kings", "sas": "San Antonio Spurs",
     "tor": "Toronto Raptors", "uta": "Utah Jazz", "was": "Washington Wizards",
 }
+
+# ── Cricket Discovery + Health (v7.0) ────────────────────────────────
+CRICKET_MIN_LIQUIDITY = 50_000          # minimum Gamma liquidity for discovery
+CRICKET_MAX_DISCOVERY_SPREAD = 0.10     # reject during discovery if spread > this
+CRICKET_HEALTH_INTERVAL_S = 60          # health log interval
+CRICKET_READINESS_SPREAD = 0.08         # live readiness spread threshold
+CRICKET_READINESS_TICK_RATE = 5         # minimum ticks/min for READY
+CRICKET_READINESS_PRICE_RANGE = 0.01    # minimum price_range_60s for READY
+CRICKET_READINESS_CHECK_INTERVAL_S = 300  # readiness check every 5 min

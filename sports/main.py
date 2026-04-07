@@ -68,6 +68,8 @@ from tennis.spread_breakout import SpreadBreakoutDetector
 from cricket import (
     CricketState, CricketFeed, CricketStrategy,
     CricketExecutionGuard, CricketCSVLogger,
+    CricketBookHealthMonitor, check_cricket_readiness,
+    ReadinessStatus, SpreadPhase, get_spread_phase,
 )
 from cricket.tick_strategy import CricketTickDetector
 from cricket.exit_manager import CricketExitManager
@@ -76,6 +78,7 @@ from sports.config import (
     CRICKET_MOMENTUM_RR_THRESH, CRICKET_MOMENTUM_EDGE,
     CRICKET_WICKET_EDGE, CRICKET_LATENCY_THRESH_MS,
     CRICKET_COOLDOWN_S,
+    CRICKET_READINESS_CHECK_INTERVAL_S,
 )
 
 log = logging.getLogger("sports.main")
@@ -435,6 +438,9 @@ class SportsOrchestrator:
         self._cricket_prev_spread: dict[str, float] = {}      # match_id → previous spread
         # v6.0: Tick-based reversion detector (no ESPN dependency)
         self.cricket_tick_detector = CricketTickDetector()
+        # v7.0: Book health monitor + readiness
+        self.cricket_health = CricketBookHealthMonitor()
+        self._cricket_readiness_status: dict[str, str] = {}  # match_id → last status
 
     async def discover(self) -> list[SportMarket]:
         """Discover active sports markets on Polymarket."""
@@ -571,32 +577,41 @@ class SportsOrchestrator:
                      tm.title, player_a_name, player_b_name,
                      price_a, price_b, fav_id, len(all_tids))
 
-        # ── Cricket market links ───────────────────────────────────
+        # ── Cricket market links (v7.0 — deterministic token assignment) ──
         self.cricket_markets = [m for m in self.markets if m.sport == "cricket"]
         for cm in self.cricket_markets:
             if cm.event_id in self.cricket_links:
                 continue
             
-            # Simple link building for cricket
+            # Deterministic token assignment: outcomes[0] → yes (home), outcomes[1] → no (away)
             all_tids = [o.token_id for o in cm.outcomes]
+            home_tid = cm.outcomes[0].token_id if len(cm.outcomes) >= 1 else ""
+            away_tid = cm.outcomes[1].token_id if len(cm.outcomes) >= 2 else ""
+
+            # Parse team names from title
+            home_name, away_name = self._parse_cricket_teams(cm.title)
+
             link = GameMarketLink(
                 game_id=cm.event_id,
                 sport="cricket",
                 league=cm.league,
-                home_team=cm.title, # placeholder until feed matches
-                away_team="",
+                home_team=home_name or cm.title,
+                away_team=away_name or "",
                 polymarket_event_id=cm.event_id,
                 polymarket_title=cm.title,
                 polymarket_slug=cm.slug,
+                home_token_id=home_tid,
+                away_token_id=away_tid,
                 all_token_ids=all_tids,
             )
-            # Try to identify home/away/draw tokens if possible
-            for o in cm.outcomes:
-                t = o.outcome_label.lower()
-                if "yes" in t or "win" in t: link.home_token_id = o.token_id
             
             self.cricket_links[cm.event_id] = link
-            log.info("CRICKET LINK: %s | tokens=%d", cm.title, len(all_tids))
+            log.info(
+                "CRICKET LINK: %s | tokens=%d | home_tid=%s | away_tid=%s",
+                cm.title, len(all_tids),
+                home_tid[:12] + '...' if home_tid else 'NONE',
+                away_tid[:12] + '...' if away_tid else 'NONE',
+            )
 
         log.info("matched %d games + %d tennis + %d cricket matches to Polymarket",
                  len(self.links), len(self.tennis_links), len(self.cricket_links))
@@ -1520,6 +1535,21 @@ class SportsOrchestrator:
                                 link.polymarket_title[:50],
                             )
                         continue
+
+                    # ── v7.0: Feed health monitor ─────────────────
+                    self.cricket_health.tick(
+                        match_id=match_id,
+                        mid=book.mid,
+                        spread=book.spread,
+                        bid=book.best_bid,
+                        ask=book.best_ask,
+                        ts=book.timestamp,
+                        market_title=link.polymarket_title,
+                    )
+
+                    # ── v7.0: Dead market skip (Part 6) ──────────
+                    if self.cricket_health.is_dead(match_id):
+                        continue  # skip detector entirely
                     market_price = book.mid
 
                     # ════════════════════════════════════════════════
@@ -1710,10 +1740,117 @@ class SportsOrchestrator:
                     )
                     last_health_log = now
 
+                # v7.0: Per-market health diagnostics (every 60s)
+                titles = {mid: lnk.polymarket_title
+                          for mid, lnk in self.cricket_links.items()}
+                self.cricket_health.log_health(market_titles=titles)
+
             except Exception as e:
                 log.error("cricket signal loop error: %s", e)
 
             await asyncio.sleep(POLYMARKET_SNAPSHOT_S)
+
+    async def _cricket_readiness_loop(self):
+        """Cricket readiness monitoring (v7.0).
+
+        Periodically checks all cricket markets for tradability.
+        Sends Telegram alerts at regular intervals and on status changes.
+        """
+        await asyncio.sleep(30)  # wait for initial discovery + first ticks
+        log.info("Cricket readiness loop started")
+
+        while not self._shutdown:
+            try:
+                for match_id, link in list(self.cricket_links.items()):
+                    # Determine spread phase
+                    # Try to parse match start time from endDate
+                    match_start_ts = 0.0
+                    if link.polymarket_slug:
+                        # For now, use current time as reference (pre-match = PRE)
+                        # Markets are discovered when active, so default LIVE
+                        pass
+
+                    # Default to LIVE phase (most conservative threshold)
+                    phase = SpreadPhase.LIVE
+
+                    result = check_cricket_readiness(
+                        match_id=match_id,
+                        token_ids=link.all_token_ids,
+                        books=self.poly_feed.books,
+                        health_monitor=self.cricket_health,
+                        phase=phase,
+                    )
+
+                    new_status = result.status.value  # "READY" or "NOT_READY"
+                    old_status = self._cricket_readiness_status.get(match_id, "")
+
+                    # Log readiness result
+                    if result.status == ReadinessStatus.READY:
+                        log.info(
+                            "CRICKET_READY | %s | spread=%.4f | "
+                            "tick_rate=%.0f | price_range=%.4f | "
+                            "last_tick_age=%.0fs",
+                            link.polymarket_title[:50],
+                            result.spread, result.tick_rate,
+                            result.price_range, result.last_tick_age,
+                        )
+                    else:
+                        log.info(
+                            "CRICKET_NOT_READY | %s | reason=%s | "
+                            "issues=%s | spread=%.4f | tick_rate=%.0f | "
+                            "price_range=%.4f | last_tick_age=%.0fs",
+                            link.polymarket_title[:50],
+                            result.reason.value if result.reason else "UNKNOWN",
+                            result.issues,
+                            result.spread, result.tick_rate,
+                            result.price_range, result.last_tick_age,
+                        )
+
+                    # Status change detection (Part 5: immediate alert)
+                    if old_status and old_status != new_status:
+                        log.warning(
+                            "CRICKET_STATUS_CHANGE | %s | %s → %s",
+                            link.polymarket_title[:50], old_status, new_status,
+                        )
+                        try:
+                            await self.engine.tg.notify_cricket_status_change(
+                                match_name=link.polymarket_title,
+                                old_status=old_status,
+                                new_status=new_status,
+                                spread=result.spread,
+                                tick_rate=result.tick_rate,
+                                price_range=result.price_range,
+                            )
+                        except Exception:
+                            pass
+                    elif not old_status:
+                        # First check — send initial status
+                        try:
+                            if result.status == ReadinessStatus.READY:
+                                await self.engine.tg.notify_cricket_ready(
+                                    match_name=link.polymarket_title,
+                                    spread=result.spread,
+                                    tick_rate=result.tick_rate,
+                                    price_range=result.price_range,
+                                )
+                            else:
+                                await self.engine.tg.notify_cricket_not_ready(
+                                    match_name=link.polymarket_title,
+                                    reason=result.reason.value if result.reason else "UNKNOWN",
+                                    issues=result.issues,
+                                    spread=result.spread,
+                                    tick_rate=result.tick_rate,
+                                    price_range=result.price_range,
+                                )
+                        except Exception:
+                            pass
+
+                    self._cricket_readiness_status[match_id] = new_status
+
+            except Exception as e:
+                log.error("cricket readiness loop error: %s", e)
+
+            await asyncio.sleep(CRICKET_READINESS_CHECK_INTERVAL_S)
 
     async def _status_printer_loop(self):
         """Periodically print system status + Telegram updates."""
@@ -1850,6 +1987,8 @@ class SportsOrchestrator:
             asyncio.create_task(self._tennis_signal_loop(), name="tennis_signals"),
             # Cricket — signal processing
             asyncio.create_task(self._cricket_signal_loop(), name="cricket_signals"),
+            # Cricket — readiness monitoring (v7.0)
+            asyncio.create_task(self._cricket_readiness_loop(), name="cricket_readiness"),
         ]
 
         # Graceful shutdown handler

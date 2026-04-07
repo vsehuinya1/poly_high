@@ -163,3 +163,44 @@ class TelegramNotifier:
             f"├ Links: {links} | Trades: {trades}\n"
             f"└ Daily PnL: ${daily_pnl:+.2f}"
         )
+
+    # ── Cricket Readiness Alerts (v7.0) ───────────────────────────
+
+    async def notify_cricket_ready(self, match_name: str, spread: float,
+                                    tick_rate: float, price_range: float):
+        await self.send(
+            f"🏏 <b>CRICKET READY ✅</b>\n"
+            f"Match: {match_name}\n"
+            f"Spread: {spread:.4f}\n"
+            f"Ticks: {tick_rate:.0f}/min\n"
+            f"Movement: {price_range:.4f}\n"
+            f"Market: ACTIVE"
+        )
+
+    async def notify_cricket_not_ready(self, match_name: str, reason: str,
+                                        issues: list[str], spread: float,
+                                        tick_rate: float, price_range: float):
+        issues_str = "\n".join(f"  • {i}" for i in issues) if issues else "  (none)"
+        await self.send(
+            f"🏏 <b>CRICKET NOT READY ❌</b>\n"
+            f"Match: {match_name}\n"
+            f"Reason: {reason}\n"
+            f"Issues:\n{issues_str}\n"
+            f"Spread: {spread:.4f}\n"
+            f"Ticks: {tick_rate:.0f}\n"
+            f"Movement: {price_range:.4f}"
+        )
+
+    async def notify_cricket_status_change(self, match_name: str,
+                                            old_status: str, new_status: str,
+                                            spread: float, tick_rate: float,
+                                            price_range: float):
+        emoji = "✅" if new_status == "READY" else "❌"
+        await self.send(
+            f"🏏 <b>CRICKET STATUS CHANGE {emoji}</b>\n"
+            f"Match: {match_name}\n"
+            f"{old_status} → {new_status}\n"
+            f"Spread: {spread:.4f}\n"
+            f"Ticks: {tick_rate:.0f}/min\n"
+            f"Movement: {price_range:.4f}"
+        )

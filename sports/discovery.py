@@ -27,6 +27,80 @@ CRICKET_NATIONS = {
     "kenya", "qatar", "bahrain", "botswana", "lesotho",
 }
 
+# ── IPL franchise names (robust fuzzy matching) ───────────────────────
+# All 10 current IPL teams + common abbreviations / short forms
+IPL_TEAMS = {
+    # Full names
+    "mumbai indians", "chennai super kings", "royal challengers bengaluru",
+    "royal challengers bangalore", "kolkata knight riders",
+    "sunrisers hyderabad", "rajasthan royals", "delhi capitals",
+    "punjab kings", "lucknow super giants", "gujarat titans",
+    # Short forms / abbreviations
+    "mumbai", "chennai", "kolkata", "hyderabad", "rajasthan",
+    "delhi", "punjab", "lucknow", "gujarat", "bengaluru", "bangalore",
+    # Abbreviation codes
+    "mi", "csk", "rcb", "kkr", "srh", "rr", "dc", "pbks", "lsg", "gt",
+}
+
+# City→franchise mapping for fuzzy matching
+_IPL_CITY_TO_TEAM = {
+    "mumbai": "mumbai indians", "chennai": "chennai super kings",
+    "bengaluru": "royal challengers bengaluru",
+    "bangalore": "royal challengers bangalore",
+    "kolkata": "kolkata knight riders", "hyderabad": "sunrisers hyderabad",
+    "rajasthan": "rajasthan royals", "jaipur": "rajasthan royals",
+    "delhi": "delhi capitals", "punjab": "punjab kings",
+    "mohali": "punjab kings", "lucknow": "lucknow super giants",
+    "gujarat": "gujarat titans", "ahmedabad": "gujarat titans",
+}
+
+
+def _is_ipl_match(title: str) -> bool:
+    """Check if a market title is an IPL match (contains two IPL team names).
+
+    Robust fuzzy matching:
+    - Checks full team names
+    - Checks city names
+    - Case-insensitive, handles 'vs.' and 'vs'
+    """
+    t = title.lower()
+    # Must have "vs" somewhere
+    has_vs = False
+    for sep in [" vs. ", " vs "]:
+        if sep in t:
+            has_vs = True
+            break
+    if not has_vs:
+        return False
+
+    # Count how many IPL team references appear
+    matches = 0
+    matched_teams = []
+    for team in IPL_TEAMS:
+        if len(team) <= 3:  # skip abbreviations for title matching (too short)
+            continue
+        if team in t:
+            matches += 1
+            matched_teams.append(team)
+            if matches >= 2:
+                log.info("DISCOVERY | IPL candidate: %s | teams=%s",
+                         title, matched_teams)
+                return True
+
+    # Fallback: check city names
+    for city in _IPL_CITY_TO_TEAM:
+        if len(city) <= 3:
+            continue
+        if city in t and city not in [m for m in matched_teams]:
+            matches += 1
+            matched_teams.append(city)
+            if matches >= 2:
+                log.info("DISCOVERY | IPL candidate (city): %s | teams=%s",
+                         title, matched_teams)
+                return True
+
+    return False
+
 
 def _is_cricket_match(title: str) -> bool:
     """Check if a market title contains two cricket nations (Team A vs Team B)."""
@@ -320,9 +394,138 @@ def extract_token_ids(market: dict) -> list[tuple[str, str]]:
     return results
 
 
+async def fetch_cricket_book(
+    session: aiohttp.ClientSession,
+    token_id: str,
+    clob_url: str = "https://clob.polymarket.com",
+) -> dict:
+    """Fetch REST orderbook for a single token. Returns {bid, ask, spread, mid}."""
+    try:
+        url = f"{clob_url}/book"
+        params = {"token_id": token_id}
+        async with session.get(
+            url, params=params,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status != 200:
+                return {"bid": 0, "ask": 0, "spread": 1.0, "mid": 0}
+            data = await resp.json()
+
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        bid = float(bids[0]["price"]) if bids else 0.0
+        ask = float(asks[0]["price"]) if asks else 0.0
+        spread = ask - bid if ask > bid else 1.0
+        mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
+        return {"bid": bid, "ask": ask, "spread": spread, "mid": mid}
+    except Exception as e:
+        log.warning("CRICKET_BOOK_FETCH_FAIL | token=%s | %s", token_id[:12], e)
+        return {"bid": 0, "ask": 0, "spread": 1.0, "mid": 0}
+
+
+def _cricket_match_key(title: str) -> str:
+    """Extract a normalized match key for grouping markets by match.
+
+    'Indian Premier League: Mumbai Indians vs Kolkata Knight Riders'
+    → 'mumbai indians vs kolkata knight riders'
+    """
+    t = title.lower()
+    # Strip league prefix before last ':'
+    if ":" in t:
+        t = t.rsplit(":", 1)[-1].strip()
+    # Strip prop suffix after ' - '
+    if " - " in t:
+        t = t.split(" - ", 1)[0].strip()
+    return t
+
+
+async def rank_cricket_markets(
+    session: aiohttp.ClientSession,
+    cricket_markets: list[SportMarket],
+) -> list[SportMarket]:
+    """Part 1: Group cricket markets by match, rank, select top 1 per match.
+
+    For each match group:
+      1. Fetch REST book for each candidate
+      2. Reject dead books (bid ≤ 0.02 AND ask ≥ 0.98, or spread ≥ 0.90)
+      3. Rank by: lowest spread → highest liquidity
+      4. Select top 1
+      5. Log rejections
+    """
+    if not cricket_markets:
+        return []
+
+    # Group by match key
+    groups: dict[str, list[SportMarket]] = {}
+    for m in cricket_markets:
+        key = _cricket_match_key(m.title)
+        groups.setdefault(key, []).append(m)
+
+    selected: list[SportMarket] = []
+
+    for match_key, candidates in groups.items():
+        log.info("CRICKET_RANK | match=%s | candidates=%d", match_key, len(candidates))
+
+        scored: list[tuple[SportMarket, float, float]] = []  # (market, spread, liquidity)
+
+        for mkt in candidates:
+            # Fetch REST book for the first token
+            if mkt.outcomes:
+                book_data = await fetch_cricket_book(session, mkt.outcomes[0].token_id)
+            else:
+                book_data = {"bid": 0, "ask": 0, "spread": 1.0, "mid": 0}
+
+            bid = book_data["bid"]
+            ask = book_data["ask"]
+            rest_spread = book_data["spread"]
+
+            # Reject dead books
+            if (bid <= 0.02 and ask >= 0.98) or rest_spread >= 0.90:
+                log.warning(
+                    "CRICKET_REJECT_DEAD_BOOK | %s | bid=%.2f ask=%.2f "
+                    "spread=%.4f | liq=$%.0f",
+                    mkt.title[:60], bid, ask, rest_spread, mkt.liquidity,
+                )
+                continue
+
+            scored.append((mkt, rest_spread, mkt.liquidity))
+            log.info(
+                "CRICKET_CANDIDATE | %s | spread=%.4f | bid=%.2f "
+                "ask=%.2f | liq=$%.0f",
+                mkt.title[:60], rest_spread, bid, ask, mkt.liquidity,
+            )
+
+        if not scored:
+            log.warning("CRICKET_RANK_EMPTY | match=%s | all candidates rejected", match_key)
+            continue
+
+        # Rank: lowest spread first, then highest liquidity
+        scored.sort(key=lambda x: (x[1], -x[2]))
+
+        # Select top 1
+        winner = scored[0][0]
+        selected.append(winner)
+        log.info(
+            "CRICKET_SELECTED | %s | spread=%.4f | liq=$%.0f",
+            winner.title[:60], scored[0][1], scored[0][2],
+        )
+
+        # Reject others
+        for mkt, spr, liq in scored[1:]:
+            log.info(
+                "CRICKET_REJECT_SECONDARY | %s | spread=%.4f | liq=$%.0f",
+                mkt.title[:60], spr, liq,
+            )
+
+    log.info("CRICKET_RANK_RESULT | selected=%d/%d markets",
+             len(selected), len(cricket_markets))
+    return selected
+
+
 async def discover_sports_markets(session: aiohttp.ClientSession) -> list[SportMarket]:
     """Fetch all active single-game sports markets from Polymarket Gamma API."""
     all_markets: list[SportMarket] = []
+    cricket_raw: list[SportMarket] = []  # cricket candidates before ranking
     seen_event_ids = set()
 
     for page in range(20):
@@ -397,19 +600,49 @@ async def discover_sports_markets(session: aiohttp.ClientSession) -> list[SportM
                 log.info("FOOTBALL_COMP_OK | sport=football | competition=%s | is_international=%s | %s",
                          league, is_international, title)
 
-            # ── Cricket prop filter — match-winner markets only (v4.9) ──
+            # ── Cricket discovery filter (v7.0 — rewritten) ──────────
             if sport == "cricket":
                 title_lower = title.lower()
                 CRICKET_PROP_KEYWORDS = [
                     "toss", "top batter", "top bowler", "runs",
                     "wickets", "over", "man of the match",
                     "first ball", "sixes", "fours", "boundaries",
+                    "highest", "most", "total", "innings",
                 ]
                 has_vs = " vs " in title_lower or " vs. " in title_lower
                 is_prop = any(kw in title_lower for kw in CRICKET_PROP_KEYWORDS)
                 if not has_vs or is_prop:
                     log.info("CRICKET_PROP_SKIP | %s | has_vs=%s is_prop=%s",
                              title, has_vs, is_prop)
+                    continue
+
+                # ── Binary only (outcomes == 2) ──
+                sub_m = event.get("markets", [])
+                if sub_m:
+                    raw_outcomes = sub_m[0].get("outcomes", "[]")
+                    if isinstance(raw_outcomes, str):
+                        try:
+                            n_outcomes = len(json.loads(raw_outcomes))
+                        except Exception:
+                            n_outcomes = 0
+                    else:
+                        n_outcomes = len(raw_outcomes)
+                    if n_outcomes != 2:
+                        log.info("CRICKET_SKIP_NON_BINARY | %s | outcomes=%d",
+                                 title, n_outcomes)
+                        continue
+
+                # ── Liquidity gate (≥ 50,000) ──
+                liq = float(event.get("liquidity", 0) or 0)
+                if liq < 50_000:
+                    log.info("CRICKET_SKIP_LOW_LIQ | %s | liq=$%.0f", title, liq)
+                    continue
+
+                # ── IPL team name match (robust fuzzy) ──
+                is_ipl = _is_ipl_match(title)
+                is_intl = _is_cricket_match(title)
+                if not is_ipl and not is_intl:
+                    log.info("CRICKET_SKIP_NO_TEAM_MATCH | %s", title)
                     continue
 
             # Process sub-markets within the event
@@ -441,7 +674,7 @@ async def discover_sports_markets(session: aiohttp.ClientSession) -> list[SportM
                 title=title,
                 sport=sport,
                 league=league,
-                end_date=event.get("endDate", "")[:10],
+                end_date=event.get("endDate", "")[:19],  # preserve time for readiness
                 outcomes=outcomes,
                 volume_24h=float(event.get("volume24hr", 0) or 0),
                 liquidity=float(event.get("liquidity", 0) or 0),
@@ -450,13 +683,26 @@ async def discover_sports_markets(session: aiohttp.ClientSession) -> list[SportM
                 home_team=home_team,
                 away_team=away_team,
             )
-            all_markets.append(sm)
 
-        log.info("discovery page %d: %d sports markets so far", page + 1, len(all_markets))
+            # Cricket goes to separate ranking pipeline
+            if sport == "cricket":
+                cricket_raw.append(sm)
+            else:
+                all_markets.append(sm)
+
+        log.info("discovery page %d: %d sports markets so far (+ %d cricket candidates)",
+                 page + 1, len(all_markets), len(cricket_raw))
 
         # If very few results, stop early
         if len(events) < 100:
             break
+
+    # ── Cricket: rank and select top 1 per match ─────────────────────
+    if cricket_raw:
+        selected_cricket = await rank_cricket_markets(session, cricket_raw)
+        all_markets.extend(selected_cricket)
+        log.info("cricket discovery: %d candidates → %d selected",
+                 len(cricket_raw), len(selected_cricket))
 
     log.info("discovered %d single-game sports markets", len(all_markets))
     return all_markets
