@@ -70,6 +70,7 @@ from cricket import (
     CricketExecutionGuard, CricketCSVLogger,
     CricketBookHealthMonitor, check_cricket_readiness,
     ReadinessStatus, SpreadPhase, get_spread_phase,
+    FailureReason, get_liquidity_threshold,
 )
 from cricket.tick_strategy import CricketTickDetector
 from cricket.exit_manager import CricketExitManager
@@ -1547,9 +1548,21 @@ class SportsOrchestrator:
                         market_title=link.polymarket_title,
                     )
 
+                    # ── v2.0: CRICKET_TICK_ACTIVE logging ──────────
+                    tracker = self.cricket_health.get_tracker(match_id)
+                    if tracker:
+                        self.cricket_health.log_tick_active(
+                            match_id, link.polymarket_title, tracker,
+                        )
+
                     # ── v7.0: Dead market skip (Part 6) ──────────
                     if self.cricket_health.is_dead(match_id):
                         continue  # skip detector entirely
+
+                    # ── v2.0: WARMUP gate — subscribed but don't trade ──
+                    if self.cricket_health.is_warmup(match_id):
+                        continue  # ticks feed health monitor but no signals
+
                     market_price = book.mid
 
                     # ════════════════════════════════════════════════
@@ -1823,6 +1836,21 @@ class SportsOrchestrator:
                             )
                         except Exception:
                             pass
+
+                        # ── v2.0: TG alert on late activation ──────
+                        if (new_status == "READY" and
+                                self.cricket_health.was_late_activated(match_id)):
+                            try:
+                                await self.engine.tg.send(
+                                    f"🏏 <b>CRICKET LIVE READY</b>\n"
+                                    f"Match: {link.polymarket_title}\n"
+                                    f"Spread: {result.spread:.4f}\n"
+                                    f"Ticks/min: {result.tick_rate:.0f}\n"
+                                    f"Status: ACTIVE (late-activated)"
+                                )
+                            except Exception:
+                                pass
+
                     elif not old_status:
                         # First check — send initial status
                         try:

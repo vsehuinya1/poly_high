@@ -1,9 +1,8 @@
 """
 Cricket Market Health Monitor + Readiness Engine + Dead Market Detection.
 
-Parts 3, 4, 6 of the cricket market discovery fix.
-
-v1.0 — 2026-04-07
+v2.0 — 2026-04-09  Late-liquidity activation, WARMUP phase, dead→alive recovery
+v1.0 — 2026-04-07  Initial health monitor + readiness engine
 """
 from __future__ import annotations
 
@@ -15,6 +14,22 @@ from enum import Enum
 from typing import Optional
 
 log = logging.getLogger("cricket.health")
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Dynamic Liquidity Thresholds (v2.0)
+# ═══════════════════════════════════════════════════════════════════════
+
+# Minimum liquidity (USD) by time window relative to match start
+# Before T-60:  20k  (loose — early discovery)
+# T-60 → T+30:  10k  (loosest — catch late-populating markets)
+# After T+30:   50k  (strict — must be genuinely active)
+LIQUIDITY_THRESHOLD_PRE = 20_000
+LIQUIDITY_THRESHOLD_MATCH = 10_000
+LIQUIDITY_THRESHOLD_LIVE = 50_000
+
+# Warmup spread: subscribe but don't trade until spread ≤ this
+WARMUP_MAX_SPREAD = 0.20  # subscribe when ≤ 0.20
+TRADE_READY_SPREAD = 0.08  # allow trades when ≤ 0.08
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -38,6 +53,7 @@ class FailureReason(Enum):
     NO_MOVEMENT  = "NO_MOVEMENT"
     LOW_TICKS    = "LOW_TICKS"
     BAD_MAPPING  = "BAD_MAPPING"
+    WARMUP       = "WARMUP"       # v2.0: subscribed but spread too wide for trading
 
 
 @dataclass
@@ -117,19 +133,31 @@ class _MarketTracker:
 class CricketBookHealthMonitor:
     """Tracks per-market health and logs diagnostics every 60s.
 
-    Also implements dead market detection (Part 6).
+    Also implements dead market detection (Part 6) and dead→alive
+    recovery with CRICKET_LATE_ACTIVATION logging (v2.0).
     """
 
     HEALTH_LOG_INTERVAL_S = 60.0
     # Dead market thresholds (Part 6)
     DEAD_PERSIST_S = 60.0  # condition must persist > 60s
     DEAD_PRICE_RANGE = 0.005  # price_range_60s < this = no movement
+    # Recovery thresholds (v2.0) — to prevent flip-flopping
+    RECOVERY_SPREAD_MAX = 0.15   # must tighten below this
+    RECOVERY_PRICE_RANGE_MIN = 0.005  # must show some movement
+    RECOVERY_PERSIST_S = 30.0  # alive conditions must persist 30s
+    # CRICKET_TICK_ACTIVE logging interval
+    TICK_ACTIVE_LOG_S = 120.0
 
     def __init__(self):
         self._trackers: dict[str, _MarketTracker] = {}
         self._last_health_log: float = 0.0
         self._dead_markets: set[str] = set()
         self._last_status: dict[str, MarketHealth] = {}  # for change detection
+        # v2.0: recovery tracking
+        self._recovery_since: dict[str, float] = {}  # match_id → timestamp
+        self._warmup_markets: set[str] = set()  # markets in WARMUP state
+        self._activated_markets: set[str] = set()  # markets that transitioned DEAD→ALIVE
+        self._last_tick_active_log: dict[str, float] = {}  # per-market active tick logging
 
     def _get_tracker(self, match_id: str) -> _MarketTracker:
         if match_id not in self._trackers:
@@ -206,13 +234,83 @@ class CricketBookHealthMonitor:
                         now - tracker._dead_since,
                     )
                 tracker.health = MarketHealth.DEAD
+            # Clear recovery tracking while dead
+            self._recovery_since.pop(match_id, None)
         else:
-            tracker._dead_since = 0.0
-            self._dead_markets.discard(match_id)
+            # ── v2.0: Dead → Alive recovery ──────────────────────
+            if match_id in self._dead_markets:
+                # Check recovery conditions: spread tightened + some movement
+                spread_ok = tracker.last_spread <= self.RECOVERY_SPREAD_MAX
+                move_ok = tracker.price_range_60s >= self.RECOVERY_PRICE_RANGE_MIN
+                if spread_ok and move_ok:
+                    if match_id not in self._recovery_since:
+                        self._recovery_since[match_id] = now
+                    elif now - self._recovery_since[match_id] > self.RECOVERY_PERSIST_S:
+                        # Confirmed recovery — remove from dead set
+                        self._dead_markets.discard(match_id)
+                        self._recovery_since.pop(match_id, None)
+                        self._activated_markets.add(match_id)
+                        log.warning(
+                            "CRICKET_LATE_ACTIVATION | %s | bid=%.3f ask=%.3f "
+                            "spread=%.4f | price_range=%.4f | "
+                            "was_dead_for=%.0fs",
+                            match_id, tracker.last_bid, tracker.last_ask,
+                            tracker.last_spread, tracker.price_range_60s,
+                            now - tracker._dead_since if tracker._dead_since > 0 else 0,
+                        )
+                        tracker._dead_since = 0.0
+                else:
+                    self._recovery_since.pop(match_id, None)
+            else:
+                tracker._dead_since = 0.0
 
     def is_dead(self, match_id: str) -> bool:
         """Check if a market is marked DEAD (Part 6)."""
         return match_id in self._dead_markets
+
+    def is_warmup(self, match_id: str) -> bool:
+        """v2.0: Check if market is in WARMUP state (subscribed but not tradable)."""
+        return match_id in self._warmup_markets
+
+    def set_warmup(self, match_id: str) -> None:
+        """Mark market as WARMUP."""
+        self._warmup_markets.add(match_id)
+
+    def clear_warmup(self, match_id: str) -> None:
+        """Remove WARMUP flag — market is now fully tradable."""
+        self._warmup_markets.discard(match_id)
+
+    def was_late_activated(self, match_id: str) -> bool:
+        """Check if market was dead and then recovered (v2.0)."""
+        return match_id in self._activated_markets
+
+    def log_tick_active(self, match_id: str, market_title: str,
+                        tracker: '_MarketTracker') -> None:
+        """v2.0: Log CRICKET_TICK_ACTIVE for markets with real price movement.
+
+        Only logs if:
+         - mid deviates from 0.50 (real price discovery)
+         - price_range > 0 (not flat)
+         - rate limited to every 120s per market
+        """
+        now = time.time()
+        if now - self._last_tick_active_log.get(match_id, 0) < self.TICK_ACTIVE_LOG_S:
+            return
+
+        # Only log if mid is NOT stuck at 0.50 (dead default)
+        mid_real = abs(tracker.last_mid - 0.50) > 0.01
+        has_movement = tracker.price_range_60s > 0.001
+
+        if mid_real or has_movement:
+            self._last_tick_active_log[match_id] = now
+            log.info(
+                "CRICKET_TICK_ACTIVE | %s | mid=%.4f | spread=%.4f | "
+                "ticks/min=%.0f | price_range=%.4f | late_activated=%s",
+                market_title[:50],
+                tracker.last_mid, tracker.last_spread,
+                tracker.tick_rate, tracker.price_range_60s,
+                match_id in self._activated_markets,
+            )
 
     def log_health(self, market_titles: dict[str, str] | None = None) -> None:
         """Log per-market health every 60s."""
@@ -244,15 +342,17 @@ class CricketBookHealthMonitor:
 # ═══════════════════════════════════════════════════════════════════════
 
 class SpreadPhase(Enum):
-    PRE   = "PRE"    # T-60 → T-5
-    EARLY = "EARLY"  # first ~10 min of match
-    LIVE  = "LIVE"   # steady-state live
+    PRE    = "PRE"     # T-60 → T-5
+    EARLY  = "EARLY"   # first ~10 min of match
+    LIVE   = "LIVE"    # steady-state live
+    WARMUP = "WARMUP"  # v2.0: subscribed but not tradable yet
 
 # Phase → max allowed spread
 SPREAD_THRESHOLDS = {
-    SpreadPhase.PRE:   0.15,
-    SpreadPhase.EARLY: 0.12,
-    SpreadPhase.LIVE:  0.08,
+    SpreadPhase.PRE:    0.15,
+    SpreadPhase.EARLY:  0.12,
+    SpreadPhase.LIVE:   0.08,
+    SpreadPhase.WARMUP: 0.20,  # v2.0: allow subscription at wide spread
 }
 
 
@@ -346,6 +446,20 @@ def check_cricket_readiness(
     if spread > max_spread:
         issues.append(f"spread {spread:.4f} > {max_spread:.2f} ({phase.value})")
 
+    # 5b. v2.0: WARMUP check — spread ≤ 0.20 but > 0.08 → subscribe, don't trade
+    if spread <= WARMUP_MAX_SPREAD and spread > TRADE_READY_SPREAD:
+        if health_monitor:
+            health_monitor.set_warmup(match_id)
+        return ReadinessResult(
+            status=ReadinessStatus.NOT_READY,
+            reason=FailureReason.WARMUP,
+            issues=[f"WARMUP: spread {spread:.4f} ≤ 0.20 but > 0.08"],
+            spread=spread, tick_rate=tick_rate,
+            price_range=price_range, last_tick_age=last_tick_age,
+        )
+    elif spread <= TRADE_READY_SPREAD and health_monitor:
+        health_monitor.clear_warmup(match_id)
+
     # 6. Tick rate ≥ 5/min
     if tick_rate < 5:
         issues.append(f"tick_rate {tick_rate:.0f} < 5/min")
@@ -382,3 +496,26 @@ def check_cricket_readiness(
         spread=spread, tick_rate=tick_rate,
         price_range=price_range, last_tick_age=last_tick_age,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Dynamic Liquidity Helper (v2.0)
+# ═══════════════════════════════════════════════════════════════════════
+
+def get_liquidity_threshold(match_start_ts: float,
+                            now: float | None = None) -> float:
+    """Return minimum liquidity threshold based on proximity to match start.
+
+    Before T-60:  $20k (loose — allows early discovery)
+    T-60 → T+30:  $10k (loosest — catch late-populating markets)
+    After T+30:   $50k (strict — must be genuinely active)
+    """
+    if now is None:
+        now = time.time()
+    dt = now - match_start_ts  # seconds since match start
+    if dt < -3600:       # more than 60 min before start
+        return LIQUIDITY_THRESHOLD_PRE
+    elif dt <= 1800:     # T-60 to T+30
+        return LIQUIDITY_THRESHOLD_MATCH
+    else:                # after T+30
+        return LIQUIDITY_THRESHOLD_LIVE
