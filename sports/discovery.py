@@ -154,6 +154,7 @@ class SportMarket:
     game_id: str = ""           # API-Football fixture ID or NBA game ID
     home_team: str = ""
     away_team: str = ""
+    initial_state: str = "ACTIVE"  # "ACTIVE" or "DEAD" (v2.0)
 
     @property
     def all_token_ids(self) -> list[str]:
@@ -479,39 +480,36 @@ async def rank_cricket_markets(
             ask = book_data["ask"]
             rest_spread = book_data["spread"]
 
-            # Reject dead books
-            if (bid <= 0.02 and ask >= 0.98) or rest_spread >= 0.90:
-                log.warning(
-                    "CRICKET_REJECT_DEAD_BOOK | %s | bid=%.2f ask=%.2f "
-                    "spread=%.4f | liq=$%.0f",
-                    mkt.title[:60], bid, ask, rest_spread, mkt.liquidity,
-                )
-                continue
-
-            scored.append((mkt, rest_spread, mkt.liquidity))
+            # v2.0: Tag dead books instead of rejecting
+            is_dead_book = (bid <= 0.02 and ask >= 0.98) or rest_spread >= 0.90
+            
+            scored.append((mkt, rest_spread, mkt.liquidity, is_dead_book))
             log.info(
                 "CRICKET_CANDIDATE | %s | spread=%.4f | bid=%.2f "
-                "ask=%.2f | liq=$%.0f",
-                mkt.title[:60], rest_spread, bid, ask, mkt.liquidity,
+                "ask=%.2f | liq=$%.0f | dead=%s",
+                mkt.title[:60], rest_spread, bid, ask, mkt.liquidity, is_dead_book
             )
 
         if not scored:
-            log.warning("CRICKET_RANK_EMPTY | match=%s | all candidates rejected", match_key)
+            log.warning("CRICKET_RANK_EMPTY | match=%s | no candidates", match_key)
             continue
 
         # Rank: lowest spread first, then highest liquidity
         scored.sort(key=lambda x: (x[1], -x[2]))
 
         # Select top 1
-        winner = scored[0][0]
+        winner, win_spr, win_liq, win_dead = scored[0]
+        if win_dead:
+            winner.initial_state = "DEAD"
+            
         selected.append(winner)
         log.info(
-            "CRICKET_SELECTED | %s | spread=%.4f | liq=$%.0f",
-            winner.title[:60], scored[0][1], scored[0][2],
+            "CRICKET_SELECTED | %s | spread=%.4f | liq=$%.0f | initial_state=%s",
+            winner.title[:60], win_spr, win_liq, winner.initial_state,
         )
 
         # Reject others
-        for mkt, spr, liq in scored[1:]:
+        for mkt, spr, liq, dead in scored[1:]:
             log.info(
                 "CRICKET_REJECT_SECONDARY | %s | spread=%.4f | liq=$%.0f",
                 mkt.title[:60], spr, liq,
@@ -632,9 +630,10 @@ async def discover_sports_markets(session: aiohttp.ClientSession) -> list[SportM
                                  title, n_outcomes)
                         continue
 
-                # ── Liquidity gate (≥ 50,000) ──
+                # ── Liquidity gate (≥ 10,000) ──
+                # Reduced for v2.0 late-liquidity rescan support
                 liq = float(event.get("liquidity", 0) or 0)
-                if liq < 50_000:
+                if liq < 10_000:
                     log.info("CRICKET_SKIP_LOW_LIQ | %s | liq=$%.0f", title, liq)
                     continue
 
