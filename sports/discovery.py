@@ -630,10 +630,10 @@ async def discover_sports_markets(session: aiohttp.ClientSession) -> list[SportM
                                  title, n_outcomes)
                         continue
 
-                # ── Liquidity gate (≥ 10,000) ──
+                # ── Liquidity gate (≥ 5,000) ──
                 # Reduced for v2.0 late-liquidity rescan support
                 liq = float(event.get("liquidity", 0) or 0)
-                if liq < 10_000:
+                if liq < 5_000:
                     log.info("CRICKET_SKIP_LOW_LIQ | %s | liq=$%.0f", title, liq)
                     continue
 
