@@ -391,12 +391,17 @@ class TennisExitManager:
                     continue
 
             # 5. TIMEOUT — 10 min hard cap (after min hold)
+            #    v8.0: Skip timeout when runner is active and profitable —
+            #    let the trailing stop capture multi-R moves.
             if elapsed >= self.TIMEOUT_S:
-                _capture_spread()
-                self._close_trade(trade, exit_price=mkt,
-                                  exit_reason="EXIT_TIMEOUT",
-                                  exit_score=score)
-                continue
+                if trade.runner_v2_active and mkt > trade.entry_price:
+                    pass  # runner rides — trail stop will handle exit
+                else:
+                    _capture_spread()
+                    self._close_trade(trade, exit_price=mkt,
+                                      exit_reason="EXIT_TIMEOUT",
+                                      exit_score=score)
+                    continue
 
     # ── Internal ────────────────────────────────────────────────
 
