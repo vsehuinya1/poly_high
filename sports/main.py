@@ -1093,7 +1093,7 @@ class SportsOrchestrator:
                             # ═══ GLOBAL EDGE GUARD (v6.0) ═══
                             sb_edge = sb_sig.get("edge", 0)
                             can_exec, block_reason = validate_trade_execution(
-                                edge=sb_edge if sb_edge > 0 else abs(sb_sig["entry_price"] - sb_sig.get("pre_widen_mid", sb_sig["entry_price"])),
+                                edge=sb_edge if sb_edge > 0 else max(abs(sb_sig["entry_price"] - sb_sig.get("pre_widen_mid", sb_sig["entry_price"])), 0.01),
                                 price=sb_sig["entry_price"],
                                 sport="tennis_sb",
                                 context=f"SPREAD_BREAKOUT {sb_sig['direction']} | {sb_link.polymarket_title[:50]}",
