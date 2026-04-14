@@ -124,9 +124,11 @@ class TennisExitManager:
     Call check_all() on every tick.
     """
 
-    # ── Runner V2 Parameters ─────────────────────────────────────
-    RUNNER_V2_MFE_THRESHOLD = 0.03   # 3% MFE before trailing activates
-    RUNNER_V2_TRAIL_PCT = 0.50       # give back up to 50% of gains
+    # ── Runner V2 Parameters (v8.1) ───────────────────────────────
+    RUNNER_V2_MFE_THRESHOLD = 0.06   # 6% MFE before trailing activates
+    RUNNER_V2_TRAIL_PCT = 0.30       # give back up to 30% of gains
+    RUNNER_V2_TRAIL_PCT_LATE = 0.20  # tighten to 20% after 20 minutes
+    RUNNER_V2_LATE_S = 1200.0        # 20 minutes
     RUNNER_V2_CONFIRM_TICKS = 2      # consecutive adverse ticks to confirm reversal
 
     # ── Risk Control (v6.0) ──────────────────────────────────────
@@ -378,7 +380,11 @@ class TennisExitManager:
 
             # 4. RUNNER_V2 trailing stop (confirmed reversal)
             if trade.runner_v2_active:
-                trail_level = trade.mfe * self.RUNNER_V2_TRAIL_PCT
+                # v8.1: time-based tightening — less giveback after 20min
+                trail_pct = self.RUNNER_V2_TRAIL_PCT
+                if elapsed > self.RUNNER_V2_LATE_S:
+                    trail_pct = self.RUNNER_V2_TRAIL_PCT_LATE
+                trail_level = trade.mfe * trail_pct
                 exit_threshold = trade.entry_price + trail_level
 
                 if (mkt <= exit_threshold

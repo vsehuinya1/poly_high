@@ -1138,17 +1138,8 @@ class SportsOrchestrator:
                                 entry_price=sb_sig["entry_price"],
                                 direction=sb_sig["direction"],
                             )
-                            # Telegram notification
-                            try:
-                                await self.engine.tg.send(
-                                    f"🎾 <b>Spread Breakout [PAPER]</b>\n"
-                                    f"Direction: {sb_sig['direction']}\n"
-                                    f"Price: {sb_sig['entry_price']:.4f}\n"
-                                    f"Pre-widen: {sb_sig['pre_widen_mid']:.4f}\n"
-                                    f"Match: {sb_sig['match_title']}"
-                                )
-                            except Exception:
-                                pass
+                            # v8.1: Spread breakout TG notifications removed (noise)
+                            # Logging and execution remain active.
 
                 # ── Spread Breakout: exit checks (v5.2) ────────────
                 def _sb_get_price(tid):
@@ -1157,17 +1148,10 @@ class SportsOrchestrator:
 
                 sb_closed = self.sb_detector.check_exits(_sb_get_price)
                 for sbt in sb_closed:
-                    try:
-                        r_str = f"{sbt.r_multiple:+.4f}"
-                        await self.engine.tg.send(
-                            f"➖ <b>Spread Breakout Exit [PAPER]</b>\n"
-                            f"Player: {sbt.player}\n"
-                            f"Reason: {sbt.exit_reason}\n"
-                            f"Entry: {sbt.entry_price:.4f} → Exit: {sbt.exit_price:.4f}\n"
-                            f"R: {r_str} | Duration: {sbt.duration_s:.0f}s"
-                        )
-                    except Exception:
-                        pass
+                    # v8.1: Spread breakout exit TG removed (noise) — log only
+                    log.info("SB_EXIT | %s | %s | entry=%.4f exit=%.4f R=%s | dur=%.0fs",
+                             sbt.player, sbt.exit_reason, sbt.entry_price,
+                             sbt.exit_price, f"{sbt.r_multiple:+.4f}", sbt.duration_s)
 
                 # ── Exit Manager: check all open trades ───────────
                 self._tennis_check_exits()
