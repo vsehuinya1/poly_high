@@ -414,8 +414,11 @@ class SportsOrchestrator:
         self.tennis_states: dict[str, TennisState] = {}  # match_id → latest state
         self._tennis_fs_map: dict[str, str] = {}  # poly_event_id → flashscore_match_id
 
-        # ── Spread Breakout Detector (v5.2) ────────────────────────
+        # ── Spread Breakout Detector (v5.2) ────────────────────
         self.sb_detector = SpreadBreakoutDetector()
+        # v7.1: Real price-change tracking for stale market filter
+        self._tennis_last_price: dict[str, tuple] = {}    # token_id → (bid, ask)
+        self._tennis_price_change_ts: dict[str, float] = {}  # token_id → last change ts
 
         # ── Cricket Engine (Paper Only) ───────────────────────────
         self.cricket_feed = CricketFeed()
@@ -890,6 +893,13 @@ class SportsOrchestrator:
 
                     market_price = fav_book.mid
 
+                    # v7.1: Track real price changes (not heartbeats)
+                    _prev = self._tennis_last_price.get(fav_token)
+                    _cur = (fav_book.best_bid, fav_book.best_ask)
+                    if _prev != _cur:
+                        self._tennis_price_change_ts[fav_token] = time.time()
+                        self._tennis_last_price[fav_token] = _cur
+
                     # ── v4.6.5: Pending entry fast-path ───────────────
                     # If we already have a pending entry for this match,
                     # bypass strategy.evaluate() (which has state dedup
@@ -954,12 +964,12 @@ class SportsOrchestrator:
                                         market_price, link.polymarket_title[:40])
                             continue
 
-                        # ── v7.1: Stale market filter ──────────────────
-                        tick_age = time.time() - fav_book.timestamp if fav_book else 999
-                        if tick_age > 10:
+                        # ── v7.1: Price-change activity filter ─────────
+                        price_age = time.time() - self._tennis_price_change_ts.get(fav_token, 0)
+                        if price_age > 10:
                             log.info(
-                                "TENNIS_BLOCK_REASON | %s | reason=STALE_MARKET | last_tick_age=%.1fs",
-                                link.polymarket_title[:40], tick_age,
+                                "TENNIS_BLOCK_REASON | %s | reason=NO_PRICE_MOVEMENT | price_age=%.1fs",
+                                link.polymarket_title[:40], price_age,
                             )
                             continue
 
@@ -1110,12 +1120,12 @@ class SportsOrchestrator:
                             if not can_exec:
                                 continue
 
-                            # ── v7.1: Stale market filter ──────────────
-                            sb_tick_age = time.time() - sb_book.timestamp if sb_book else 999
-                            if sb_tick_age > 10:
+                            # ── v7.1: Price-change activity filter ────
+                            sb_price_age = time.time() - self._tennis_price_change_ts.get(sb_tid, 0)
+                            if sb_price_age > 10:
                                 log.info(
-                                    "TENNIS_BLOCK_REASON | %s | reason=STALE_MARKET | last_tick_age=%.1fs",
-                                    sb_link.polymarket_title[:40], sb_tick_age,
+                                    "TENNIS_BLOCK_REASON | %s | reason=NO_PRICE_MOVEMENT | price_age=%.1fs",
+                                    sb_link.polymarket_title[:40], sb_price_age,
                                 )
                                 continue
 
