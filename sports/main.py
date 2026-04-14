@@ -442,6 +442,9 @@ class SportsOrchestrator:
         # v7.0: Book health monitor + readiness
         self.cricket_health = CricketBookHealthMonitor()
         self._cricket_readiness_status: dict[str, str] = {}  # match_id → last status
+        # v7.1: Runtime state tracking (DEAD → ACTIVE activation)
+        self._cricket_runtime_state: dict[str, str] = {}     # match_id → DEAD/ACTIVE
+        self._cricket_state_log_ts: dict[str, float] = {}    # throttled state logging
 
     async def discover(self) -> list[SportMarket]:
         """Discover active sports markets on Polymarket."""
@@ -607,11 +610,15 @@ class SportsOrchestrator:
             )
             
             self.cricket_links[cm.event_id] = link
+            # v7.1: Initialize runtime state from discovery
+            init_state = getattr(cm, 'initial_state', 'ACTIVE')
+            self._cricket_runtime_state[cm.event_id] = init_state
             log.info(
-                "CRICKET LINK: %s | tokens=%d | home_tid=%s | away_tid=%s",
+                "CRICKET LINK: %s | tokens=%d | home_tid=%s | away_tid=%s | state=%s",
                 cm.title, len(all_tids),
                 home_tid[:12] + '...' if home_tid else 'NONE',
                 away_tid[:12] + '...' if away_tid else 'NONE',
+                init_state,
             )
 
         log.info("matched %d games + %d tennis + %d cricket matches to Polymarket",
@@ -1548,20 +1555,32 @@ class SportsOrchestrator:
                         market_title=link.polymarket_title,
                     )
 
-                    # ── v2.0: CRICKET_TICK_ACTIVE logging ──────────
-                    tracker = self.cricket_health.get_tracker(match_id)
-                    if tracker:
-                        self.cricket_health.log_tick_active(
-                            match_id, link.polymarket_title, tracker,
+                    # ── v7.1: Simple activation (DEAD → ACTIVE) ──
+                    rt_state = self._cricket_runtime_state.get(match_id, "ACTIVE")
+                    spread = book.spread
+                    if rt_state == "DEAD":
+                        if spread <= 0.12 and book.best_bid > 0.05 and book.best_ask < 0.95:
+                            self._cricket_runtime_state[match_id] = "ACTIVE"
+                            rt_state = "ACTIVE"
+                            log.info(
+                                "CRICKET_ACTIVATED | %s | spread=%.4f | bid=%.2f ask=%.2f",
+                                link.polymarket_title[:60], spread,
+                                book.best_bid, book.best_ask,
+                            )
+
+                    # ── v7.1: State visibility (throttled 60s) ────
+                    now_st = time.time()
+                    if now_st - self._cricket_state_log_ts.get(match_id, 0) > 60:
+                        self._cricket_state_log_ts[match_id] = now_st
+                        log.info(
+                            "CRICKET_STATE | %s | state=%s | spread=%.4f | bid=%.2f ask=%.2f",
+                            link.polymarket_title[:60], rt_state, spread,
+                            book.best_bid, book.best_ask,
                         )
 
-                    # ── v7.0: Dead market skip (Part 6) ──────────
-                    if self.cricket_health.is_dead(match_id):
-                        continue  # skip detector entirely
-
-                    # ── v2.0: WARMUP gate — subscribed but don't trade ──
-                    if self.cricket_health.is_warmup(match_id):
-                        continue  # ticks feed health monitor but no signals
+                    # ── v7.1: Gate — only evaluate signals for ACTIVE markets ──
+                    if rt_state != "ACTIVE":
+                        continue
 
                     market_price = book.mid
 
