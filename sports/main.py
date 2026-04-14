@@ -954,6 +954,15 @@ class SportsOrchestrator:
                                         market_price, link.polymarket_title[:40])
                             continue
 
+                        # ── v7.1: Stale market filter ──────────────────
+                        tick_age = time.time() - fav_book.timestamp if fav_book else 999
+                        if tick_age > 10:
+                            log.info(
+                                "TENNIS_BLOCK_REASON | %s | reason=STALE_MARKET | last_tick_age=%.1fs",
+                                link.polymarket_title[:40], tick_age,
+                            )
+                            continue
+
                         log.info("TENNIS_DELAYED_ENTRY | delay=%.0fs confirm=%d edge=%.4f | %s",
                                  entry_delay_actual, confirm_at_entry,
                                  current_edge, link.polymarket_title[:40])
@@ -1099,6 +1108,15 @@ class SportsOrchestrator:
                                 context=f"SPREAD_BREAKOUT {sb_sig['direction']} | {sb_link.polymarket_title[:50]}",
                             )
                             if not can_exec:
+                                continue
+
+                            # ── v7.1: Stale market filter ──────────────
+                            sb_tick_age = time.time() - sb_book.timestamp if sb_book else 999
+                            if sb_tick_age > 10:
+                                log.info(
+                                    "TENNIS_BLOCK_REASON | %s | reason=STALE_MARKET | last_tick_age=%.1fs",
+                                    sb_link.polymarket_title[:40], sb_tick_age,
+                                )
                                 continue
 
                             # Register trade for exit tracking
