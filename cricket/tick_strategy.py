@@ -42,7 +42,7 @@ PRICE_CEIL = 0.80
 STALE_TICK_S = 60.0
 
 # Spike Continuation
-SPIKE_MIN_MOVE = 0.04       # minimum price move for spike
+SPIKE_MIN_MOVE = 0.02       # minimum price move for spike
 SPIKE_WINDOW_S = 60.0       # spike must occur within 60s
 SPIKE_CONFIRM_MIN_S = 5.0   # wait at least 5s after spike
 SPIKE_CONFIRM_MAX_S = 10.0  # don't wait longer than 10s
@@ -51,7 +51,7 @@ SPIKE_MAX_SPREAD = 0.04     # spread must be ≤ 0.04 at entry
 SPIKE_MIN_CONTRACTION = 2   # spread must contract for ≥ 2 consecutive ticks
 
 # Momentum Drift
-DRIFT_MIN_MOVE = 0.04       # net move over window
+DRIFT_MIN_MOVE = 0.015      # net move over window
 DRIFT_WINDOW_MIN_S = 120.0  # minimum lookback
 DRIFT_WINDOW_MAX_S = 300.0  # maximum lookback
 DRIFT_SMOOTH_RATIO = 0.60   # net/range > 0.60
