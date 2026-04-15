@@ -75,7 +75,7 @@ class TelegramNotifier:
 
     async def notify_startup(self, n_markets: int, n_links: int, n_tokens: int):
         await self.send(
-            f"🏀 <b>Sports System Started</b>\n"
+            f"🚀 <b>Sports System Started (v8.3)</b>\n"
             f"├ Markets: {n_markets}\n"
             f"├ Linked games: {n_links}\n"
             f"├ WS tokens: {n_tokens}\n"

@@ -2029,9 +2029,24 @@ class SportsOrchestrator:
         all_tokens = []
         for link in self.links.values():
             all_tokens.extend(link.all_token_ids)
-        await self.engine.tg.notify_startup(
-            len(self.markets), len(self.links), len(all_tokens)
-        )
+        log.info("STARTUP_TG_SENDING | markets=%d links=%d tokens=%d",
+                 len(self.markets), len(self.links), len(all_tokens))
+        try:
+            await self.engine.tg.notify_startup(
+                len(self.markets), len(self.links), len(all_tokens)
+            )
+            log.info("STARTUP_TG_SUCCESS")
+        except Exception as e:
+            log.error("STARTUP_TG_FAIL | %s", e)
+            # Retry once after short delay (session warmup)
+            try:
+                await asyncio.sleep(2)
+                await self.engine.tg.notify_startup(
+                    len(self.markets), len(self.links), len(all_tokens)
+                )
+                log.info("STARTUP_TG_RETRY_SUCCESS")
+            except Exception as e2:
+                log.error("STARTUP_TG_RETRY_FAIL | %s", e2)
 
         # Phase 4: Start all async loops
         tasks = [
