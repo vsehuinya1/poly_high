@@ -71,6 +71,22 @@ MOMENTUM_FAIL_S = 45.0      # exit if no new extreme for this long
 # Cooldown
 COOLDOWN_S = 120.0
 
+# v8.2: Pullback Entry
+PULLBACK_OFFSET = 0.015     # enter 1.5¢ below spike peak
+PULLBACK_WINDOW_S = 30.0    # must fill within 30s
+PULLBACK_MAX_SPREAD = 0.03  # spread check at fill
+
+# v8.2: Continuation Clock
+CONTINUATION_S = 90.0       # must see +0.02 within 90s of entry
+CONTINUATION_MIN_MOVE = 0.02
+
+# v8.2: Regime Filter
+REGIME_LOOKBACK_S = 60.0    # look back 60s for momentum
+REGIME_MIN_MOVE = 0.02      # require 2¢ move in last 60s
+
+# v8.2: Match Cooldown
+MATCH_COOLDOWN_S = 300.0    # 5 minutes between trades per match
+
 # Market filter
 IPL_KEYWORDS = ["indian premier league"]
 
@@ -97,6 +113,16 @@ class CricketTickSignal:
     fair_price: float       # projected fair value (continuation)
     edge: float             # projected_move - spread/2
     spread: float           # current spread
+
+
+@dataclass
+class PendingPullback:
+    """v8.2: Pending pullback entry waiting for fill."""
+    signal: CricketTickSignal
+    spike_peak: float           # price at spike detection
+    limit_price: float          # entry limit = peak - PULLBACK_OFFSET
+    created_ts: float           # when pending was created
+    direction: str              # LONG or SHORT
 
 
 @dataclass
@@ -134,10 +160,13 @@ class CricketTickDetector:
         self._trades: dict[str, TickTrade] = {}
         self._last_signal_ts: dict[str, float] = {}
         self._market_titles: dict[str, str] = {}  # match_id → title
+        self._pending: dict[str, PendingPullback] = {}  # v8.2: pending pullback entries
+        self._last_trade_exit_ts: dict[str, float] = {}  # v8.2: match cooldown
         self._skip_counts: dict[str, int] = {
             "no_move": 0, "spread": 0, "band": 0, "cooldown": 0,
             "not_ipl": 0, "small_spike": 0, "no_contraction": 0,
             "low_edge": 0, "retrace": 0, "too_early": 0,
+            "low_momentum": 0, "match_cooldown": 0, "pullback_expired": 0,
         }
         self._last_skip_log = 0.0
 
@@ -174,6 +203,32 @@ class CricketTickDetector:
         if match_id in self._trades:
             return None
 
+        # v8.2: Check pending pullback fill
+        if match_id in self._pending:
+            pending = self._pending[match_id]
+            age = timestamp - pending.created_ts
+            if age > PULLBACK_WINDOW_S:
+                log.info("CRICKET_PULLBACK_EXPIRED | %s | age=%.1fs | peak=%.4f limit=%.4f mid=%.4f",
+                         match_id, age, pending.spike_peak, pending.limit_price, mid)
+                self._skip("pullback_expired")
+                del self._pending[match_id]
+            elif spread <= PULLBACK_MAX_SPREAD:
+                # Check fill: for LONG, price must dip to limit; for SHORT, rise to limit
+                filled = False
+                if pending.direction == "LONG" and mid <= pending.limit_price:
+                    filled = True
+                elif pending.direction == "SHORT" and mid >= pending.limit_price:
+                    filled = True
+                if filled:
+                    # Adjust entry price to actual fill level
+                    fill_signal = pending.signal
+                    fill_signal.entry_price = mid
+                    log.info("CRICKET_PULLBACK_ENTRY | %s | peak=%.4f limit=%.4f fill=%.4f | spread=%.4f",
+                             match_id, pending.spike_peak, pending.limit_price, mid, spread)
+                    del self._pending[match_id]
+                    return fill_signal
+            return None
+
         # Price band
         if mid < PRICE_FLOOR or mid > PRICE_CEIL:
             self._skip("band")
@@ -201,18 +256,52 @@ class CricketTickDetector:
             self._skip("cooldown")
             return None
 
+        # v8.2: Match cooldown — 5min between trades per match
+        last_exit = self._last_trade_exit_ts.get(match_id, 0)
+        if timestamp - last_exit < MATCH_COOLDOWN_S:
+            self._skip("match_cooldown")
+            return None
+
         # Need enough data
         if len(buf) < 10:
             return None
 
-        # ── Check patterns (priority: spike first) ────────────────
-        signal = self._check_spike_continuation(match_id, buf, mid, spread, timestamp)
-        if signal:
-            return signal
+        # v8.2: Regime filter — require real momentum in last 60s
+        regime_ok = False
+        for i in range(len(buf) - 1, -1, -1):
+            dt = timestamp - buf[i].timestamp
+            if dt > REGIME_LOOKBACK_S:
+                break
+            if abs(mid - buf[i].mid) >= REGIME_MIN_MOVE:
+                regime_ok = True
+                break
+        if not regime_ok:
+            self._skip("low_momentum")
+            # Don't return yet — still log diagnostics below
+        else:
+            # ── Check patterns (priority: spike first) ────────────────
+            signal = self._check_spike_continuation(match_id, buf, mid, spread, timestamp)
+            if signal:
+                # v8.2: Don't return immediately — store as pending pullback
+                if signal.direction == "LONG":
+                    limit = mid - PULLBACK_OFFSET
+                else:
+                    limit = mid + PULLBACK_OFFSET
+                self._pending[match_id] = PendingPullback(
+                    signal=signal,
+                    spike_peak=mid,
+                    limit_price=limit,
+                    created_ts=timestamp,
+                    direction=signal.direction,
+                )
+                log.info("CRICKET_PULLBACK_PENDING | %s | dir=%s | peak=%.4f limit=%.4f | edge=%.4f",
+                         match_id, signal.direction, mid, limit, signal.edge)
+                return None  # will fill on a subsequent tick
 
-        signal = self._check_momentum_drift(match_id, buf, mid, spread, timestamp)
-        if signal:
-            return signal
+            signal = self._check_momentum_drift(match_id, buf, mid, spread, timestamp)
+            if signal:
+                # Drift signals enter immediately (no pullback needed)
+                return signal
 
         # Periodic diagnostic (every 60s)
         if timestamp - self._last_skip_log > 60.0:
@@ -220,7 +309,8 @@ class CricketTickDetector:
             log.info(
                 "CRICKET_TICK_DIAG | markets=%d | total_ticks=%d | "
                 "skips: not_ipl=%d small_spike=%d no_contraction=%d "
-                "low_edge=%d spread=%d band=%d retrace=%d cooldown=%d",
+                "low_edge=%d spread=%d band=%d retrace=%d cooldown=%d "
+                "low_momentum=%d match_cd=%d pullback_exp=%d",
                 len(self._ticks), total_ticks,
                 self._skip_counts.get("not_ipl", 0),
                 self._skip_counts.get("small_spike", 0),
@@ -230,6 +320,9 @@ class CricketTickDetector:
                 self._skip_counts.get("band", 0),
                 self._skip_counts.get("retrace", 0),
                 self._skip_counts.get("cooldown", 0),
+                self._skip_counts.get("low_momentum", 0),
+                self._skip_counts.get("match_cooldown", 0),
+                self._skip_counts.get("pullback_expired", 0),
             )
             self._skip_counts = {k: 0 for k in self._skip_counts}
             self._last_skip_log = timestamp
@@ -549,7 +642,19 @@ class CricketTickDetector:
                 elif trade.direction == "SHORT" and mid >= trade.trail_price:
                     reason = "EXIT_RUNNER"
 
-            # 3. Momentum fail: no new high/low for 45s after entry
+            # 3. v8.2: Continuation clock — exit if no +0.02 in 90s
+            if not reason and not trade.runner_active:
+                if elapsed >= CONTINUATION_S and trade.mfe < CONTINUATION_MIN_MOVE:
+                    reason = "EXIT_EARLY"
+                    log.info(
+                        "CRICKET_EXIT_EARLY | reason=NO_CONTINUATION | "
+                        "duration=%.0fs | mfe=%.4f < %.4f | "
+                        "entry=%.4f mid=%.4f | %s",
+                        elapsed, trade.mfe, CONTINUATION_MIN_MOVE,
+                        trade.entry_price, mid, match_id,
+                    )
+
+            # 4. Momentum fail: no new high/low for 45s after entry
             if not reason and not trade.runner_active:
                 time_since_extreme = now - trade.last_extreme_ts
                 if time_since_extreme >= MOMENTUM_FAIL_S and elapsed >= MOMENTUM_FAIL_S:
@@ -562,7 +667,7 @@ class CricketTickDetector:
                         time_since_extreme, match_id,
                     )
 
-            # 4. Timeout
+            # 5. Timeout
             if not reason and elapsed >= trade.timeout_s:
                 reason = "EXIT_TIMEOUT"
 
@@ -594,6 +699,8 @@ class CricketTickDetector:
                     trade.entry_price, mid, reason,
                 ))
                 del self._trades[match_id]
+                # v8.2: record exit time for match cooldown
+                self._last_trade_exit_ts[match_id] = now
 
         return exits
 
