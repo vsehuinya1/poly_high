@@ -72,7 +72,7 @@ MOMENTUM_FAIL_S = 45.0      # exit if no new extreme for this long
 COOLDOWN_S = 120.0
 
 # v8.2: Pullback Entry
-PULLBACK_OFFSET = 0.015     # enter 1.5¢ below spike peak
+PULLBACK_OFFSET = 0.008     # enter 0.8¢ below spike peak
 PULLBACK_WINDOW_S = 30.0    # must fill within 30s
 PULLBACK_MAX_SPREAD = 0.03  # spread check at fill
 
@@ -85,7 +85,7 @@ REGIME_LOOKBACK_S = 60.0    # look back 60s for momentum
 REGIME_MIN_MOVE = 0.02      # require 2¢ move in last 60s
 
 # v8.2: Match Cooldown
-MATCH_COOLDOWN_S = 300.0    # 5 minutes between trades per match
+MATCH_COOLDOWN_S = 180.0    # 3 minutes between trades per match
 
 # Market filter
 IPL_KEYWORDS = ["indian premier league"]
