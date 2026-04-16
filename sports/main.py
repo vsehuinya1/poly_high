@@ -1671,6 +1671,7 @@ class SportsOrchestrator:
                         spread=book.spread,
                         timestamp=book.timestamp,
                         market_title=link.polymarket_title,
+                        match_state=state,
                     )
 
                     if tick_signal:

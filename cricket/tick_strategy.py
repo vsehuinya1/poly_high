@@ -167,6 +167,7 @@ class CricketTickDetector:
             "not_ipl": 0, "small_spike": 0, "no_contraction": 0,
             "low_edge": 0, "retrace": 0, "too_early": 0,
             "low_momentum": 0, "match_cooldown": 0, "pullback_expired": 0,
+            "score_filter": 0,
         }
         self._last_skip_log = 0.0
 
@@ -179,6 +180,7 @@ class CricketTickDetector:
         spread: float,
         timestamp: float,
         market_title: str = "",
+        match_state: object = None,
     ) -> Optional[CricketTickSignal]:
         """Process a new tick. Returns a signal if one is detected."""
         # Store tick
@@ -234,11 +236,6 @@ class CricketTickDetector:
             self._skip("band")
             return None
 
-        # Spread gate (use tighter of the two thresholds)
-        if spread > SPIKE_MAX_SPREAD:
-            self._skip("spread")
-            return None
-
         # Staleness
         if len(buf) >= 2:
             last_change_ts = timestamp
@@ -256,7 +253,7 @@ class CricketTickDetector:
             self._skip("cooldown")
             return None
 
-        # v8.2: Match cooldown — 5min between trades per match
+        # v8.2: Match cooldown — 3min between trades per match
         last_exit = self._last_trade_exit_ts.get(match_id, 0)
         if timestamp - last_exit < MATCH_COOLDOWN_S:
             self._skip("match_cooldown")
@@ -266,23 +263,86 @@ class CricketTickDetector:
         if len(buf) < 10:
             return None
 
-        # v8.2: Regime filter — require real momentum in last 60s
-        regime_ok = False
-        for i in range(len(buf) - 1, -1, -1):
-            dt = timestamp - buf[i].timestamp
-            if dt > REGIME_LOOKBACK_S:
-                break
-            if abs(mid - buf[i].mid) >= REGIME_MIN_MOVE:
-                regime_ok = True
-                break
-        if not regime_ok:
-            self._skip("low_momentum")
-            # Don't return yet — still log diagnostics below
-        else:
-            # ── Check patterns (priority: spike first) ────────────────
-            signal = self._check_spike_continuation(match_id, buf, mid, spread, timestamp)
+        # ── v8.4: Detection FIRST, quality gates AFTER ─────────────
+        # Run spike detection on ALL ticks (regardless of spread/regime)
+        signal = self._check_spike_continuation(match_id, buf, mid, spread, timestamp)
+        if signal:
+            # ── SPIKE CANDIDATE FOUND — apply quality gates ────────
+            log.info(
+                "CRICKET_SPIKE_CANDIDATE | %s | dir=%s | move=%.4f "
+                "| spread=%.4f | mid=%.4f | age=%.1fs",
+                match_id, signal.direction, signal.move,
+                spread, mid, timestamp - buf[0].timestamp,
+            )
+
+            # Quality gate 1: Score filter (v8.4)
+            if signal and match_state is not None:
+                _is_live = getattr(match_state, 'is_live', False)
+                _overs = getattr(match_state, 'overs', 0.0)
+                _recent_wicket = getattr(match_state, 'had_recent_wicket', False)
+                if not _is_live:
+                    log.info(
+                        "CRICKET_SPIKE_REJECT | %s | reason=score_filter_not_live "
+                        "| move=%.4f | spread=%.4f",
+                        match_id, signal.move, spread,
+                    )
+                    self._skip("score_filter")
+                    signal = None
+                elif _overs < 2:
+                    log.info(
+                        "CRICKET_SPIKE_REJECT | %s | reason=score_filter_early_overs "
+                        "| overs=%.1f | move=%.4f",
+                        match_id, _overs, signal.move,
+                    )
+                    self._skip("score_filter")
+                    signal = None
+                elif not (_overs >= 16 or _recent_wicket):
+                    log.info(
+                        "CRICKET_SPIKE_REJECT | %s | reason=score_filter_low_pressure "
+                        "| overs=%.1f | wicket=%s | move=%.4f",
+                        match_id, _overs, _recent_wicket, signal.move,
+                    )
+                    self._skip("score_filter")
+                    signal = None
+
+            # Quality gate 2: Spread
+            if signal and spread > SPIKE_MAX_SPREAD:
+                log.info(
+                    "CRICKET_SPIKE_REJECT | %s | reason=spread "
+                    "| spread=%.4f > %.4f | move=%.4f",
+                    match_id, spread, SPIKE_MAX_SPREAD, signal.move,
+                )
+                self._skip("spread")
+                signal = None
+
+            # Quality gate 3: Regime filter — require momentum in last 60s
             if signal:
-                # v8.2: Don't return immediately — store as pending pullback
+                regime_ok = False
+                for i in range(len(buf) - 1, -1, -1):
+                    dt = timestamp - buf[i].timestamp
+                    if dt > REGIME_LOOKBACK_S:
+                        break
+                    if abs(mid - buf[i].mid) >= REGIME_MIN_MOVE:
+                        regime_ok = True
+                        break
+                if not regime_ok:
+                    log.info(
+                        "CRICKET_SPIKE_REJECT | %s | reason=low_momentum "
+                        "| move=%.4f | no %.3f move in last %.0fs",
+                        match_id, signal.move, REGIME_MIN_MOVE,
+                        REGIME_LOOKBACK_S,
+                    )
+                    self._skip("low_momentum")
+                    signal = None
+
+            # ── Signal passed all gates → create pending pullback ──
+            if signal:
+                log.info(
+                    "CRICKET_SPIKE_ACCEPTED | %s | dir=%s | move=%.4f "
+                    "| spread=%.4f | mid=%.4f",
+                    match_id, signal.direction, signal.move,
+                    spread, mid,
+                )
                 if signal.direction == "LONG":
                     limit = mid - PULLBACK_OFFSET
                 else:
@@ -294,14 +354,36 @@ class CricketTickDetector:
                     created_ts=timestamp,
                     direction=signal.direction,
                 )
-                log.info("CRICKET_PULLBACK_PENDING | %s | dir=%s | peak=%.4f limit=%.4f | edge=%.4f",
-                         match_id, signal.direction, mid, limit, signal.edge)
+                log.info(
+                    "CRICKET_PULLBACK_PENDING | %s | dir=%s | peak=%.4f "
+                    "limit=%.4f | edge=%.4f",
+                    match_id, signal.direction, mid, limit, signal.edge,
+                )
                 return None  # will fill on a subsequent tick
+        else:
+            # No spike — check spread for diag counting only
+            if spread > SPIKE_MAX_SPREAD:
+                self._skip("spread")
+            # Check regime for diag counting only
+            else:
+                regime_ok = False
+                for i in range(len(buf) - 1, -1, -1):
+                    dt = timestamp - buf[i].timestamp
+                    if dt > REGIME_LOOKBACK_S:
+                        break
+                    if abs(mid - buf[i].mid) >= REGIME_MIN_MOVE:
+                        regime_ok = True
+                        break
+                if not regime_ok:
+                    self._skip("low_momentum")
 
-            signal = self._check_momentum_drift(match_id, buf, mid, spread, timestamp)
-            if signal:
-                # Drift signals enter immediately (no pullback needed)
-                return signal
+        # Check drift (only when no spike and spread ok)
+        if spread <= DRIFT_MAX_SPREAD:
+            drift_signal = self._check_momentum_drift(
+                match_id, buf, mid, spread, timestamp,
+            )
+            if drift_signal:
+                return drift_signal
 
         # Periodic diagnostic (every 60s)
         if timestamp - self._last_skip_log > 60.0:
