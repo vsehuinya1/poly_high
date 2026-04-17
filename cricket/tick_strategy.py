@@ -43,7 +43,7 @@ STALE_TICK_S = 60.0
 
 # Spike Continuation
 SPIKE_MIN_MOVE = 0.02       # minimum price move for spike
-SPIKE_WINDOW_S = 60.0       # spike must occur within 60s
+SPIKE_WINDOW_S = 120.0      # v8.5: widened from 60s for REST polling cadence (~72s)
 SPIKE_CONFIRM_MIN_S = 5.0   # wait at least 5s after spike
 SPIKE_CONFIRM_MAX_S = 10.0  # don't wait longer than 10s
 SPIKE_MAX_RETRACE = 0.33    # retrace must be < 33% of spike
@@ -162,6 +162,9 @@ class CricketTickDetector:
         self._market_titles: dict[str, str] = {}  # match_id → title
         self._pending: dict[str, PendingPullback] = {}  # v8.2: pending pullback entries
         self._last_trade_exit_ts: dict[str, float] = {}  # v8.2: match cooldown
+        # v8.5: Stateful mid tracking for sparse REST data
+        self._last_mid: dict[str, float] = {}     # match_id → last distinct mid
+        self._last_mid_ts: dict[str, float] = {}  # match_id → timestamp of last change
         self._skip_counts: dict[str, int] = {
             "no_move": 0, "spread": 0, "band": 0, "cooldown": 0,
             "not_ipl": 0, "small_spike": 0, "no_contraction": 0,
@@ -188,6 +191,12 @@ class CricketTickDetector:
             self._ticks[match_id] = deque(maxlen=MAX_TICK_HISTORY)
         buf = self._ticks[match_id]
         buf.append(TickPoint(timestamp=timestamp, mid=mid, spread=spread))
+
+        # v8.5: Track distinct mid changes for sparse REST data
+        prev_mid = self._last_mid.get(match_id)
+        if prev_mid is None or abs(mid - prev_mid) >= 0.001:
+            self._last_mid[match_id] = mid
+            self._last_mid_ts[match_id] = timestamp
 
         # Store title for IPL filtering
         if market_title:
@@ -417,9 +426,13 @@ class CricketTickDetector:
         self, match_id: str, buf: deque, mid: float,
         spread: float, now: float,
     ) -> Optional[CricketTickSignal]:
-        """Detect spike ≥0.04 within ≤60s and ride continuation."""
+        """Detect spike ≥0.02 within ≤120s and ride continuation.
 
-        # Find the largest move in the lookback window
+        v8.5: Uses both buffer lookback AND stateful mid tracking
+        to handle sparse REST polling data.
+        """
+
+        # ── Method 1: Buffer lookback (works with dense WS ticks) ──
         best_move = 0.0
         best_origin_idx = -1
 
@@ -432,22 +445,38 @@ class CricketTickDetector:
                 best_move = move
                 best_origin_idx = i
 
+        # ── Method 2: Stateful mid delta (v8.5 — handles sparse REST) ──
+        prev_mid = self._last_mid.get(match_id)
+        prev_ts = self._last_mid_ts.get(match_id, 0)
+        if prev_mid is not None and abs(mid - prev_mid) >= 0.001:
+            stateful_dt = now - prev_ts
+            stateful_move = mid - prev_mid
+            if stateful_dt <= SPIKE_WINDOW_S and abs(stateful_move) > abs(best_move):
+                best_move = stateful_move
+                # Use the closest buffer tick at the old price as origin
+                for i in range(len(buf) - 2, -1, -1):
+                    if abs(buf[i].mid - prev_mid) < 0.001:
+                        best_origin_idx = i
+                        break
+
         # Minimum spike size
         if abs(best_move) < SPIKE_MIN_MOVE:
-            if abs(best_move) >= 0.02:  # log near-misses
-                self._skip("small_spike")
+            return None
+
+        # Need a valid origin
+        if best_origin_idx < 0:
             return None
 
         origin = buf[best_origin_idx]
         spike_age = now - origin.timestamp
 
         # Confirmation delay: must be 5-10s after spike origin
-        if spike_age < SPIKE_CONFIRM_MIN_S:
+        # v8.5: Skip confirmation for REST-detected spikes (age > 30s)
+        if spike_age < SPIKE_CONFIRM_MIN_S and spike_age < 30.0:
             self._skip("too_early")
             return None
 
         # Check retrace: price must not have reverted > 33% of spike
-        # Find the spike peak index (highest point for UP, lowest for DOWN)
         peak_idx = best_origin_idx
         if best_move > 0:
             for j in range(best_origin_idx, len(buf)):
@@ -459,19 +488,18 @@ class CricketTickDetector:
                     peak_idx = j
         peak_price = buf[peak_idx].mid
 
-        # Measure retrace ONLY from peak forward (not from origin)
         retrace = 0.0
         for j in range(peak_idx, len(buf)):
-            if best_move > 0:  # spike UP → retrace = peak - current
+            if best_move > 0:
                 retrace = max(retrace, peak_price - buf[j].mid)
-            else:  # spike DOWN → retrace = current - trough
+            else:
                 retrace = max(retrace, buf[j].mid - peak_price)
 
         if retrace > abs(best_move) * SPIKE_MAX_RETRACE:
             self._skip("retrace")
             return None
 
-        # Spread contraction check: last N ticks must show contracting spread
+        # Spread contraction check
         if len(buf) >= SPIKE_MIN_CONTRACTION + 1:
             contracting = 0
             for k in range(len(buf) - SPIKE_MIN_CONTRACTION, len(buf)):
@@ -485,7 +513,6 @@ class CricketTickDetector:
             return None
 
         # ── SIGNAL CONFIRMED ──────────────────────────────────────
-        # Direction: SAME as spike (momentum, not fade)
         direction = "LONG" if best_move > 0 else "SHORT"
 
         # Edge calculation (v2.0)
