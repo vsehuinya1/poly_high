@@ -298,21 +298,49 @@ class CricketTickDetector:
                     self._skip("score_filter")
                     signal = None
                 elif _overs < 2:
-                    log.info(
-                        "CRICKET_SPIKE_REJECT | %s | reason=score_filter_early_overs "
-                        "| overs=%.1f | move=%.4f",
-                        match_id, _overs, signal.move,
+                    # v8.6: Early shock regime — allow big SHORT spikes even < 2 overs
+                    _early_shock = (
+                        _overs >= 0
+                        and abs(signal.move) >= 0.05
+                        and spread <= 0.02
+                        and signal.direction == "SHORT"
                     )
-                    self._skip("score_filter")
-                    signal = None
+                    if not _early_shock:
+                        log.info(
+                            "CRICKET_SPIKE_REJECT | %s | reason=score_filter_early_overs "
+                            "| overs=%.1f | move=%.4f",
+                            match_id, _overs, signal.move,
+                        )
+                        self._skip("score_filter")
+                        signal = None
+                    else:
+                        log.info(
+                            "CRICKET_EARLY_SHOCK_ACCEPTED | %s "
+                            "| overs=%.1f | move=%.4f | spread=%.4f",
+                            match_id, _overs, signal.move, spread,
+                        )
                 elif not (_overs >= 16 or _recent_wicket):
-                    log.info(
-                        "CRICKET_SPIKE_REJECT | %s | reason=score_filter_low_pressure "
-                        "| overs=%.1f | wicket=%s | move=%.4f",
-                        match_id, _overs, _recent_wicket, signal.move,
+                    # v8.6: Early shock regime for overs 2–6
+                    _early_shock = (
+                        _overs < 6
+                        and abs(signal.move) >= 0.05
+                        and spread <= 0.02
+                        and signal.direction == "SHORT"
                     )
-                    self._skip("score_filter")
-                    signal = None
+                    if not _early_shock:
+                        log.info(
+                            "CRICKET_SPIKE_REJECT | %s | reason=score_filter_low_pressure "
+                            "| overs=%.1f | wicket=%s | move=%.4f",
+                            match_id, _overs, _recent_wicket, signal.move,
+                        )
+                        self._skip("score_filter")
+                        signal = None
+                    else:
+                        log.info(
+                            "CRICKET_EARLY_SHOCK_ACCEPTED | %s "
+                            "| overs=%.1f | move=%.4f | spread=%.4f",
+                            match_id, _overs, signal.move, spread,
+                        )
 
             # Quality gate 2: Spread
             if signal and spread > SPIKE_MAX_SPREAD:
