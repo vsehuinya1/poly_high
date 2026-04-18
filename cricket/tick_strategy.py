@@ -184,8 +184,15 @@ class CricketTickDetector:
         timestamp: float,
         market_title: str = "",
         match_state: object = None,
+        observe_only: bool = False,
     ) -> Optional[CricketTickSignal]:
-        """Process a new tick. Returns a signal if one is detected."""
+        """Process a new tick. Returns a signal if one is detected.
+
+        Args:
+            observe_only: If True, run spike detection for diagnostics
+                but do NOT create entries or pullbacks.  Used when
+                match_state is None (no score context).
+        """
         # Store tick
         if match_id not in self._ticks:
             self._ticks[match_id] = deque(maxlen=MAX_TICK_HISTORY)
@@ -371,6 +378,15 @@ class CricketTickDetector:
                     )
                     self._skip("low_momentum")
                     signal = None
+
+            # ── v8.7: Observe-only mode — log but do NOT act ──────
+            if observe_only and signal:
+                log.info(
+                    "CRICKET_BLOCK_NO_STATE | %s | dir=%s | move=%.4f "
+                    "| mid=%.4f | reason=observe_only_no_match_state",
+                    match_id, signal.direction, signal.move, mid,
+                )
+                return None
 
             # ── Signal passed all gates → create pending pullback ──
             if signal:

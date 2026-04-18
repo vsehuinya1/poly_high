@@ -1311,21 +1311,45 @@ class SportsOrchestrator:
                 return (team_a, team_b)
         return ("", "")
 
+    # ── Team name alias map for matching ──────────────────────────
+    _CRICKET_NAME_ALIASES: dict[str, str] = {
+        "bangalore": "bengaluru",
+        "rcb": "royal challengers bengaluru",
+        "csk": "chennai super kings",
+        "mi": "mumbai indians",
+        "kkr": "kolkata knight riders",
+        "srh": "sunrisers hyderabad",
+        "dc": "delhi capitals",
+        "rr": "rajasthan royals",
+        "gt": "gujarat titans",
+        "lsg": "lucknow super giants",
+        "pbks": "punjab kings",
+    }
+
     @staticmethod
-    def _normalize_team(name: str) -> str:
-        """Normalize a team name for comparison: lowercase, strip spaces."""
-        return name.lower().strip()
+    def _normalize_cricket_name(name: str) -> str:
+        """Normalize a cricket team name for comparison.
+
+        Applies:
+          - lowercase + strip
+          - alias replacement (bangalore → bengaluru, etc.)
+        """
+        n = name.lower().strip()
+        for alias, canonical in SportsOrchestrator._CRICKET_NAME_ALIASES.items():
+            n = n.replace(alias, canonical)
+        return n
 
     @staticmethod
     def _teams_match(poly_name: str, espn_name: str) -> bool:
         """Check if a Poly team name matches an ESPN team name.
 
-        Uses substring containment in both directions.
+        Uses normalized names + substring containment in both directions.
         'mumbai indians' matches 'Mumbai Indians'
         'kolkata' matches 'Kolkata Knight Riders'
+        'royal challengers bangalore' matches 'Royal Challengers Bengaluru'
         """
-        pn = poly_name.lower().strip()
-        en = espn_name.lower().strip()
+        pn = SportsOrchestrator._normalize_cricket_name(poly_name)
+        en = SportsOrchestrator._normalize_cricket_name(espn_name)
         if not pn or not en:
             return False
         return pn in en or en in pn
@@ -1455,37 +1479,50 @@ class SportsOrchestrator:
         last_health_log = time.time()
         last_map_attempt: dict[str, float] = {}  # match_id → last attempt ts
         MAP_RETRY_S = 120.0  # retry mapping every 2 min
-        # v4.9: deterministic mapping cache
+        # v8.7: persistent mapping cache (ESPN ID → match state source)
         cricket_espn_map: dict[str, str] = {}
+        # v8.7: persistent mapping source tracker
+        cricket_map_source: dict[str, str] = {}  # match_id → "LIVE" | "ESPN"
 
         while not self._shutdown:
             try:
                 for match_id, link in list(self.cricket_links.items()):
-                    # ── Deterministic Poly→ESPN mapping (v4.9) ────
+                    # ═══════════════════════════════════════════════════
+                    #  v8.7: Two-pass mapping (LIVE primary, ESPN fallback)
+                    #  Persistent: once mapped, reuse until invalid
+                    # ═══════════════════════════════════════════════════
                     espn_id = cricket_espn_map.get(match_id)
                     state = None
 
+                    # ── Reuse existing mapping if valid ────────────
                     if espn_id:
                         state = self.cricket_feed.games.get(espn_id)
+                        if state:
+                            pass  # mapping still valid, use it
+                        else:
+                            # mapping went stale — clear it for re-mapping
+                            del cricket_espn_map[match_id]
+                            cricket_map_source.pop(match_id, None)
+                            espn_id = None
 
+                    # ── Mapping needed — run two-pass ────────────
                     if not state:
-                        # Rate-limit mapping attempts
                         now_map = time.time()
                         last_try = last_map_attempt.get(match_id, 0)
                         if now_map - last_try < MAP_RETRY_S and last_try > 0:
-                            pass  # skip re-mapping, fall through to fallback
+                            pass  # rate-limited, skip
                         else:
                             last_map_attempt[match_id] = now_map
-                            # Parse teams from Poly title
                             poly_a, poly_b = self._parse_cricket_teams(
                                 link.polymarket_title
                             )
                             if poly_a and poly_b:
-                                espn_candidates = []
+                                live_candidates = []
+                                # ── PASS 1: CRICKET_LIVE feed (PRIMARY) ──
                                 for eid, cs in self.cricket_feed.games.items():
                                     if not cs.team_a or not cs.team_b:
                                         continue
-                                    espn_candidates.append(
+                                    live_candidates.append(
                                         f"{cs.team_a} vs {cs.team_b}"
                                     )
                                     a_match = (
@@ -1500,9 +1537,11 @@ class SportsOrchestrator:
                                         espn_id = eid
                                         state = cs
                                         cricket_espn_map[match_id] = espn_id
+                                        cricket_map_source[match_id] = "LIVE"
                                         log.info(
-                                            'CRICKET_MAP_SUCCESS | poly="%s" '
-                                            '| espn="%s" | teams=%s vs %s',
+                                            'CRICKET_MAP_SUCCESS | source=LIVE '
+                                            '| poly="%s" | espn="%s" '
+                                            '| teams=%s vs %s',
                                             link.polymarket_title[:60],
                                             espn_id, cs.team_a, cs.team_b,
                                         )
@@ -1510,12 +1549,12 @@ class SportsOrchestrator:
 
                                 if not state:
                                     log.info(
-                                        'CRICKET_MAP_FAIL | poly="%s" '
-                                        '| parsed=[%s vs %s] '
-                                        '| candidates=%s',
+                                        'CRICKET_MAP_FAIL | source=BOTH '
+                                        '| poly="%s" | parsed=[%s vs %s] '
+                                        '| live_candidates=%s',
                                         link.polymarket_title[:60],
                                         poly_a, poly_b,
-                                        espn_candidates[:5],
+                                        live_candidates[:5],
                                     )
                             else:
                                 log.info(
@@ -1663,8 +1702,23 @@ class SportsOrchestrator:
                         # DLS path done — but ALWAYS fall through to tick detector
 
                     # ════════════════════════════════════════════════
-                    #  PATH 2: Tick-based continuation (ALWAYS runs)
+                    #  PATH 2: Tick-based continuation
+                    #  v8.7: Safety guard — block blind trading
                     # ════════════════════════════════════════════════
+                    if state is None:
+                        # Observe-only: run detection for diagnostics
+                        # but do NOT create entries or pullbacks
+                        self.cricket_tick_detector.on_tick(
+                            match_id=match_id,
+                            mid=book.mid,
+                            spread=book.spread,
+                            timestamp=book.timestamp,
+                            market_title=link.polymarket_title,
+                            match_state=None,
+                            observe_only=True,
+                        )
+                        continue
+
                     tick_signal = self.cricket_tick_detector.on_tick(
                         match_id=match_id,
                         mid=book.mid,

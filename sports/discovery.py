@@ -480,13 +480,13 @@ async def rank_cricket_markets(
             ask = book_data["ask"]
             rest_spread = book_data["spread"]
 
-            # v2.0: Tag dead books instead of rejecting
+            # v2.0: Tag dead books instead of rejecting (STRICT: no spread rejections)
             is_dead_book = (bid <= 0.02 and ask >= 0.98) or rest_spread >= 0.90
             
             scored.append((mkt, rest_spread, mkt.liquidity, is_dead_book))
             log.info(
                 "CRICKET_CANDIDATE | %s | spread=%.4f | bid=%.2f "
-                "ask=%.2f | liq=$%.0f | dead=%s",
+                "ask=%.2f | liq=$%.0f | is_dead=%s",
                 mkt.title[:60], rest_spread, bid, ask, mkt.liquidity, is_dead_book
             )
 
@@ -501,6 +501,8 @@ async def rank_cricket_markets(
         winner, win_spr, win_liq, win_dead = scored[0]
         if win_dead:
             winner.initial_state = "DEAD"
+        else:
+            winner.initial_state = "ACTIVE"
             
         selected.append(winner)
         log.info(
@@ -508,7 +510,7 @@ async def rank_cricket_markets(
             winner.title[:60], win_spr, win_liq, winner.initial_state,
         )
 
-        # Reject others
+        # Reject others (secondary markets for the same match)
         for mkt, spr, liq, dead in scored[1:]:
             log.info(
                 "CRICKET_REJECT_SECONDARY | %s | spread=%.4f | liq=$%.0f",
