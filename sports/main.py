@@ -965,8 +965,8 @@ class SportsOrchestrator:
                             continue
 
                         # ── v7.1: Price-change activity filter ─────────
-                        price_age = time.time() - self._tennis_price_change_ts.get(fav_token, 0)
-                        if price_age > 10:
+                        price_age = time.time() - self._tennis_price_change_ts.get(fav_token, time.time())
+                        if price_age > 60:
                             log.info(
                                 "TENNIS_BLOCK_REASON | %s | reason=NO_PRICE_MOVEMENT | price_age=%.1fs",
                                 link.polymarket_title[:40], price_age,
@@ -1123,8 +1123,8 @@ class SportsOrchestrator:
                                 continue
 
                             # ── v7.1: Price-change activity filter ────
-                            sb_price_age = time.time() - self._tennis_price_change_ts.get(sb_tid, 0)
-                            if sb_price_age > 10:
+                            sb_price_age = time.time() - self._tennis_price_change_ts.get(sb_tid, time.time())
+                            if sb_price_age > 60:
                                 log.info(
                                     "TENNIS_BLOCK_REASON | %s | reason=NO_PRICE_MOVEMENT | price_age=%.1fs",
                                     sb_link.polymarket_title[:40], sb_price_age,
