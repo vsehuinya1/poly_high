@@ -190,15 +190,20 @@ class TennisExitManager:
     ) -> TennisPaperTrade:
         """Register a new paper trade after a signal is accepted."""
         # ═══ GLOBAL EDGE GUARD (v6.1 — inside function, non-bypassable) ═══
-        from sports.guards import validate_trade_execution, circuit_breaker
+        from sports.guards import validate_trade_execution, circuit_breaker, STRAT_TENNIS_INFLECTION
         can_exec, block_reason = validate_trade_execution(
             edge=edge, price=entry_price, sport="tennis",
             context=f"{trigger_type} | {player} | {match_id}",
+            strategy=STRAT_TENNIS_INFLECTION,
         )
         if not can_exec:
-            circuit_breaker.record_signal_result(was_blocked=True)
+            circuit_breaker.record_signal_result(
+                was_blocked=True, sport="tennis", strategy=STRAT_TENNIS_INFLECTION,
+            )
             return None
-        circuit_breaker.record_signal_result(was_blocked=False)
+        circuit_breaker.record_signal_result(
+            was_blocked=False, sport="tennis", strategy=STRAT_TENNIS_INFLECTION,
+        )
 
         # Spread capture: log-only adjusted entry for paper PnL
         spread_capture = spread > self.SPREAD_CAPTURE_THRESHOLD
@@ -460,9 +465,13 @@ class TennisExitManager:
                 trade.runner_v2_active, trade.match_id,
             )
 
-        # v7.0: Feed circuit breaker with trade outcome
-        from sports.guards import circuit_breaker
-        circuit_breaker.record_trade_outcome(trade.R_multiple)
+        # v9.0: Feed per-strategy circuit breaker with trade outcome
+        from sports.guards import circuit_breaker, STRAT_TENNIS_INFLECTION
+        circuit_breaker.record_trade_outcome(
+            trade.R_multiple,
+            sport="tennis",
+            strategy=STRAT_TENNIS_INFLECTION,
+        )
 
         # v5.0: Update MFE distribution buckets
         self._update_mfe_buckets(trade)

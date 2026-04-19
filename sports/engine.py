@@ -14,7 +14,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-from sports.guards import validate_trade_execution, circuit_breaker
+from sports.guards import validate_trade_execution, circuit_breaker, STRAT_ENGINE
 
 from sports.config import (
     ENTRY_EDGE_THRESHOLD,
@@ -688,6 +688,11 @@ class SignalEngine:
     async def _evaluate_paper_trade(self, signal: EdgeSignal,
                                      books: dict[str, BookState],
                                      link: GameMarketLink):
+        # v9.0: Football fully disabled — no signals, no paper trades
+        sport_lower = link.sport.lower() if link.sport else ""
+        if sport_lower == "football":
+            return
+
         if self.daily_pnl <= -MAX_DAILY_LOSS:
             if not self._killed:
                 log.warning("KILL SWITCH: daily PnL %.2f ≤ -%.0f",
@@ -1252,9 +1257,13 @@ class SignalEngine:
                 pos.stop_loss_triggered = (exit_reason == "stop_loss")
                 self.daily_pnl += pnl
 
-                # v7.0: Feed circuit breaker with trade outcome
+                # v9.0: Feed per-strategy circuit breaker with trade outcome
                 r_mult = pnl / pos.size_usd if pos.size_usd > 0 else 0.0
-                circuit_breaker.record_trade_outcome(r_mult)
+                circuit_breaker.record_trade_outcome(
+                    r_mult,
+                    sport=link.sport or "unknown",
+                    strategy=STRAT_ENGINE,
+                )
 
                 # Per-game PnL + cooldown tracking
                 gts = self._get_game_state(game_state.game_id)

@@ -60,7 +60,7 @@ from sports.config import (
     TENNIS_MIN_ORDER_USD, POLY_PRIVATE_KEY, POLY_FUNDER_ADDRESS,
     CLOB_PROXY_URL,
 )
-from sports.guards import validate_trade_execution
+from sports.guards import validate_trade_execution, circuit_breaker, STRAT_TENNIS_INFLECTION, STRAT_TENNIS_SB, STRAT_CRICKET_MOM
 from tennis.live_executor import LiveExecutor
 from tennis.spread_breakout import SpreadBreakoutDetector
 
@@ -985,6 +985,7 @@ class SportsOrchestrator:
                             price=market_price,
                             sport="tennis",
                             context=f"{signal.trigger_type} | {link.polymarket_title[:50]}",
+                            strategy=STRAT_TENNIS_INFLECTION,
                         )
                         if not can_exec:
                             continue
@@ -1116,6 +1117,7 @@ class SportsOrchestrator:
                                 price=sb_sig["entry_price"],
                                 sport="tennis_sb",
                                 context=f"SPREAD_BREAKOUT {sb_sig['direction']} | {sb_link.polymarket_title[:50]}",
+                                strategy=STRAT_TENNIS_SB,
                             )
                             if not can_exec:
                                 continue
@@ -1152,6 +1154,12 @@ class SportsOrchestrator:
                     log.info("SB_EXIT | %s | %s | entry=%.4f exit=%.4f R=%s | dur=%.0fs",
                              sbt.player, sbt.exit_reason, sbt.entry_price,
                              sbt.exit_price, f"{sbt.r_multiple:+.4f}", sbt.duration_s)
+                    # v9.0: Feed per-strategy CB with SB exit outcome
+                    circuit_breaker.record_trade_outcome(
+                        sbt.r_multiple,
+                        sport="tennis_sb",
+                        strategy=STRAT_TENNIS_SB,
+                    )
 
                 # ── Exit Manager: check all open trades ───────────
                 self._tennis_check_exits()
@@ -1656,6 +1664,7 @@ class SportsOrchestrator:
                                     price=market_price,
                                     sport="cricket",
                                     context=f"{sig.signal_type} | {link.polymarket_title[:50]}",
+                                    strategy=STRAT_CRICKET_MOM,
                                 )
                                 if not can_exec:
                                     continue
@@ -1735,6 +1744,7 @@ class SportsOrchestrator:
                             price=tick_signal.entry_price,
                             sport="cricket_tick",
                             context=f"{tick_signal.signal_type} {tick_signal.direction} | {link.polymarket_title[:50]}",
+                            strategy=STRAT_CRICKET_MOM,
                         )
                         if not can_exec:
                             continue
@@ -2102,6 +2112,14 @@ class SportsOrchestrator:
                 log.info("STARTUP_TG_RETRY_SUCCESS")
             except Exception as e2:
                 log.error("STARTUP_TG_RETRY_FAIL | %s", e2)
+
+        # v9.0: Wire circuit breaker → Telegram notification callback
+        import asyncio as _asyncio
+        _tg_ref = self.engine.tg
+        def _cb_telegram_callback(sport, strategy, streak):
+            _asyncio.ensure_future(_tg_ref.notify_circuit_breaker(sport, strategy, streak))
+        circuit_breaker.set_telegram_callback(_cb_telegram_callback)
+        log.info("CB_TELEGRAM_CALLBACK_WIRED")
 
         # Phase 4: Start all async loops
         tasks = [

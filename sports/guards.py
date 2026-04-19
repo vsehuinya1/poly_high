@@ -8,12 +8,24 @@ v1.0 — 2026-04-04  Initial: edge > 0, price band, sanity checks.
 v1.1 — 2026-04-05  Fix: use abs(edge) — edge sign encodes direction,
                     not quality. Negative edge = SELL direction is valid.
 v2.0 — 2026-04-06  Final hardening: staleness, empty book, edge drift.
+v3.0 — 2026-04-19  Per-strategy circuit breaker. Football disabled.
+                    Only counts losses (R<0), ignores breakevens.
 """
 import logging
 import time
 from collections import deque
 
 log = logging.getLogger("sports.guards")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Strategy ID Constants — single source of truth for CB keys
+# ═══════════════════════════════════════════════════════════════════════
+
+STRAT_ENGINE = "engine"                  # football / NBA paper trades
+STRAT_TENNIS_SB = "spread_breakout"      # tennis spread breakout
+STRAT_TENNIS_INFLECTION = "inflection"   # tennis inflection strategy
+STRAT_CRICKET_MOM = "tick_momentum"      # cricket tick momentum
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -54,116 +66,179 @@ _edge_tracker = EdgeQualityTracker()
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Global Kill Switch — circuit breaker for systemic failures
+#  Per-Strategy Circuit Breaker (v3.0)
 # ═══════════════════════════════════════════════════════════════════════
 
-class TradingCircuitBreaker:
-    """System-wide trading halt.
+class StrategyCircuitBreaker:
+    """Per-(sport, strategy) circuit breaker.
 
-    Triggers on:
-      1. Last 5 trades all losses
-      2. ΣR over last 10 trades < -2.0
-      3. Guard blocks > 30% of recent signals
+    Rules:
+      - Tracks consecutive LOSSES only (R < 0)
+      - Ignores breakevens (R == 0) — no increment, no reset
+      - Resets streak to 0 on any WIN (R > 0)
+      - Blocks ONLY the specific (sport, strategy) that triggered
 
-    When triggered: all new entries disabled, exits continue.
+    When triggered: new entries for that (sport, strategy) disabled.
+    Exits / stop-losses / runners are NEVER affected.
     """
 
-    def __init__(
-        self,
-        loss_streak_limit: int = 5,
-        rolling_r_window: int = 10,
-        rolling_r_floor: float = -2.0,
-        block_ratio_window: int = 100,
-        block_ratio_threshold: float = 0.30,
-    ):
+    def __init__(self, loss_streak_limit: int = 5):
         self.loss_streak_limit = loss_streak_limit
-        self.rolling_r_window = rolling_r_window
-        self.rolling_r_floor = rolling_r_floor
-        self.block_ratio_window = block_ratio_window
-        self.block_ratio_threshold = block_ratio_threshold
 
-        self._r_values: deque[float] = deque(maxlen=rolling_r_window)
-        self._recent_outcomes: deque[bool] = deque(maxlen=loss_streak_limit)
-        self._signal_results: deque[bool] = deque(maxlen=block_ratio_window)
+        # Per-key tracking
+        self._loss_streaks: dict[tuple[str, str], int] = {}
+        self._disabled_keys: set[tuple[str, str]] = set()
+        self._disable_times: dict[tuple[str, str], float] = {}
 
-        self._disabled = False
-        self._disable_reason = ""
-        self._disable_time = 0.0
+        # Telegram spam protection: only notify once per trip
+        self._notified_keys: set[tuple[str, str]] = set()
 
-    @property
-    def is_disabled(self) -> bool:
-        return self._disabled
+        # Optional async callback for Telegram notification
+        # Set via set_telegram_callback() during orchestrator init
+        self._tg_callback = None
 
-    @property
-    def disable_reason(self) -> str:
-        return self._disable_reason
+    def set_telegram_callback(self, callback) -> None:
+        """Set async callback: callback(sport, strategy, streak)."""
+        self._tg_callback = callback
 
-    def record_trade_outcome(self, r_multiple: float) -> None:
-        """Record a closed trade's R-multiple."""
-        is_win = r_multiple > 0
-        self._r_values.append(r_multiple)
-        self._recent_outcomes.append(is_win)
+    def record_trade_outcome(
+        self,
+        r_multiple: float,
+        sport: str,
+        strategy: str,
+    ) -> None:
+        """Record a closed trade's R-multiple for a specific (sport, strategy).
 
-        # Check loss streak
-        if (len(self._recent_outcomes) >= self.loss_streak_limit
-                and not any(self._recent_outcomes)):
-            self._trip("LOSS_STREAK_5")
-            return
+        - R < 0: increment loss streak
+        - R > 0: reset loss streak + re-enable if blocked
+        - R == 0: ignore completely (breakeven)
+        """
+        key = (sport, strategy)
 
-        # Check rolling R
-        if len(self._r_values) >= self.rolling_r_window:
-            total_r = sum(self._r_values)
-            if total_r < self.rolling_r_floor:
-                self._trip(f"ROLLING_R_{total_r:+.2f}")
-                return
+        if r_multiple < 0:
+            # LOSS — increment streak
+            streak = self._loss_streaks.get(key, 0) + 1
+            self._loss_streaks[key] = streak
 
-    def record_signal_result(self, was_blocked: bool) -> None:
-        """Record whether a signal was blocked (True) or passed (False)."""
-        self._signal_results.append(was_blocked)
-
-        if len(self._signal_results) >= self.block_ratio_window:
-            blocked = sum(1 for b in self._signal_results if b)
-            ratio = blocked / len(self._signal_results)
-            if ratio > self.block_ratio_threshold:
-                self._trip(f"BLOCK_RATIO_{ratio:.0%}")
-
-    def _trip(self, reason: str) -> None:
-        if not self._disabled:
-            self._disabled = True
-            self._disable_reason = reason
-            self._disable_time = time.time()
-            log.error(
-                "TRADING_DISABLED | reason=%s | "
-                "last_R=[%s] | time=%s",
-                reason,
-                ", ".join(f"{r:+.3f}" for r in self._r_values),
-                time.strftime("%H:%M:%S"),
+            log.info(
+                "CB_LOSS | sport=%s | strat=%s | streak=%d/%d | R=%+.3f",
+                sport, strategy, streak, self.loss_streak_limit, r_multiple,
             )
 
-    def reset(self) -> None:
-        """Manual reset — only for operator intervention."""
-        if self._disabled:
-            log.warning(
-                "TRADING_RE_ENABLED | was_disabled_for=%.0fs | reason_was=%s",
-                time.time() - self._disable_time,
-                self._disable_reason,
-            )
-        self._disabled = False
-        self._disable_reason = ""
+            if streak >= self.loss_streak_limit and key not in self._disabled_keys:
+                self._trip(sport, strategy, streak)
 
-    def check(self) -> tuple[bool, str]:
-        """Check if trading is currently disabled.
+        elif r_multiple > 0:
+            # WIN — reset streak + re-enable
+            old_streak = self._loss_streaks.get(key, 0)
+            self._loss_streaks[key] = 0
+
+            if key in self._disabled_keys:
+                self._disabled_keys.discard(key)
+                self._notified_keys.discard(key)
+                elapsed = time.time() - self._disable_times.get(key, 0)
+                log.warning(
+                    "CB_RESET | sport=%s | strat=%s | "
+                    "was_disabled_for=%.0fs | reset_by_win R=%+.3f",
+                    sport, strategy, elapsed, r_multiple,
+                )
+            elif old_streak > 0:
+                log.info(
+                    "CB_WIN | sport=%s | strat=%s | streak_reset %d→0 | R=%+.3f",
+                    sport, strategy, old_streak, r_multiple,
+                )
+
+        # R == 0: intentionally ignored — no increment, no reset
+
+    def record_signal_result(
+        self,
+        was_blocked: bool,
+        sport: str = "",
+        strategy: str = "",
+    ) -> None:
+        """Record whether a signal was blocked. Currently a no-op for v3.0.
+
+        Kept for API compatibility — block ratio trigger removed
+        (was causing global false positives).
+        """
+        pass
+
+    def _trip(self, sport: str, strategy: str, streak: int) -> None:
+        """Trip the circuit breaker for a specific (sport, strategy)."""
+        key = (sport, strategy)
+        self._disabled_keys.add(key)
+        self._disable_times[key] = time.time()
+
+        log.error(
+            "CIRCUIT_BREAKER_TRIGGERED | sport=%s | strat=%s | "
+            "streak=%d | action=blocked",
+            sport, strategy, streak,
+        )
+
+        # Telegram notification — only on first trip (spam protection)
+        if key not in self._notified_keys:
+            self._notified_keys.add(key)
+            if self._tg_callback:
+                try:
+                    self._tg_callback(sport, strategy, streak)
+                except Exception as e:
+                    log.error("CB telegram callback error: %s", e)
+
+    def reset(self, sport: str = "", strategy: str = "") -> None:
+        """Manual reset — only for operator intervention.
+
+        If sport+strategy provided: reset that specific key.
+        If empty: reset ALL keys.
+        """
+        if sport and strategy:
+            key = (sport, strategy)
+            if key in self._disabled_keys:
+                log.warning(
+                    "CB_MANUAL_RESET | sport=%s | strat=%s | "
+                    "was_disabled_for=%.0fs",
+                    sport, strategy,
+                    time.time() - self._disable_times.get(key, 0),
+                )
+                self._disabled_keys.discard(key)
+                self._notified_keys.discard(key)
+                self._loss_streaks[key] = 0
+        else:
+            # Reset everything
+            if self._disabled_keys:
+                log.warning(
+                    "CB_MANUAL_RESET_ALL | keys=%s",
+                    list(self._disabled_keys),
+                )
+            self._disabled_keys.clear()
+            self._notified_keys.clear()
+            self._loss_streaks.clear()
+            self._disable_times.clear()
+
+    def check(self, sport: str = "", strategy: str = "") -> tuple[bool, str]:
+        """Check if trading is disabled for a specific (sport, strategy).
 
         Returns:
             (can_trade: bool, reason: str)
         """
-        if self._disabled:
-            return False, f"BLOCK_CIRCUIT_BREAKER:{self._disable_reason}"
+        key = (sport, strategy)
+        if key in self._disabled_keys:
+            streak = self._loss_streaks.get(key, 0)
+            reason = f"BLOCK_CB|sport={sport}|strat={strategy}|streak={streak}"
+            return False, reason
         return True, ""
 
+    @property
+    def is_disabled(self) -> bool:
+        """True if ANY key is currently blocked."""
+        return bool(self._disabled_keys)
 
-# Global singleton
-circuit_breaker = TradingCircuitBreaker()
+    @property
+    def disabled_keys(self) -> set:
+        return set(self._disabled_keys)
+
+
+# Global singleton (v3.0: per-strategy)
+circuit_breaker = StrategyCircuitBreaker()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -183,6 +258,7 @@ def validate_trade_execution(
     price: float,
     sport: str,
     context: str,
+    strategy: str = STRAT_ENGINE,
     book_age: float = 0.0,
     book_bid: float = -1.0,
     book_ask: float = -1.0,
@@ -191,6 +267,7 @@ def validate_trade_execution(
     """Validate that a trade is safe to execute.
 
     Must be called DIRECTLY before register_trade / buy / sell.
+    ENTRY ONLY — never call this for exits / stop-losses / runners.
 
     Edge sign convention: positive = BUY, negative = SELL.
     The MAGNITUDE must be > 0 for any trade.
@@ -198,8 +275,9 @@ def validate_trade_execution(
     Args:
         edge:         Computed edge (sign = direction, abs = magnitude).
         price:        Entry price (market mid or limit).
-        sport:        Sport identifier (for logging).
+        sport:        Sport identifier (for logging + CB key).
         context:      Human-readable context.
+        strategy:     Strategy identifier (for CB key). Default: STRAT_ENGINE.
         book_age:     Seconds since last book update (0 = unknown/skip).
         book_bid:     Best bid price (-1 = unknown/skip).
         book_ask:     Best ask price (-1 = unknown/skip).
@@ -269,12 +347,12 @@ def validate_trade_execution(
                 signal_edge, edge, drift, sport, context,
             )
 
-    # 7. Circuit breaker — system-wide trading halt
-    cb_ok, cb_reason = circuit_breaker.check()
+    # 7. Per-strategy circuit breaker check
+    cb_ok, cb_reason = circuit_breaker.check(sport=sport, strategy=strategy)
     if not cb_ok:
         log.warning(
-            "BLOCK_CIRCUIT_BREAKER | reason=%s | sport=%s | %s",
-            cb_reason, sport, context,
+            "BLOCK_CB | sport=%s | strat=%s | %s",
+            sport, strategy, context,
         )
         return False, cb_reason
 

@@ -204,3 +204,15 @@ class TelegramNotifier:
             f"Ticks: {tick_rate:.0f}/min\n"
             f"Movement: {price_range:.4f}"
         )
+
+    # ── Circuit Breaker Alerts (v9.0) ─────────────────────────────
+
+    async def notify_circuit_breaker(self, sport: str, strategy: str,
+                                      streak: int):
+        await self.send(
+            f"🚨 <b>CIRCUIT BREAKER TRIGGERED</b>\n"
+            f"├ Sport: {sport}\n"
+            f"├ Strategy: {strategy}\n"
+            f"├ Consecutive losses: {streak}\n"
+            f"└ Action: BLOCKED (entries disabled)"
+        )

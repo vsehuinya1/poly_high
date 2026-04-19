@@ -689,17 +689,22 @@ class CricketTickDetector:
     def register_trade(self, signal: CricketTickSignal) -> None:
         """Register an active trade for exit tracking."""
         # ═══ GLOBAL EDGE GUARD (v7.0 — inside function, non-bypassable) ═══
-        from sports.guards import validate_trade_execution, circuit_breaker
+        from sports.guards import validate_trade_execution, circuit_breaker, STRAT_CRICKET_MOM
         can_exec, block_reason = validate_trade_execution(
             edge=signal.edge,
             price=signal.entry_price,
             sport="cricket_tick",
             context=f"{signal.signal_type} {signal.direction} | {signal.match_id}",
+            strategy=STRAT_CRICKET_MOM,
         )
         if not can_exec:
-            circuit_breaker.record_signal_result(was_blocked=True)
+            circuit_breaker.record_signal_result(
+                was_blocked=True, sport="cricket_tick", strategy=STRAT_CRICKET_MOM,
+            )
             return
-        circuit_breaker.record_signal_result(was_blocked=False)
+        circuit_breaker.record_signal_result(
+            was_blocked=False, sport="cricket_tick", strategy=STRAT_CRICKET_MOM,
+        )
 
         now = time.time()
         if signal.direction == "LONG":
@@ -844,8 +849,12 @@ class CricketTickDetector:
                 )
 
                 # Feed circuit breaker
-                from sports.guards import circuit_breaker
-                circuit_breaker.record_trade_outcome(r_mult)
+                from sports.guards import circuit_breaker, STRAT_CRICKET_MOM
+                circuit_breaker.record_trade_outcome(
+                    r_mult,
+                    sport="cricket_tick",
+                    strategy=STRAT_CRICKET_MOM,
+                )
 
                 exits.append((
                     match_id, trade.signal_type,
