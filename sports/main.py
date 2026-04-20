@@ -348,6 +348,34 @@ def prewarm_football_lambdas(links: dict[str, "GameMarketLink"]) -> None:
              warmed, len(football_links))
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  v9.2: Tournament Tier Classifier
+# ═══════════════════════════════════════════════════════════════════════
+
+def _classify_tournament(name: str) -> str:
+    """Classify a tennis tournament name into a tier for logging."""
+    n = name.lower()
+    if any(x in n for x in ["grand slam", "wimbledon", "roland garros",
+                             "us open", "australian open"]):
+        return "slam"
+    if any(x in n for x in ["masters", "1000", "rome", "madrid",
+                             "indian wells", "miami", "shanghai",
+                             "montreal", "cincinnati", "paris"]):
+        return "atp1000"
+    if "500" in n or any(x in n for x in ["barcelona", "hamburg", "vienna",
+                                           "beijing", "washington"]):
+        return "atp500"
+    if "250" in n:
+        return "atp250"
+    if any(x in n for x in ["wta 1000", "wta1000"]):
+        return "wta1000"
+    if "wta" in n:
+        return "wta"
+    if any(x in n for x in ["challenger", "itf", "futures"]):
+        return "low_tier"
+    return "unknown"
+
+
 class SportsOrchestrator:
     """Main async orchestrator for the sports trading system."""
 
@@ -419,6 +447,9 @@ class SportsOrchestrator:
         # v7.1: Real price-change tracking for stale market filter
         self._tennis_last_price: dict[str, tuple] = {}    # token_id → (bid, ask)
         self._tennis_price_change_ts: dict[str, float] = {}  # token_id → last change ts
+        # v9.2: Per-tier R tracking for summary logging
+        self._tier_r: dict[str, list] = {}  # tier → [R values]
+        self._tier_trade_count = 0
 
         # ── Cricket Engine (Paper Only) ───────────────────────────
         self.cricket_feed = CricketFeed()
@@ -529,6 +560,10 @@ class SportsOrchestrator:
             if tm.event_id in self.tennis_links:
                 continue  # already linked
 
+            # v9.2: Extract tournament name and tier
+            _tourn_name = tm.title.split(":")[0].strip() if ":" in tm.title else tm.title
+            _tourn_tier = _classify_tournament(_tourn_name)
+
             # Extract player names from Polymarket title
             player_a_name, player_b_name = extract_players_from_title(tm.title)
             if not player_a_name or not player_b_name:
@@ -564,6 +599,8 @@ class SportsOrchestrator:
                 pregame_home_prob=price_a,
                 pregame_away_prob=price_b,
             )
+            link.tournament = _tourn_name
+            link.tier = _tourn_tier
             self.tennis_links[tm.event_id] = link
 
             # Determine who is the pre-game favorite
@@ -973,7 +1010,8 @@ class SportsOrchestrator:
                             )
                             continue
 
-                        log.info("TENNIS_DELAYED_ENTRY | delay=%.0fs confirm=%d edge=%.4f | %s",
+                        log.info("TENNIS_DELAYED_ENTRY | tier=%s | tourn=%s | delay=%.0fs confirm=%d edge=%.4f | %s",
+                                 link.tier, link.tournament,
                                  entry_delay_actual, confirm_at_entry,
                                  current_edge, link.polymarket_title[:40])
                         diag["signal_ok"] += 1
@@ -1003,6 +1041,7 @@ class SportsOrchestrator:
                             player=fav_name, trigger_type=signal.trigger_type,
                             entry_price=market_price, fair_value=signal.fair_price,
                             edge=current_edge, entry_score=score_str, spread=current_spread,
+                            tournament=link.tournament, tier=link.tier,
                         )
                         log.info("TENNIS PAPER ENTRY | %s | edge=%.4f | mkt=%.4f | delay=%.0fs | %s %d-%d %d-%d",
                                  signal.trigger_type, current_edge, market_price,
@@ -1051,8 +1090,9 @@ class SportsOrchestrator:
 
                     # Log signal
                     self.tennis_logger.log_signal(signal)
-                    log.info("TENNIS SIGNAL | %s | edge=%+.4f | fair=%.4f | mkt=%.4f",
-                             signal.trigger_type, signal.edge, signal.fair_price, market_price)
+                    log.info("TENNIS SIGNAL | %s | tier=%s | tourn=%s | edge=%+.4f | fair=%.4f | mkt=%.4f",
+                             signal.trigger_type, link.tier, link.tournament,
+                             signal.edge, signal.fair_price, market_price)
 
                     # Check execution guards
                     decision = self.tennis_guard.can_execute(signal, state)
@@ -1151,9 +1191,21 @@ class SportsOrchestrator:
                 sb_closed = self.sb_detector.check_exits(_sb_get_price)
                 for sbt in sb_closed:
                     # v8.1: Spread breakout exit TG removed (noise) — log only
-                    log.info("SB_EXIT | %s | %s | entry=%.4f exit=%.4f R=%s | dur=%.0fs",
-                             sbt.player, sbt.exit_reason, sbt.entry_price,
-                             sbt.exit_price, f"{sbt.r_multiple:+.4f}", sbt.duration_s)
+                    _sb_tier = sb_link.tier if hasattr(sb_link, 'tier') else "unknown"
+                    _sb_tourn = sb_link.tournament if hasattr(sb_link, 'tournament') else ""
+                    log.info("SB_EXIT | %s | %s | tier=%s | tourn=%s | entry=%.4f exit=%.4f R=%s | dur=%.0fs",
+                             sbt.player, sbt.exit_reason, _sb_tier, _sb_tourn,
+                             sbt.entry_price, sbt.exit_price,
+                             f"{sbt.r_multiple:+.4f}", sbt.duration_s)
+                    # v9.2: Accumulate per-tier R
+                    self._tier_r.setdefault(_sb_tier, []).append(sbt.r_multiple)
+                    self._tier_trade_count += 1
+                    if self._tier_trade_count % 10 == 0:
+                        _parts = []
+                        for _t, _rs in sorted(self._tier_r.items()):
+                            _parts.append(f"{_t}: {len(_rs)} trades R={sum(_rs):+.3f}")
+                        log.info("TENNIS_TIER_SUMMARY | trades=%d | %s",
+                                 self._tier_trade_count, " | ".join(_parts))
                     # v9.0: Feed per-strategy CB with SB exit outcome
                     circuit_breaker.record_trade_outcome(
                         sbt.r_multiple,

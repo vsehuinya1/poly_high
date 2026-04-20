@@ -82,6 +82,8 @@ class GameMarketLink:
     pregame_away_prob: float = 0.0
     lambda_home: Optional[float] = None   # pre-warmed via invert_1x2_to_lambdas
     lambda_away: Optional[float] = None   # pre-warmed via invert_1x2_to_lambdas
+    tournament: str = ""                  # v9.2: tournament name (tennis only)
+    tier: str = "unknown"                 # v9.2: slam/atp1000/atp500/atp250/wta1000/wta/low_tier/unknown
 
 
 # ═══════════════════════════════════════════════════════════════════════

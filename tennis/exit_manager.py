@@ -76,6 +76,9 @@ class TennisPaperTrade:
     mae: float = 0.0               # max adverse excursion (absolute)
     mae_ticks: int = 0             # max adverse excursion in ticks (1 tick = $0.01)
     min_price_seen: float = 0.0    # worst price seen during trade
+    # v9.2: Tournament context for tier-based analysis
+    tournament: str = ""
+    tier: str = "unknown"
 
     @property
     def duration_seconds(self) -> float:
@@ -187,6 +190,8 @@ class TennisExitManager:
         spread_at_signal: float = 0.0,
         mid_price_signal: float = 0.0,
         mid_price_entry: float = 0.0,
+        tournament: str = "",
+        tier: str = "unknown",
     ) -> TennisPaperTrade:
         """Register a new paper trade after a signal is accepted."""
         # ═══ GLOBAL EDGE GUARD (v6.1 — inside function, non-bypassable) ═══
@@ -230,6 +235,8 @@ class TennisExitManager:
             spread_at_entry=spread,
             mid_price_signal=mid_price_signal,
             mid_price_entry=mid_price_entry,
+            tournament=tournament,
+            tier=tier,
         )
 
         # If there's already an open trade for this match, close it first
@@ -445,10 +452,10 @@ class TennisExitManager:
         # v5.0: Diagnostic summary log
         log.info(
             "TENNIS_EXIT_SUMMARY | "
-            "reason=%s | mfe=%.4f | mae=%.4f | "
+            "reason=%s | tier=%s | tourn=%s | mfe=%.4f | mae=%.4f | "
             "time_to_mfe=%.1fs | duration=%.1fs | "
             "entry=%.4f exit=%.4f R=%+.4f | %s",
-            exit_reason, trade.mfe, trade.mae,
+            exit_reason, trade.tier, trade.tournament, trade.mfe, trade.mae,
             trade.time_to_mfe_seconds, elapsed,
             trade.entry_price, exit_price, trade.R_multiple,
             trade.match_id,
@@ -457,10 +464,10 @@ class TennisExitManager:
         # v7.0: MISSED_RUNNER — log trades that had high MFE but exited poorly
         if trade.mfe >= 0.05 and trade.R_multiple < 0.05:
             log.warning(
-                "MISSED_RUNNER | mfe=%.4f exit_R=%+.4f | "
+                "MISSED_RUNNER | tier=%s | mfe=%.4f exit_R=%+.4f | "
                 "exit_reason=%s | duration=%.0fs | "
                 "runner_active=%s | %s",
-                trade.mfe, trade.R_multiple,
+                trade.tier, trade.mfe, trade.R_multiple,
                 exit_reason, elapsed,
                 trade.runner_v2_active, trade.match_id,
             )
