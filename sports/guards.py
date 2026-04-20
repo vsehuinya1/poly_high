@@ -27,6 +27,9 @@ STRAT_TENNIS_SB = "spread_breakout"      # tennis spread breakout
 STRAT_TENNIS_INFLECTION = "inflection"   # tennis inflection strategy
 STRAT_CRICKET_MOM = "tick_momentum"      # cricket tick momentum
 
+# v9.2: Training mode — CB records and notifies but NEVER blocks entries
+TRAINING_MODE = True
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Edge Quality Tracker — rolling metrics for signal monitoring
@@ -114,39 +117,39 @@ class StrategyCircuitBreaker:
         - R == 0: ignore completely (breakeven)
         """
         key = (sport, strategy)
+        prev_streak = self._loss_streaks.get(key, 0)
 
         if r_multiple < 0:
             # LOSS — increment streak
-            streak = self._loss_streaks.get(key, 0) + 1
-            self._loss_streaks[key] = streak
+            new_streak = prev_streak + 1
+            self._loss_streaks[key] = new_streak
 
             log.info(
                 "CB_LOSS | sport=%s | strat=%s | streak=%d/%d | R=%+.3f",
-                sport, strategy, streak, self.loss_streak_limit, r_multiple,
+                sport, strategy, new_streak, self.loss_streak_limit, r_multiple,
             )
 
-            if streak >= self.loss_streak_limit and key not in self._disabled_keys:
-                self._trip(sport, strategy, streak)
+            # TRIGGER ONLY ON 4→5 TRANSITION (prevents duplicates)
+            if prev_streak == self.loss_streak_limit - 1 and new_streak == self.loss_streak_limit:
+                self._trip(sport, strategy, new_streak)
 
         elif r_multiple > 0:
             # WIN — reset streak + re-enable
-            old_streak = self._loss_streaks.get(key, 0)
-            self._loss_streaks[key] = 0
-
-            if key in self._disabled_keys:
-                self._disabled_keys.discard(key)
-                self._notified_keys.discard(key)
-                elapsed = time.time() - self._disable_times.get(key, 0)
-                log.warning(
-                    "CB_RESET | sport=%s | strat=%s | "
-                    "was_disabled_for=%.0fs | reset_by_win R=%+.3f",
-                    sport, strategy, elapsed, r_multiple,
+            if prev_streak >= self.loss_streak_limit:
+                log.info(
+                    "CB_RESET | sport=%s | strat=%s | reset_by_win R=%+.3f",
+                    sport, strategy, r_multiple,
                 )
-            elif old_streak > 0:
+
+            elif prev_streak > 0:
                 log.info(
                     "CB_WIN | sport=%s | strat=%s | streak_reset %d→0 | R=%+.3f",
-                    sport, strategy, old_streak, r_multiple,
+                    sport, strategy, prev_streak, r_multiple,
                 )
+
+            self._loss_streaks[key] = 0
+            self._disabled_keys.discard(key)
+            self._notified_keys.discard(key)
 
         # R == 0: intentionally ignored — no increment, no reset
 
@@ -169,13 +172,14 @@ class StrategyCircuitBreaker:
         self._disabled_keys.add(key)
         self._disable_times[key] = time.time()
 
-        log.error(
+        mode_str = "observe_only" if TRAINING_MODE else "live"
+        log.warning(
             "CIRCUIT_BREAKER_TRIGGERED | sport=%s | strat=%s | "
-            "streak=%d | action=blocked",
-            sport, strategy, streak,
+            "streak=%d | mode=%s",
+            sport, strategy, streak, mode_str,
         )
 
-        # Telegram notification — only on first trip (spam protection)
+        # Telegram notification — only ONCE per trip (4→5 guarantees single call)
         if key not in self._notified_keys:
             self._notified_keys.add(key)
             if self._tg_callback:
@@ -220,6 +224,10 @@ class StrategyCircuitBreaker:
         Returns:
             (can_trade: bool, reason: str)
         """
+        if TRAINING_MODE:
+            # NEVER block in training mode
+            return True, ""
+
         key = (sport, strategy)
         if key in self._disabled_keys:
             streak = self._loss_streaks.get(key, 0)

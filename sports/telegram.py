@@ -209,10 +209,14 @@ class TelegramNotifier:
 
     async def notify_circuit_breaker(self, sport: str, strategy: str,
                                       streak: int):
+        from sports.guards import TRAINING_MODE
+        mode_line = "├ Mode: OBSERVE ONLY (no blocking)\n" if TRAINING_MODE else ""
+        action = "OBSERVING (training)" if TRAINING_MODE else "BLOCKED (entries disabled)"
         await self.send(
             f"🚨 <b>CIRCUIT BREAKER TRIGGERED</b>\n"
             f"├ Sport: {sport}\n"
             f"├ Strategy: {strategy}\n"
             f"├ Consecutive losses: {streak}\n"
-            f"└ Action: BLOCKED (entries disabled)"
+            f"{mode_line}"
+            f"└ Action: {action}"
         )
