@@ -63,6 +63,7 @@ from sports.config import (
 from sports.guards import validate_trade_execution, circuit_breaker, STRAT_TENNIS_INFLECTION, STRAT_TENNIS_SB, STRAT_CRICKET_MOM
 from tennis.live_executor import LiveExecutor
 from tennis.spread_breakout import SpreadBreakoutDetector
+from tennis.signal_snapshots import SignalSnapshotScheduler
 
 # Cricket engine imports
 from cricket import (
@@ -450,6 +451,8 @@ class SportsOrchestrator:
         # v9.2: Per-tier R tracking for summary logging
         self._tier_r: dict[str, list] = {}  # tier → [R values]
         self._tier_trade_count = 0
+        # v9.7: Post-signal price snapshot scheduler
+        self._signal_snapshots = SignalSnapshotScheduler(self.poly_feed)
 
         # ── Cricket Engine (Paper Only) ───────────────────────────
         self.cricket_feed = CricketFeed()
@@ -1093,6 +1096,18 @@ class SportsOrchestrator:
                     log.info("TENNIS SIGNAL | %s | tier=%s | tourn=%s | edge=%+.4f | fair=%.4f | mkt=%.4f",
                              signal.trigger_type, link.tier, link.tournament,
                              signal.edge, signal.fair_price, market_price)
+
+                    # v9.7: Schedule post-signal price snapshots (+5s, +10s, +30s)
+                    _snap_id = f"{match_id}_{int(time.time())}"
+                    self._signal_snapshots.schedule(
+                        signal_id=_snap_id,
+                        token_id=fav_token,
+                        signal_time=time.time(),
+                        price_signal=market_price,
+                        match_id=match_id,
+                        trigger_type=signal.trigger_type,
+                        logger=self.tennis_logger,
+                    )
 
                     # Check execution guards
                     decision = self.tennis_guard.can_execute(signal, state)

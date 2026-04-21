@@ -3,6 +3,8 @@ Tennis edge validation CSV logger.
 
 Writes structured trade/signal data to CSV for post-hoc analysis.
 Follows the same CSVLogger pattern from sports/engine.py.
+
+v9.7: Added signal snapshot logging (post-signal price captures).
 """
 from __future__ import annotations
 
@@ -57,6 +59,19 @@ SIGNAL_LOG_HEADERS = [
     "momentum_delta",
     "p_a",
     "p_b",
+]
+
+# v9.7: Post-signal price snapshot schema
+SNAPSHOT_LOG_HEADERS = [
+    "signal_time",
+    "match_id",
+    "token_id",
+    "trigger_type",
+    "price_signal",
+    "price_t5",
+    "price_t10",
+    "price_t30",
+    "time_to_first_tick",
 ]
 
 
@@ -163,6 +178,27 @@ class TennisCSVLogger:
             str(lag_detected),
             exit_reason,
             f"{r_multiple:.4f}" if r_multiple else "",
+        ])
+
+    # ── v9.7: Signal Snapshot Logging ─────────────────────────────
+
+    def log_signal_snapshot(self, snap) -> None:
+        """Log a post-signal price snapshot row.
+
+        Args:
+            snap: SignalSnapshot dataclass from signal_snapshots module.
+        """
+        w = self._get_writer("tennis_signal_snapshots", SNAPSHOT_LOG_HEADERS)
+        w.writerow([
+            f"{snap.signal_time:.3f}",
+            snap.match_id,
+            snap.token_id,
+            snap.trigger_type,
+            f"{snap.price_signal:.4f}",
+            f"{snap.price_t5:.4f}" if snap.price_t5 is not None else "",
+            f"{snap.price_t10:.4f}" if snap.price_t10 is not None else "",
+            f"{snap.price_t30:.4f}" if snap.price_t30 is not None else "",
+            f"{snap.time_to_first_tick:.3f}" if snap.time_to_first_tick is not None else "",
         ])
 
     # ── Cleanup ───────────────────────────────────────────────────
