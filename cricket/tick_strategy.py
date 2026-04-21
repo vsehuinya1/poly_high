@@ -281,30 +281,20 @@ class CricketTickDetector:
                 self._skip("continuation_fail")
                 del self._pending_confirm[match_id]
                 return None
-            # ── Continuation confirmed → create pullback ──
+            # ── v9.5: Continuation confirmed → MARKET ENTRY (bypass pullback) ──
             log.info(
                 "CRICKET_CONTINUATION_PASS | %s | dir=%s | peak=%.4f | next=%.4f",
                 match_id, direction, peak, mid,
             )
             sig = pc['signal']
-            if direction == "LONG":
-                limit = mid - PULLBACK_OFFSET
-            else:
-                limit = mid + PULLBACK_OFFSET
-            self._pending[match_id] = PendingPullback(
-                signal=sig,
-                spike_peak=mid,
-                limit_price=limit,
-                created_ts=timestamp,
-                direction=direction,
-            )
+            sig.entry_price = mid
             log.info(
-                "CRICKET_PULLBACK_PENDING | %s | dir=%s | peak=%.4f "
-                "limit=%.4f | edge=%.4f",
-                match_id, direction, mid, limit, sig.edge,
+                "CRICKET_MARKET_ENTRY | %s | dir=%s | entry=%.4f "
+                "| peak=%.4f | confirm_price=%.4f | reason=POST_CONTINUATION",
+                match_id, direction, mid, peak, mid,
             )
             del self._pending_confirm[match_id]
-            return None
+            return sig
 
         # Price band
         if mid < PRICE_FLOOR or mid > PRICE_CEIL:
