@@ -165,12 +165,14 @@ class CricketTickDetector:
         # v8.5: Stateful mid tracking for sparse REST data
         self._last_mid: dict[str, float] = {}     # match_id → last distinct mid
         self._last_mid_ts: dict[str, float] = {}  # match_id → timestamp of last change
+        # v9.4: Continuation confirmation — pending spikes awaiting next-tick verify
+        self._pending_confirm: dict[str, dict] = {}  # match_id → {signal, peak, dir, ts}
         self._skip_counts: dict[str, int] = {
             "no_move": 0, "spread": 0, "band": 0, "cooldown": 0,
             "not_ipl": 0, "small_spike": 0, "no_contraction": 0,
             "low_edge": 0, "retrace": 0, "too_early": 0,
             "low_momentum": 0, "match_cooldown": 0, "pullback_expired": 0,
-            "score_filter": 0,
+            "score_filter": 0, "continuation_fail": 0,
         }
         self._last_skip_log = 0.0
 
@@ -245,6 +247,63 @@ class CricketTickDetector:
                              match_id, pending.spike_peak, pending.limit_price, mid, spread)
                     del self._pending[match_id]
                     return fill_signal
+            return None
+
+        # v9.4: Check pending continuation confirmation
+        if match_id in self._pending_confirm:
+            pc = self._pending_confirm[match_id]
+            age = timestamp - pc['ts']
+            peak = pc['peak']
+            direction = pc['dir']
+            # Timeout: no confirmation tick within 15s → reject
+            if age > 15.0:
+                log.info(
+                    "CRICKET_SPIKE_REJECT | %s | reason=CONTINUATION_TIMEOUT "
+                    "| dir=%s | peak=%.4f | age=%.1fs",
+                    match_id, direction, peak, age,
+                )
+                self._skip("continuation_fail")
+                del self._pending_confirm[match_id]
+                return None
+            # Check continuation on this tick
+            if direction == "LONG":
+                drop = peak - mid
+                passed = mid >= peak - 0.003
+            else:  # SHORT
+                drop = mid - peak
+                passed = mid <= peak + 0.003
+            if not passed:
+                log.info(
+                    "CRICKET_SPIKE_REJECT | %s | reason=CONTINUATION_FAIL "
+                    "| dir=%s | peak=%.4f | next=%.4f | drop=%.4f",
+                    match_id, direction, peak, mid, drop,
+                )
+                self._skip("continuation_fail")
+                del self._pending_confirm[match_id]
+                return None
+            # ── Continuation confirmed → create pullback ──
+            log.info(
+                "CRICKET_CONTINUATION_PASS | %s | dir=%s | peak=%.4f | next=%.4f",
+                match_id, direction, peak, mid,
+            )
+            sig = pc['signal']
+            if direction == "LONG":
+                limit = mid - PULLBACK_OFFSET
+            else:
+                limit = mid + PULLBACK_OFFSET
+            self._pending[match_id] = PendingPullback(
+                signal=sig,
+                spike_peak=mid,
+                limit_price=limit,
+                created_ts=timestamp,
+                direction=direction,
+            )
+            log.info(
+                "CRICKET_PULLBACK_PENDING | %s | dir=%s | peak=%.4f "
+                "limit=%.4f | edge=%.4f",
+                match_id, direction, mid, limit, sig.edge,
+            )
+            del self._pending_confirm[match_id]
             return None
 
         # Price band
@@ -388,7 +447,7 @@ class CricketTickDetector:
                 )
                 return None
 
-            # ── Signal passed all gates → create pending pullback ──
+            # ── v9.4: Signal passed all gates → store for continuation confirm ──
             if signal:
                 log.info(
                     "CRICKET_SPIKE_ACCEPTED | %s | dir=%s | move=%.4f "
@@ -396,23 +455,15 @@ class CricketTickDetector:
                     match_id, signal.direction, signal.move,
                     spread, mid,
                 )
-                if signal.direction == "LONG":
-                    limit = mid - PULLBACK_OFFSET
-                else:
-                    limit = mid + PULLBACK_OFFSET
-                self._pending[match_id] = PendingPullback(
-                    signal=signal,
-                    spike_peak=mid,
-                    limit_price=limit,
-                    created_ts=timestamp,
-                    direction=signal.direction,
-                )
-                log.info(
-                    "CRICKET_PULLBACK_PENDING | %s | dir=%s | peak=%.4f "
-                    "limit=%.4f | edge=%.4f",
-                    match_id, signal.direction, mid, limit, signal.edge,
-                )
-                return None  # will fill on a subsequent tick
+                # Store spike and wait for NEXT tick to confirm continuation
+                self._pending_confirm[match_id] = {
+                    'signal': signal,
+                    'peak': mid,
+                    'dir': signal.direction,
+                    'ts': timestamp,
+                }
+                self._last_signal_ts[match_id] = timestamp
+                return None  # will confirm on next tick
         else:
             # No spike — check spread for diag counting only
             if spread > SPIKE_MAX_SPREAD:
@@ -445,7 +496,7 @@ class CricketTickDetector:
                 "CRICKET_TICK_DIAG | markets=%d | total_ticks=%d | "
                 "skips: not_ipl=%d small_spike=%d no_contraction=%d "
                 "low_edge=%d spread=%d band=%d retrace=%d cooldown=%d "
-                "low_momentum=%d match_cd=%d pullback_exp=%d",
+                "low_momentum=%d match_cd=%d pullback_exp=%d cont_fail=%d",
                 len(self._ticks), total_ticks,
                 self._skip_counts.get("not_ipl", 0),
                 self._skip_counts.get("small_spike", 0),
@@ -458,6 +509,7 @@ class CricketTickDetector:
                 self._skip_counts.get("low_momentum", 0),
                 self._skip_counts.get("match_cooldown", 0),
                 self._skip_counts.get("pullback_expired", 0),
+                self._skip_counts.get("continuation_fail", 0),
             )
             self._skip_counts = {k: 0 for k in self._skip_counts}
             self._last_skip_log = timestamp
