@@ -168,7 +168,7 @@ TENNIS_PRICE_FLOOR         = 0.20   # v4.9.2: raised from 0.15 — align with ex
 TENNIS_PRICE_FLOOR_BYPASS  = 0.15   # v4.9.2: high-edge trades bypass floor if max_edge >= this
 
 # Tennis Entry Timing — Lightweight (v4.6)
-TENNIS_ENTRY_DELAY_S       = 30     # 30s delay before entry
+TENNIS_ENTRY_DELAY_S       = 15     # v9.8A: reduced from 30 — improves fill rate, reduces restart exposure
 TENNIS_ENTRY_CONFIRM_TICKS = 2      # 2 confirmations required
 TENNIS_ENTRY_MIN_EDGE      = 0.06   # edge must persist above this
 TENNIS_EDGE_DECAY_THRESH   = 0.30   # cancel if edge drops >30% from initial

@@ -64,6 +64,7 @@ from sports.guards import validate_trade_execution, circuit_breaker, STRAT_TENNI
 from tennis.live_executor import LiveExecutor
 from tennis.spread_breakout import SpreadBreakoutDetector
 from tennis.signal_snapshots import SignalSnapshotScheduler
+from tennis.pending_store import PendingStore
 
 # Cricket engine imports
 from cricket import (
@@ -453,6 +454,8 @@ class SportsOrchestrator:
         self._tier_trade_count = 0
         # v9.7: Post-signal price snapshot scheduler
         self._signal_snapshots = SignalSnapshotScheduler(self.poly_feed)
+        # v9.8A: Pending queue persistence
+        self._pending_store = PendingStore(DATA_DIR)
 
         # ── Cricket Engine (Paper Only) ───────────────────────────
         self.cricket_feed = CricketFeed()
@@ -904,6 +907,9 @@ class SportsOrchestrator:
         last_health_log = time.time()
         last_diag_log = 0  # v4.6.2 diagnostic
 
+        # v9.8A: Restore persisted pending entries on startup
+        self._restore_pending_from_disk()
+
         while not self._shutdown:
             try:
                 # v4.6.2: diagnostic counters
@@ -962,17 +968,19 @@ class SportsOrchestrator:
 
                         # Decay guard
                         if pend["initial_edge"] > 0 and current_edge < pend["initial_edge"] * (1 - TENNIS_EDGE_DECAY_THRESH):
-                            log.info("TENNIS_PENDING_CANCEL_DECAY | edge %.4f → %.4f | %s",
+                            log.info("TENNIS_PENDING_DROPPED | reason=edge_decay | edge %.4f → %.4f | %s",
                                      pend["initial_edge"], current_edge,
                                      link.polymarket_title[:40])
                             del self._tennis_pending[pending_key]
+                            self._pending_store.save(self._tennis_pending)
                             continue
 
                         # Expiry
                         if elapsed_p > TENNIS_ENTRY_MAX_DELAY_S:
-                            log.info("TENNIS_PENDING_EXPIRE | %.0fs | %s",
+                            log.info("TENNIS_PENDING_DROPPED | reason=timeout | %.0fs | %s",
                                      elapsed_p, link.polymarket_title[:40])
                             del self._tennis_pending[pending_key]
+                            self._pending_store.save(self._tennis_pending)
                             continue
 
                         # Check entry conditions
@@ -988,11 +996,14 @@ class SportsOrchestrator:
                             continue
 
                         # All conditions met → execute
+                        log.info("TENNIS_ENTRY_ATTEMPT | %s | mkt=%.4f | edge=%.4f | elapsed=%.0fs",
+                                 link.polymarket_title[:40], market_price, current_edge, elapsed_p)
                         entry_delay_actual = elapsed_p
                         confirm_at_entry = pend["confirm_count"]
                         signal = pend["signal"]
                         state = pend["state"]
                         del self._tennis_pending[pending_key]
+                        self._pending_store.save(self._tennis_pending)
 
                         # ═══════════════════════════════════════════════
                         # HARD PRICE BAND GATE (v5.1 — non-bypassable)
@@ -1046,8 +1057,8 @@ class SportsOrchestrator:
                             edge=current_edge, entry_score=score_str, spread=current_spread,
                             tournament=link.tournament, tier=link.tier,
                         )
-                        log.info("TENNIS PAPER ENTRY | %s | edge=%.4f | mkt=%.4f | delay=%.0fs | %s %d-%d %d-%d",
-                                 signal.trigger_type, current_edge, market_price,
+                        log.info("TENNIS_ENTRY_CONFIRMED | %s | entry_price=%.4f | edge=%.4f | delay=%.0fs | %s %d-%d %d-%d",
+                                 signal.trigger_type, market_price, current_edge,
                                  entry_delay_actual, link.polymarket_title[:30],
                                  state.sets_a, state.sets_b, state.games_a, state.games_b)
                         # Live order
@@ -1142,8 +1153,12 @@ class SportsOrchestrator:
                         "fav_book": fav_book,
                         "market_price": market_price,
                     }
-                    log.info("TENNIS_PENDING_START | %s | edge=%.4f | mkt=%.4f | %s",
-                             signal.trigger_type, signal.edge, market_price,
+                    # v9.8A: Persist to disk + enhanced logging
+                    self._pending_store.save(self._tennis_pending)
+                    fav_name = state.pregame_favorite_id or link.home_team or "?"
+                    log.info("TENNIS_PENDING_CREATED | %s | %s | mkt=%.4f | edge=%.4f | delay=%ds | %s",
+                             fav_name, signal.trigger_type, market_price,
+                             signal.edge, TENNIS_ENTRY_DELAY_S,
                              link.polymarket_title[:40])
 
                 # ── Spread Breakout: tick detection (v5.2) ─────────
@@ -1253,6 +1268,86 @@ class SportsOrchestrator:
                 log.error("tennis signal loop error: %s", e)
 
             await asyncio.sleep(POLYMARKET_SNAPSHOT_S)
+
+    # ── v9.8A: Pending queue restore from disk ──────────────────────
+
+    def _restore_pending_from_disk(self):
+        """Restore persisted pending entries after engine restart.
+
+        For each entry, re-lookup the live link, state, and book objects.
+        Reconstruct a TennisSignal from the stored scalars.
+        Skip entries whose match is no longer tracked.
+        """
+        from tennis.state import TennisState, PointScore, TennisModelOutput
+        from tennis.model import get_win_prob
+
+        entries = self._pending_store.load(TENNIS_ENTRY_MAX_DELAY_S)
+        restored = 0
+
+        for entry in entries:
+            match_id = entry.get("match_id", "")
+            token_id = entry.get("token_id", "")
+            direction = entry.get("direction", "BUY")
+
+            # Look up live objects
+            link = self.tennis_links.get(match_id)
+            state = self.tennis_states.get(match_id)
+            fav_book = self.poly_feed.books.get(token_id)
+
+            if not link or not state:
+                log.info("TENNIS_PENDING_RESTORE_SKIP | %s | reason=no_link_or_state", match_id)
+                continue
+
+            # Reconstruct TennisSignal from stored fields + live model
+            try:
+                model = get_win_prob(state)
+                if state.pregame_favorite_id == state.player_a_id:
+                    fair_fav = model.p_a
+                else:
+                    fair_fav = model.p_b
+
+                signal = TennisSignal(
+                    timestamp=entry.get("start_time", time.time()),
+                    match_id=match_id,
+                    trigger_type=entry.get("trigger_type", "SET_MEAN_REVERSION"),
+                    edge=entry.get("signal_edge", 0.0),
+                    fair_price=fair_fav,  # Use current fair value
+                    market_price=entry.get("signal_market_price", 0.0),
+                    state_snapshot=state,
+                    model_output=model,
+                )
+            except Exception as e:
+                log.warning("TENNIS_PENDING_RESTORE_FAIL | %s | %s", match_id, e)
+                continue
+
+            pending_key = (match_id, token_id, direction)
+
+            # Dedup: skip if already in memory
+            if pending_key in self._tennis_pending:
+                continue
+
+            self._tennis_pending[pending_key] = {
+                "start_time": entry["start_time"],
+                "confirm_count": entry.get("confirm_count", 1),
+                "initial_edge": entry.get("initial_edge", 0.0),
+                "last_edge": entry.get("last_edge", 0.0),
+                "signal": signal,
+                "link": link,
+                "state": state,
+                "fav_token": token_id,
+                "fav_book": fav_book,
+                "market_price": entry.get("market_price", 0.0),
+            }
+            remaining = TENNIS_ENTRY_MAX_DELAY_S - (time.time() - entry["start_time"])
+            log.info(
+                "TENNIS_PENDING_RESTORED_ENTRY | %s | remaining=%.0fs | edge=%.4f | %s",
+                match_id, remaining, entry.get("initial_edge", 0),
+                entry.get("polymarket_title", ""),
+            )
+            restored += 1
+
+        if restored > 0:
+            log.info("TENNIS_PENDING_RESTORE_COMPLETE | restored=%d", restored)
 
     def _tennis_check_exits(self):
         """Run ExitManager check_all with accessor lambdas."""
