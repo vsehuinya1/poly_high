@@ -81,8 +81,11 @@ CONTINUATION_S = 90.0       # must see +0.02 within 90s of entry
 CONTINUATION_MIN_MOVE = 0.02
 
 # v8.2: Regime Filter
-REGIME_LOOKBACK_S = 60.0    # look back 60s for momentum
-REGIME_MIN_MOVE = 0.02      # require 2¢ move in last 60s
+REGIME_LOOKBACK_S = 150.0   # v9.6: widened from 60s for REST cadence (~70s)
+REGIME_MIN_MOVE = 0.02      # require 2¢ move in last 150s
+
+# v9.6: Monster spike — bypass score filter for huge moves
+MONSTER_SPIKE_THRESHOLD = 0.10
 
 # v8.2: Match Cooldown
 MATCH_COOLDOWN_S = 180.0    # 3 minutes between trades per match
@@ -345,7 +348,15 @@ class CricketTickDetector:
                 _is_live = getattr(match_state, 'is_live', False)
                 _overs = getattr(match_state, 'overs', 0.0)
                 _recent_wicket = getattr(match_state, 'had_recent_wicket', False)
-                if not _is_live:
+                # v9.6: Monster spike bypass — huge moves skip score filter
+                _is_monster = abs(signal.move) >= MONSTER_SPIKE_THRESHOLD
+                if _is_monster:
+                    log.info(
+                        "CRICKET_SCORE_BYPASS | %s | reason=MONSTER_SPIKE "
+                        "| move=%.4f | overs=%.1f",
+                        match_id, signal.move, _overs,
+                    )
+                elif not _is_live:
                     log.info(
                         "CRICKET_SPIKE_REJECT | %s | reason=score_filter_not_live "
                         "| move=%.4f | spread=%.4f",
