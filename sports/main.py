@@ -55,6 +55,7 @@ from sports.config import (
     # v4.6 Tennis Entry Timing
     TENNIS_ENTRY_DELAY_S, TENNIS_ENTRY_CONFIRM_TICKS,
     TENNIS_ENTRY_MIN_EDGE, TENNIS_EDGE_DECAY_THRESH, TENNIS_ENTRY_MAX_DELAY_S,
+    TENNIS_STALE_OVERRIDE_EDGE,
     TENNIS_STALE_DISABLE_COUNT, TENNIS_STALE_DISABLE_S,
     TENNIS_LIVE_MODE, TENNIS_BANKROLL, TENNIS_KELLY_PCT,
     TENNIS_MIN_ORDER_USD, POLY_PRIVATE_KEY, POLY_FUNDER_ADDRESS,
@@ -1015,14 +1016,22 @@ class SportsOrchestrator:
                                         market_price, link.polymarket_title[:40])
                             continue
 
-                        # ── v7.1: Price-change activity filter ─────────
+                        # ── v7.1 / v9.9: Price-change activity filter ──
+                        # Tennis books can be stale between points. Allow
+                        # bypass when edge is strong (v9.9).
                         price_age = time.time() - self._tennis_price_change_ts.get(fav_token, time.time())
                         if price_age > 60:
-                            log.info(
-                                "TENNIS_BLOCK_REASON | %s | reason=NO_PRICE_MOVEMENT | price_age=%.1fs",
-                                link.polymarket_title[:40], price_age,
-                            )
-                            continue
+                            if current_edge >= TENNIS_STALE_OVERRIDE_EDGE:
+                                log.info(
+                                    "TENNIS_STALE_OVERRIDE | %s | price_age=%.0fs | edge=%.4f | ALLOWED",
+                                    link.polymarket_title[:40], price_age, current_edge,
+                                )
+                            else:
+                                log.info(
+                                    "TENNIS_BLOCK_REASON | %s | reason=NO_PRICE_MOVEMENT | price_age=%.1fs | edge=%.4f",
+                                    link.polymarket_title[:40], price_age, current_edge,
+                                )
+                                continue
 
                         log.info("TENNIS_DELAYED_ENTRY | tier=%s | tourn=%s | delay=%.0fs confirm=%d edge=%.4f | %s",
                                  link.tier, link.tournament,

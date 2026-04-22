@@ -172,6 +172,7 @@ TENNIS_ENTRY_DELAY_S       = 15     # v9.8A: reduced from 30 — improves fill r
 TENNIS_ENTRY_CONFIRM_TICKS = 2      # 2 confirmations required
 TENNIS_ENTRY_MIN_EDGE      = 0.06   # edge must persist above this
 TENNIS_EDGE_DECAY_THRESH   = 0.30   # cancel if edge drops >30% from initial
+TENNIS_STALE_OVERRIDE_EDGE = 0.18   # v9.9: bypass NO_PRICE_MOVEMENT if edge >= this
 TENNIS_ENTRY_MAX_DELAY_S   = 90     # discard if not filled by 90s
 TENNIS_MAX_SIGNALS_HR      = 10     # max signals per match per rolling hour
 TENNIS_STALE_DISABLE_COUNT = 20     # v4.6.2: was 5 — too aggressive, disabled matches permanently
