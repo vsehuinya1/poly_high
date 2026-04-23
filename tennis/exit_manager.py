@@ -36,6 +36,8 @@ class TennisPaperTrade:
     edge_entry: float
     entry_timestamp: float
     entry_score: str         # e.g. "0-1 2-0"
+    # v10: Unique trade identity
+    trade_id: str = ""
     # Spread capture (v1.1)
     spread: float = 0.0
     spread_capture: bool = False
@@ -65,6 +67,7 @@ class TennisPaperTrade:
     exit_reason: Optional[str] = None
     R_multiple: Optional[float] = None
     is_open: bool = True
+    is_closed: bool = False  # v10: idempotent exit guard
     # ── Execution metrics (v2.0) ──────────────────────────────────
     spread_at_signal: float = 0.0
     spread_at_entry: float = 0.0
@@ -192,6 +195,7 @@ class TennisExitManager:
         mid_price_entry: float = 0.0,
         tournament: str = "",
         tier: str = "unknown",
+        trade_id: str = "",
     ) -> TennisPaperTrade:
         """Register a new paper trade after a signal is accepted."""
         # ═══ GLOBAL EDGE GUARD (v6.1 — inside function, non-bypassable) ═══
@@ -210,6 +214,9 @@ class TennisExitManager:
             was_blocked=False, sport="tennis", strategy=STRAT_TENNIS_INFLECTION,
         )
 
+        # v10: Generate trade_id if not provided
+        _tid = trade_id or f"{match_id}_{player}_{time.time_ns()}"
+
         # Spread capture: log-only adjusted entry for paper PnL
         spread_capture = spread > self.SPREAD_CAPTURE_THRESHOLD
         adjusted = entry_price - 0.01 if spread_capture else entry_price
@@ -224,6 +231,7 @@ class TennisExitManager:
             edge_entry=edge,
             entry_timestamp=time.time(),
             entry_score=entry_score,
+            trade_id=_tid,
             spread=spread,
             spread_capture=spread_capture,
             adjusted_entry_price=adjusted,
@@ -250,8 +258,8 @@ class TennisExitManager:
 
         self.open_trades[match_id] = trade
         sc_tag = " [SPREAD_CAPTURE]" if spread_capture else ""
-        log.info("EXIT_MGR OPEN | %s | %s | entry=%.4f adj=%.4f fair=%.4f edge=%+.4f | spread=%.3f%s | %s",
-                 match_id, trigger_type, entry_price, adjusted, fair_value,
+        log.info("EXIT_MGR OPEN [v10] | %s | %s | trade_id=%s | entry=%.4f adj=%.4f fair=%.4f edge=%+.4f | spread=%.3f%s | %s",
+                 match_id, trigger_type, _tid, entry_price, adjusted, fair_value,
                  edge, spread, sc_tag, entry_score)
         return trade
 
@@ -426,6 +434,11 @@ class TennisExitManager:
     def _close_trade(self, trade: TennisPaperTrade, exit_price: float,
                      exit_reason: str, exit_score: Optional[str]):
         """Close a trade, compute R, log to CSV, move to closed list."""
+        # v10: Idempotent exit guard — never close twice
+        if getattr(trade, "is_closed", False):
+            return
+        trade.is_closed = True
+
         # v5.0: Validate exit reason
         assert exit_reason in _VALID_EXIT_REASONS, \
             f"Invalid exit_reason '{exit_reason}' — must be one of {_VALID_EXIT_REASONS}"
@@ -449,13 +462,14 @@ class TennisExitManager:
         self.open_trades.pop(trade.match_id, None)
         self.closed_trades.append(trade)
 
-        # v5.0: Diagnostic summary log
+        # v10: Diagnostic summary log with trade_id
         log.info(
-            "TENNIS_EXIT_SUMMARY | "
-            "reason=%s | tier=%s | tourn=%s | mfe=%.4f | mae=%.4f | "
+            "TENNIS_EXIT_SUMMARY [v10] | "
+            "trade_id=%s | reason=%s | tier=%s | tourn=%s | mfe=%.4f | mae=%.4f | "
             "time_to_mfe=%.1fs | duration=%.1fs | "
             "entry=%.4f exit=%.4f R=%+.4f | %s",
-            exit_reason, trade.tier, trade.tournament, trade.mfe, trade.mae,
+            trade.trade_id, exit_reason, trade.tier, trade.tournament,
+            trade.mfe, trade.mae,
             trade.time_to_mfe_seconds, elapsed,
             trade.entry_price, exit_price, trade.R_multiple,
             trade.match_id,

@@ -94,6 +94,7 @@ class SpreadBreakoutTrade:
     entry_price: float
     direction: str              # "UP" = bought expecting rise
     entry_ts: float
+    trade_id: str = ""         # v10: unique trade identity
     peak_price: float = 0.0    # best price seen
     adverse_ticks: int = 0     # consecutive ticks against
     last_price: float = 0.0
@@ -101,6 +102,7 @@ class SpreadBreakoutTrade:
     exit_reason: Optional[str] = None
     exit_ts: Optional[float] = None
     is_open: bool = True
+    is_closed: bool = False    # v10: idempotent exit guard
 
     @property
     def r_multiple(self) -> float:
@@ -340,6 +342,7 @@ class SpreadBreakoutDetector:
         player: str,
         entry_price: float,
         direction: str,
+        trade_id: str = "",
     ):
         """Register an executed SPREAD_BREAKOUT trade for exit tracking."""
         # ═══ GLOBAL EDGE GUARD (v6.1 — inside function, non-bypassable) ═══
@@ -353,6 +356,7 @@ class SpreadBreakoutDetector:
         if not can_exec:
             return
 
+        _tid = trade_id or f"{match_id}_{player}_{time.time_ns()}"
         self._trades[token_id] = SpreadBreakoutTrade(
             match_id=match_id,
             token_id=token_id,
@@ -360,6 +364,7 @@ class SpreadBreakoutDetector:
             entry_price=entry_price,
             direction=direction,
             entry_ts=time.time(),
+            trade_id=_tid,
             peak_price=entry_price,
             last_price=entry_price,
         )
@@ -379,6 +384,9 @@ class SpreadBreakoutDetector:
         closed = []
         for token_id, trade in list(self._trades.items()):
             if not trade.is_open:
+                continue
+            # v10: Idempotent exit guard
+            if trade.is_closed:
                 continue
 
             price = get_market_price(token_id)
@@ -430,16 +438,21 @@ class SpreadBreakoutDetector:
                     reason = "EXIT_TIMEOUT"
 
             if reason:
+                # v10: Atomic close — set is_closed before any state change
+                trade.is_closed = True
                 trade.exit_price = price
                 trade.exit_reason = reason
                 trade.exit_ts = now
                 trade.is_open = False
 
+                # v10: Set cooldown on exit to prevent re-entry loops
+                self._cooldown[token_id] = now
+
                 r_final = trade.r_multiple
                 log.info(
-                    "SPREAD_EXIT | %s | reason=%s | entry=%.4f → exit=%.4f | "
-                    "R=%+.4f | dur=%.0fs | dir=%s",
-                    trade.match_id, reason,
+                    "SPREAD_EXIT [v10] | %s | trade_id=%s | reason=%s | "
+                    "entry=%.4f → exit=%.4f | R=%+.4f | dur=%.0fs | dir=%s",
+                    trade.match_id, trade.trade_id, reason,
                     trade.entry_price, price,
                     r_final, trade.duration_s, trade.direction,
                 )

@@ -124,7 +124,7 @@ class StrategyCircuitBreaker:
             new_streak = prev_streak + 1
             self._loss_streaks[key] = new_streak
 
-            log.info(
+            log.debug(
                 "CB_LOSS | sport=%s | strat=%s | streak=%d/%d | R=%+.3f",
                 sport, strategy, new_streak, self.loss_streak_limit, r_multiple,
             )

@@ -395,6 +395,7 @@ class SportsOrchestrator:
         self.links: dict[str, GameMarketLink] = {}  # game_id → link
         self._shutdown = False
         self._tennis_pending: dict[tuple, dict] = {}  # v4.6: (match_id, token, dir) → pending state
+        self._tennis_active: set = set()  # v10: canonical trade_key set for duplicate prevention
         self._session: aiohttp.ClientSession | None = None
 
         # ── Tennis Engine ─────────────────────────────────────────
@@ -457,6 +458,8 @@ class SportsOrchestrator:
         self._signal_snapshots = SignalSnapshotScheduler(self.poly_feed)
         # v9.8A: Pending queue persistence
         self._pending_store = PendingStore(DATA_DIR)
+        # v10: Max pending lifetime (seconds)
+        self._MAX_PENDING_LIFETIME = 45
 
         # ── Cricket Engine (Paper Only) ───────────────────────────
         self.cricket_feed = CricketFeed()
@@ -969,17 +972,20 @@ class SportsOrchestrator:
 
                         # Decay guard
                         if pend["initial_edge"] > 0 and current_edge < pend["initial_edge"] * (1 - TENNIS_EDGE_DECAY_THRESH):
-                            log.info("TENNIS_PENDING_DROPPED | reason=edge_decay | edge %.4f → %.4f | %s",
-                                     pend["initial_edge"], current_edge,
+                            log.info("TENNIS_PENDING_DROPPED | reason=edge_decay | trade_id=%s | edge %.4f → %.4f | %s",
+                                     pend.get("trade_id", "?"), pend["initial_edge"], current_edge,
                                      link.polymarket_title[:40])
+                            # v10: Remove from active set on drop
+                            self._tennis_active.discard(pend.get("trade_key", ""))
                             del self._tennis_pending[pending_key]
                             self._pending_store.save(self._tennis_pending)
                             continue
 
-                        # Expiry
-                        if elapsed_p > TENNIS_ENTRY_MAX_DELAY_S:
-                            log.info("TENNIS_PENDING_DROPPED | reason=timeout | %.0fs | %s",
-                                     elapsed_p, link.polymarket_title[:40])
+                        # v10: MAX_PENDING_LIFETIME (45s hard cap)
+                        if elapsed_p > self._MAX_PENDING_LIFETIME:
+                            log.info("TENNIS_PENDING_DROPPED | reason=timeout | trade_id=%s | %.0fs | %s",
+                                     pend.get("trade_id", "?"), elapsed_p, link.polymarket_title[:40])
+                            self._tennis_active.discard(pend.get("trade_key", ""))
                             del self._tennis_pending[pending_key]
                             self._pending_store.save(self._tennis_pending)
                             continue
@@ -995,6 +1001,11 @@ class SportsOrchestrator:
                                      pend["confirm_count"], TENNIS_ENTRY_CONFIRM_TICKS,
                                      current_edge, link.polymarket_title[:30])
                             continue
+
+                        # v10: One-shot entry attempt — never attempt twice
+                        if pend.get("attempted", False):
+                            continue
+                        pend["attempted"] = True
 
                         # All conditions met → execute
                         log.info("TENNIS_ENTRY_ATTEMPT | %s | mkt=%.4f | edge=%.4f | elapsed=%.0fs",
@@ -1012,8 +1023,11 @@ class SportsOrchestrator:
                         # execution. No trade can pass outside [0.20, 0.80].
                         # ═══════════════════════════════════════════════
                         if market_price < 0.20 or market_price > 0.80:
-                            log.warning("TENNIS_SKIP_PRICE_BAND | price=%.4f | %s",
-                                        market_price, link.polymarket_title[:40])
+                            log.info("TENNIS_SIGNAL_REJECTED | %s | match=%s | mkt=%.4f | edge=%.4f | reason=PRICE_FLOOR",
+                                     state.pregame_favorite_id or link.home_team or "?",
+                                     match_id, market_price, current_edge)
+                            # v10: Remove from active on rejection
+                            self._tennis_active.discard(pend.get("trade_key", ""))
                             continue
 
                         # ── v7.1 / v9.9: Price-change activity filter ──
@@ -1028,9 +1042,12 @@ class SportsOrchestrator:
                                 )
                             else:
                                 log.info(
-                                    "TENNIS_BLOCK_REASON | %s | reason=NO_PRICE_MOVEMENT | price_age=%.1fs | edge=%.4f",
-                                    link.polymarket_title[:40], price_age, current_edge,
+                                    "TENNIS_SIGNAL_REJECTED | %s | match=%s | mkt=%.4f | edge=%.4f | reason=NO_PRICE_MOVEMENT",
+                                    state.pregame_favorite_id or link.home_team or "?",
+                                    match_id, market_price, current_edge,
                                 )
+                                # v10: Remove from active on rejection
+                                self._tennis_active.discard(pend.get("trade_key", ""))
                                 continue
 
                         log.info("TENNIS_DELAYED_ENTRY | tier=%s | tourn=%s | delay=%.0fs confirm=%d edge=%.4f | %s",
@@ -1066,8 +1083,9 @@ class SportsOrchestrator:
                             edge=current_edge, entry_score=score_str, spread=current_spread,
                             tournament=link.tournament, tier=link.tier,
                         )
-                        log.info("TENNIS_ENTRY_CONFIRMED | %s | entry_price=%.4f | edge=%.4f | delay=%.0fs | %s %d-%d %d-%d",
-                                 signal.trigger_type, market_price, current_edge,
+                        log.info("TENNIS_ENTRY_CONFIRMED [v10] | %s | trade_id=%s | entry_price=%.4f | edge=%.4f | delay=%.0fs | %s %d-%d %d-%d",
+                                 signal.trigger_type, pend.get("trade_id", "?"),
+                                 market_price, current_edge,
                                  entry_delay_actual, link.polymarket_title[:30],
                                  state.sets_a, state.sets_b, state.games_a, state.games_b)
                         # Live order
@@ -1141,8 +1159,9 @@ class SportsOrchestrator:
                     # ── v5.1: Price band pre-check (before pending) ──
                     # Block even creating a pending entry for out-of-band prices.
                     if market_price < 0.20 or market_price > 0.80:
-                        log.warning("TENNIS_SKIP_PRICE_BAND | price=%.4f | %s (pre-pending)",
-                                    market_price, link.polymarket_title[:40])
+                        log.info("TENNIS_SIGNAL_REJECTED | %s | match=%s | mkt=%.4f | edge=%.4f | reason=PRICE_FLOOR",
+                                 state.pregame_favorite_id or link.home_team or "?",
+                                 match_id, market_price, signal.edge if signal else 0.0)
                         continue
 
                     # ── v4.6.5: Create pending entry (first signal tick) ──
@@ -1150,6 +1169,16 @@ class SportsOrchestrator:
                     # ticks: persistence, decay, expiry, and execution.
                     pending_key = (match_id, fav_token, "BUY")
                     now_t = time.time()
+                    fav_name = state.pregame_favorite_id or link.home_team or "?"
+                    trade_key = f"{match_id}:{fav_name}"
+                    trade_id = f"{match_id}_{fav_name}_{time.time_ns()}"
+
+                    # v10: Duplicate lock — skip if already pending or active
+                    if trade_key in self._tennis_active:
+                        log.info("TENNIS_SKIP_DUPLICATE | %s | %s", fav_name, match_id)
+                        continue
+
+                    self._tennis_active.add(trade_key)
                     self._tennis_pending[pending_key] = {
                         "start_time": now_t,
                         "confirm_count": 1,
@@ -1161,12 +1190,14 @@ class SportsOrchestrator:
                         "fav_token": fav_token,
                         "fav_book": fav_book,
                         "market_price": market_price,
+                        "trade_id": trade_id,
+                        "trade_key": trade_key,
+                        "attempted": False,
                     }
                     # v9.8A: Persist to disk + enhanced logging
                     self._pending_store.save(self._tennis_pending)
-                    fav_name = state.pregame_favorite_id or link.home_team or "?"
-                    log.info("TENNIS_PENDING_CREATED | %s | %s | mkt=%.4f | edge=%.4f | delay=%ds | %s",
-                             fav_name, signal.trigger_type, market_price,
+                    log.info("TENNIS_PENDING_CREATED [v10] | %s | %s | trade_id=%s | mkt=%.4f | edge=%.4f | delay=%ds | %s",
+                             fav_name, signal.trigger_type, trade_id, market_price,
                              signal.edge, TENNIS_ENTRY_DELAY_S,
                              link.polymarket_title[:40])
 
@@ -1232,10 +1263,13 @@ class SportsOrchestrator:
                     # v8.1: Spread breakout exit TG removed (noise) — log only
                     _sb_tier = sb_link.tier if hasattr(sb_link, 'tier') else "unknown"
                     _sb_tourn = sb_link.tournament if hasattr(sb_link, 'tournament') else ""
-                    log.info("SB_EXIT | %s | %s | tier=%s | tourn=%s | entry=%.4f exit=%.4f R=%s | dur=%.0fs",
-                             sbt.player, sbt.exit_reason, _sb_tier, _sb_tourn,
+                    log.info("SB_EXIT [v10] | %s | trade_id=%s | %s | tier=%s | tourn=%s | entry=%.4f exit=%.4f R=%s | dur=%.0fs",
+                             sbt.player, sbt.trade_id, sbt.exit_reason, _sb_tier, _sb_tourn,
                              sbt.entry_price, sbt.exit_price,
                              f"{sbt.r_multiple:+.4f}", sbt.duration_s)
+                    # v10: Remove from active set on SB exit
+                    _sb_trade_key = f"{sbt.match_id}:{sbt.player}"
+                    self._tennis_active.discard(_sb_trade_key)
                     # v9.2: Accumulate per-tier R
                     self._tier_r.setdefault(_sb_tier, []).append(sbt.r_multiple)
                     self._tier_trade_count += 1
@@ -1404,6 +1438,10 @@ class SportsOrchestrator:
 
     def _tennis_live_sell_callback(self, trade):
         """Called by ExitManager when a trade closes — send Telegram + fire live SELL if filled."""
+        # v10: Remove trade_key from active set on exit
+        _tk = f"{trade.match_id}:{trade.player}"
+        self._tennis_active.discard(_tk)
+
         exit_price = trade.exit_price or 0.0
 
         # Calculate $ PnL (paper estimate based on $3.90 trade size)
@@ -2238,7 +2276,7 @@ class SportsOrchestrator:
     async def run(self):
         """Main entry point — start all loops."""
         log.info("=" * 60)
-        log.info("  SPORTS MARKET SYSTEM STARTING")
+        log.info("  SPORTS MARKET SYSTEM STARTING [v10]")
         log.info("  Date: %s", self.target_date)
         log.info("  Football source: ESPN (no key required)")
         log.info("  Data dir: %s", DATA_DIR.absolute())

@@ -56,6 +56,10 @@ class PendingStore:
             "initial_edge": pend["initial_edge"],
             "last_edge": pend["last_edge"],
             "market_price": pend["market_price"],
+            # v10: Trade identity
+            "trade_id": pend.get("trade_id", ""),
+            "trade_key": pend.get("trade_key", ""),
+            "attempted": pend.get("attempted", False),
             # Signal fields (needed for rehydration)
             "trigger_type": signal.trigger_type if signal else "",
             "fair_price": signal.fair_price if signal else 0.0,
