@@ -1,8 +1,9 @@
 """
 Cricket Market Health Monitor + Readiness Engine + Dead Market Detection.
 
-v2.0 — 2026-04-09  Late-liquidity activation, WARMUP phase, dead→alive recovery
-v1.0 — 2026-04-07  Initial health monitor + readiness engine
+v10.1 — 2026-04-23  Drift-aware ACTIVE_SLOW status for slow REST markets
+v2.0  — 2026-04-09  Late-liquidity activation, WARMUP phase, dead→alive recovery
+v1.0  — 2026-04-07  Initial health monitor + readiness engine
 """
 from __future__ import annotations
 
@@ -37,9 +38,10 @@ TRADE_READY_SPREAD = 0.08  # allow trades when ≤ 0.08
 # ═══════════════════════════════════════════════════════════════════════
 
 class MarketHealth(Enum):
-    HEALTHY  = "HEALTHY"
-    DEGRADED = "DEGRADED"
-    DEAD     = "DEAD"
+    HEALTHY     = "HEALTHY"
+    DEGRADED    = "DEGRADED"
+    DEAD        = "DEAD"
+    ACTIVE_SLOW = "ACTIVE_SLOW"  # v10.1: slow REST ticks but real drift
 
 
 class ReadinessStatus(Enum):
@@ -120,6 +122,18 @@ class _MarketTracker:
         return max(prices) - min(prices)
 
     @property
+    def price_range_300s(self) -> float:
+        """v10.1: Max - min mid price over the last 300 seconds (5 min)."""
+        if len(self._mid_history) < 2:
+            return 0.0
+        now = self._mid_history[-1][0]
+        cutoff = now - 300.0
+        prices = [m for t, m in self._mid_history if t >= cutoff and m > 0]
+        if len(prices) < 2:
+            return 0.0
+        return max(prices) - min(prices)
+
+    @property
     def last_update_age(self) -> float:
         if self.last_update_ts <= 0:
             return 9999.0
@@ -178,22 +192,32 @@ class CricketBookHealthMonitor:
         self._check_dead(match_id, tracker, ts)
 
     def _classify(self, t: _MarketTracker) -> MarketHealth:
-        """Classify market health: HEALTHY, DEGRADED, or DEAD."""
+        """Classify market health: HEALTHY, DEGRADED, ACTIVE_SLOW, or DEAD."""
         spread = t.last_spread
         tick_rate = t.tick_rate
-        pr = t.price_range_60s
+        pr_60 = t.price_range_60s
+        pr_300 = t.price_range_300s
         age = t.last_update_age
 
-        # DEAD conditions
+        # DEAD conditions (hard)
         if spread >= 0.90:
-            return MarketHealth.DEAD
-        if age > 60.0:
             return MarketHealth.DEAD
         if t.last_bid <= 0.02 and t.last_ask >= 0.98:
             return MarketHealth.DEAD
 
+        # v10.1: Drift-aware override — slow REST ticks but real movement
+        # If 60s shows nothing but 300s shows ≥ 2¢, it's a valid slow market
+        if pr_60 == 0.0 and pr_300 >= 0.02 and spread <= 0.10:
+            return MarketHealth.ACTIVE_SLOW
+
+        # v10.1: Relaxed staleness — allow up to 120s age if 300s range is healthy
+        if age > 120.0:
+            return MarketHealth.DEAD
+        if age > 60.0 and pr_300 < 0.02:
+            return MarketHealth.DEAD
+
         # HEALTHY: tight spread, active ticks, real movement
-        if spread <= 0.05 and tick_rate > 10 and pr >= 0.01:
+        if spread <= 0.05 and tick_rate > 10 and pr_60 >= 0.01:
             return MarketHealth.HEALTHY
 
         # Everything else is DEGRADED
@@ -213,8 +237,9 @@ class CricketBookHealthMonitor:
                 tracker.price_range_60s < self.DEAD_PRICE_RANGE):
             is_dead = True
 
-        # Rule 3: price_range_60s < 0.005
+        # Rule 3: price_range_60s < 0.005 — v10.1: only if 300s is also flat
         if (tracker.price_range_60s < self.DEAD_PRICE_RANGE and
+                tracker.price_range_300s < 0.02 and
                 tracker.tick_rate > 0):  # only if we have ticks
             is_dead = True
 
@@ -325,11 +350,12 @@ class CricketBookHealthMonitor:
             log.info(
                 "CRICKET_BOOK_HEALTH | %s | status=%s | spread=%.4f | "
                 "bid=%.4f | ask=%.4f | mid=%.4f | tick_rate=%.0f | "
-                "last_update_age=%.0fs | price_range_60s=%.4f",
+                "last_update_age=%.0fs | range_60s=%.4f | range_300s=%.4f",
                 title[:50], tracker.health.value,
                 tracker.last_spread, tracker.last_bid, tracker.last_ask,
                 tracker.last_mid, tracker.tick_rate,
                 tracker.last_update_age, tracker.price_range_60s,
+                tracker.price_range_300s,
             )
 
     def get_tracker(self, match_id: str) -> Optional[_MarketTracker]:
@@ -431,15 +457,29 @@ def check_cricket_readiness(
     else:
         issues.append("no tick history yet")
 
-    # 4. Dead book check
+    # 4. Dead book check — v10.1: allow ACTIVE_SLOW through
     if health_monitor.is_dead(match_id):
-        return ReadinessResult(
-            status=ReadinessStatus.NOT_READY,
-            reason=FailureReason.DEAD_BOOK,
-            issues=["market marked DEAD"],
-            spread=spread, tick_rate=tick_rate,
-            price_range=price_range, last_tick_age=last_tick_age,
+        # v10.1: Check if tracker shows drift (ACTIVE_SLOW)
+        _tracker = health_monitor.get_tracker(match_id)
+        _is_slow_active = (
+            _tracker is not None
+            and _tracker.health == MarketHealth.ACTIVE_SLOW
         )
+        if not _is_slow_active:
+            return ReadinessResult(
+                status=ReadinessStatus.NOT_READY,
+                reason=FailureReason.DEAD_BOOK,
+                issues=["market marked DEAD"],
+                spread=spread, tick_rate=tick_rate,
+                price_range=price_range, last_tick_age=last_tick_age,
+            )
+        else:
+            log.info(
+                "CRICKET_SLOW_BOOK_OVERRIDE | %s | range_300s=%.4f | "
+                "last_update_age=%.0f | allowing through pipeline",
+                match_id, _tracker.price_range_300s,
+                _tracker.last_update_age,
+            )
 
     # 5. Spread within threshold for phase
     max_spread = SPREAD_THRESHOLDS[phase]
@@ -460,12 +500,18 @@ def check_cricket_readiness(
     elif spread <= TRADE_READY_SPREAD and health_monitor:
         health_monitor.clear_warmup(match_id)
 
-    # 6. Tick rate ≥ 5/min
-    if tick_rate < 5:
+    # 6. Tick rate ≥ 5/min — v10.1: skip for ACTIVE_SLOW
+    _tracker_chk = health_monitor.get_tracker(match_id)
+    _is_slow = _tracker_chk and _tracker_chk.health == MarketHealth.ACTIVE_SLOW
+    if tick_rate < 5 and not _is_slow:
         issues.append(f"tick_rate {tick_rate:.0f} < 5/min")
 
-    # 7. Price movement ≥ 0.01 (CRITICAL — no false positives)
-    if price_range < 0.01:
+    # 7. Price movement ≥ 0.01 — v10.1: use 300s range for ACTIVE_SLOW
+    if _is_slow:
+        _pr_300 = _tracker_chk.price_range_300s if _tracker_chk else 0.0
+        if _pr_300 < 0.02:
+            issues.append(f"price_range_300s {_pr_300:.4f} < 0.02 (slow book)")
+    elif price_range < 0.01:
         issues.append(f"price_range_60s {price_range:.4f} < 0.01")
 
     # Determine primary failure reason
