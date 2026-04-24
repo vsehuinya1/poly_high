@@ -2,20 +2,23 @@
 description: Deploy code changes to VPS and restart the sports engine
 ---
 
-# Deploy to VPS
+# Deploy to VPS (v10.2)
 
 Run this in your terminal (not through the scaffold):
 
 ```bash
-cd /Users/MartinOile/Desktop/poly_high && ./deploy.sh "your commit message"
+cd /Users/MartinOile/Desktop/poly_high && ./deploy.sh "v10.2 release"
 ```
+
+> [!NOTE]
+> The shell scripts (`deploy.sh`, `vps.sh`, `status.sh`) have been updated to remove `timeout` dependencies for MacOS compatibility.
 
 This script handles the full pipeline:
 1. `git add -A && git commit && git push`
 2. `git fetch && git reset --hard` on VPS
 3. Kill old engines
 4. Start new engine with timestamped log
-5. Wait 15s and verify startup
+5. Wait 12s and verify startup
 
 If you need to run a single command on the VPS:
 ```bash
