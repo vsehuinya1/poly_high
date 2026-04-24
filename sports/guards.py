@@ -93,8 +93,9 @@ class StrategyCircuitBreaker:
         self._disabled_keys: set[tuple[str, str]] = set()
         self._disable_times: dict[tuple[str, str], float] = {}
 
-        # Telegram spam protection: only notify once per trip
-        self._notified_keys: set[tuple[str, str]] = set()
+        # v10: Explicit state tracking — notifications only on transitions
+        # Values: "NORMAL" or "TRIGGERED"
+        self._cb_state: dict[tuple[str, str], str] = {}
 
         # Optional async callback for Telegram notification
         # Set via set_telegram_callback() during orchestrator init
@@ -135,11 +136,27 @@ class StrategyCircuitBreaker:
 
         elif r_multiple > 0:
             # WIN — reset streak + re-enable
-            if prev_streak >= self.loss_streak_limit:
+            was_triggered = self._cb_state.get(key, "NORMAL") == "TRIGGERED"
+
+            if was_triggered:
+                log.info(
+                    "CB_STATE_CHANGE | sport=%s | strat=%s | TRIGGERED → NORMAL",
+                    sport, strategy,
+                )
                 log.info(
                     "CB_RESET | sport=%s | strat=%s | reset_by_win R=%+.3f",
                     sport, strategy, r_multiple,
                 )
+                self._cb_state[key] = "NORMAL"
+                # Telegram reset notification
+                if self._tg_callback:
+                    try:
+                        self._tg_callback(
+                            sport, strategy, 0,
+                            reset=True,
+                        )
+                    except Exception as e:
+                        log.error("CB telegram reset callback error: %s", e)
 
             elif prev_streak > 0:
                 log.info(
@@ -149,7 +166,6 @@ class StrategyCircuitBreaker:
 
             self._loss_streaks[key] = 0
             self._disabled_keys.discard(key)
-            self._notified_keys.discard(key)
 
         # R == 0: intentionally ignored — no increment, no reset
 
@@ -169,24 +185,33 @@ class StrategyCircuitBreaker:
     def _trip(self, sport: str, strategy: str, streak: int) -> None:
         """Trip the circuit breaker for a specific (sport, strategy)."""
         key = (sport, strategy)
+
+        # v10: Only emit notifications on NORMAL → TRIGGERED transition
+        prev_state = self._cb_state.get(key, "NORMAL")
+        if prev_state == "TRIGGERED":
+            return  # already triggered — no duplicate notification
+
+        self._cb_state[key] = "TRIGGERED"
         self._disabled_keys.add(key)
         self._disable_times[key] = time.time()
 
         mode_str = "observe_only" if TRAINING_MODE else "live"
+        log.warning(
+            "CB_STATE_CHANGE | sport=%s | strat=%s | NORMAL → TRIGGERED",
+            sport, strategy,
+        )
         log.warning(
             "CIRCUIT_BREAKER_TRIGGERED | sport=%s | strat=%s | "
             "streak=%d | mode=%s",
             sport, strategy, streak, mode_str,
         )
 
-        # Telegram notification — only ONCE per trip (4→5 guarantees single call)
-        if key not in self._notified_keys:
-            self._notified_keys.add(key)
-            if self._tg_callback:
-                try:
-                    self._tg_callback(sport, strategy, streak)
-                except Exception as e:
-                    log.error("CB telegram callback error: %s", e)
+        # Telegram notification — exactly once per state transition
+        if self._tg_callback:
+            try:
+                self._tg_callback(sport, strategy, streak)
+            except Exception as e:
+                log.error("CB telegram callback error: %s", e)
 
     def reset(self, sport: str = "", strategy: str = "") -> None:
         """Manual reset — only for operator intervention.
@@ -204,7 +229,7 @@ class StrategyCircuitBreaker:
                     time.time() - self._disable_times.get(key, 0),
                 )
                 self._disabled_keys.discard(key)
-                self._notified_keys.discard(key)
+                self._cb_state[key] = "NORMAL"
                 self._loss_streaks[key] = 0
         else:
             # Reset everything
@@ -214,7 +239,7 @@ class StrategyCircuitBreaker:
                     list(self._disabled_keys),
                 )
             self._disabled_keys.clear()
-            self._notified_keys.clear()
+            self._cb_state.clear()
             self._loss_streaks.clear()
             self._disable_times.clear()
 

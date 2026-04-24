@@ -2322,11 +2322,14 @@ class SportsOrchestrator:
             except Exception as e2:
                 log.error("STARTUP_TG_RETRY_FAIL | %s", e2)
 
-        # v9.0: Wire circuit breaker → Telegram notification callback
+        # v9.0 / v10: Wire circuit breaker → Telegram notification callback
         import asyncio as _asyncio
         _tg_ref = self.engine.tg
-        def _cb_telegram_callback(sport, strategy, streak):
-            _asyncio.ensure_future(_tg_ref.notify_circuit_breaker(sport, strategy, streak))
+        def _cb_telegram_callback(sport, strategy, streak, reset=False):
+            if reset:
+                _asyncio.ensure_future(_tg_ref.notify_circuit_breaker_reset(sport, strategy))
+            else:
+                _asyncio.ensure_future(_tg_ref.notify_circuit_breaker(sport, strategy, streak))
         circuit_breaker.set_telegram_callback(_cb_telegram_callback)
         log.info("CB_TELEGRAM_CALLBACK_WIRED")
 

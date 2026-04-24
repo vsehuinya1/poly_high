@@ -220,3 +220,11 @@ class TelegramNotifier:
             f"{mode_line}"
             f"└ Action: {action}"
         )
+
+    async def notify_circuit_breaker_reset(self, sport: str, strategy: str):
+        await self.send(
+            f"✅ <b>CIRCUIT BREAKER RESET</b>\n"
+            f"├ Sport: {sport}\n"
+            f"├ Strategy: {strategy}\n"
+            f"└ Status: losses cleared, entries re-enabled"
+        )
