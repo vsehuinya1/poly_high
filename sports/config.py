@@ -178,8 +178,8 @@ TENNIS_MAX_SIGNALS_HR      = 10     # max signals per match per rolling hour
 TENNIS_STALE_DISABLE_COUNT = 20     # v4.6.2: was 5 — too aggressive, disabled matches permanently
 TENNIS_STALE_DISABLE_S     = 60     # v4.6.2: was 300 — 1min disable instead of 5min
 
-# ── Cricket (Paper-Only Research Mode) ───────────────────────────────
-CRICKET_PAPER_ONLY         = True   # NEVER allow live execution
+# ── Cricket (Live + Paper Mode) ──────────────────────────────────────
+CRICKET_PAPER_ONLY         = False  # live execution enabled alongside paper
 CRICKET_TRADE_SIZE         = 200.0  # paper trade size ($)
 CRICKET_MAX_SPREAD         = 0.02   # abort if spread > this
 CRICKET_MOMENTUM_RR_THRESH = 2.0    # rolling RR must exceed RRR by this
@@ -187,6 +187,13 @@ CRICKET_MOMENTUM_EDGE      = 0.08   # min edge for momentum signal
 CRICKET_WICKET_EDGE        = 0.10   # min edge for wicket overreaction
 CRICKET_LATENCY_THRESH_MS  = 2000.0 # min latency for snipe logging
 CRICKET_COOLDOWN_S         = 120.0  # cooldown between trades
+
+# ── Cricket Live Execution ───────────────────────────────────────────
+CRICKET_LIVE_MODE      = os.getenv("CRICKET_LIVE_MODE", "true").lower() == "true"
+CRICKET_BANKROLL       = float(os.getenv("CRICKET_BANKROLL", "50.0"))
+CRICKET_KELLY_PCT      = float(os.getenv("CRICKET_KELLY_PCT", "0.20"))
+CRICKET_MIN_ORDER_USD  = 1.0       # minimum order size
+CRICKET_LIMIT_OFFSET   = 0.01      # limit offset from mid (avoids ghost liquidity)
 
 # ── Tennis Live Execution (v4.4) ─────────────────────────────────────
 TENNIS_LIVE_MODE       = os.getenv("TENNIS_LIVE_MODE", "false").lower() == "true"

@@ -77,12 +77,15 @@ from cricket import (
 )
 from cricket.tick_strategy import CricketTickDetector
 from cricket.exit_manager import CricketExitManager
+from cricket.live_executor import CricketLiveExecutor
 from sports.config import (
     CRICKET_PAPER_ONLY, CRICKET_TRADE_SIZE, CRICKET_MAX_SPREAD,
     CRICKET_MOMENTUM_RR_THRESH, CRICKET_MOMENTUM_EDGE,
     CRICKET_WICKET_EDGE, CRICKET_LATENCY_THRESH_MS,
     CRICKET_COOLDOWN_S,
     CRICKET_READINESS_CHECK_INTERVAL_S,
+    CRICKET_LIVE_MODE, CRICKET_BANKROLL, CRICKET_KELLY_PCT,
+    CRICKET_MIN_ORDER_USD, CRICKET_LIMIT_OFFSET,
 )
 
 log = logging.getLogger("sports.main")
@@ -461,7 +464,7 @@ class SportsOrchestrator:
         # v10: Max pending lifetime (seconds)
         self._MAX_PENDING_LIFETIME = 45
 
-        # ── Cricket Engine (Paper Only) ───────────────────────────
+        # ── Cricket Engine (Paper + Live) ──────────────────────────
         self.cricket_feed = CricketFeed()
         self.cricket_strategy = CricketStrategy(
             momentum_rr_threshold=CRICKET_MOMENTUM_RR_THRESH,
@@ -475,7 +478,10 @@ class SportsOrchestrator:
             trade_size_usd=CRICKET_TRADE_SIZE,
         )
         self.cricket_logger = CricketCSVLogger(DATA_DIR)
-        self.cricket_exit_mgr = CricketExitManager(data_dir=DATA_DIR)
+        self.cricket_exit_mgr = CricketExitManager(
+            data_dir=DATA_DIR,
+            on_close=self._cricket_live_sell_callback,
+        )
         self.cricket_links: dict[str, GameMarketLink] = {}  # match_id → link
         self.cricket_states: dict[str, CricketState] = {}  # match_id → latest state
         self._cricket_price_buf: dict[str, list[float]] = {}  # match_id → last N mid prices
@@ -489,6 +495,31 @@ class SportsOrchestrator:
         # v7.1: Runtime state tracking (DEAD → ACTIVE activation)
         self._cricket_runtime_state: dict[str, str] = {}     # match_id → DEAD/ACTIVE
         self._cricket_state_log_ts: dict[str, float] = {}    # throttled state logging
+
+        # ── Cricket Live Executor ─────────────────────────────────
+        self.cricket_live = None
+        if CRICKET_LIVE_MODE and not CRICKET_PAPER_ONLY:
+            self.cricket_live = CricketLiveExecutor(
+                private_key=POLY_PRIVATE_KEY,
+                funder_address=POLY_FUNDER_ADDRESS,
+                api_key=POLYMARKET_API_KEY,
+                api_secret=POLYMARKET_SECRET,
+                api_passphrase=POLYMARKET_PASSPHRASE,
+                proxy_url=CLOB_PROXY_URL,
+                initial_bankroll=CRICKET_BANKROLL,
+                kelly_pct=CRICKET_KELLY_PCT,
+                min_order_usd=CRICKET_MIN_ORDER_USD,
+                limit_offset=CRICKET_LIMIT_OFFSET,
+                data_dir=DATA_DIR,
+            )
+            if self.cricket_live.is_ready:
+                log.info(
+                    "CRICKET LIVE MODE: ON | bankroll=$%.2f | kelly=%.0f%% | offset=%.3f",
+                    CRICKET_BANKROLL, CRICKET_KELLY_PCT * 100, CRICKET_LIMIT_OFFSET,
+                )
+            else:
+                log.warning("CRICKET LIVE MODE: credentials missing — paper only")
+                self.cricket_live = None
 
     async def discover(self) -> list[SportMarket]:
         """Discover active sports markets on Polymarket."""
@@ -1496,6 +1527,69 @@ class SportsOrchestrator:
         except Exception:
             pass
 
+    # ── Cricket Live Sell Callback ─────────────────────────────
+
+    def _cricket_live_sell_callback(self, trade):
+        """Called by CricketExitManager when a paper trade closes — fire live SELL."""
+        exit_price = trade.exit_price or 0.0
+        pnl = trade.paper_pnl
+
+        # Determine direction from signal type
+        # DLS signals default to LONG; tick signals encode direction in entry_score
+        direction = "LONG"  # default
+        if hasattr(trade, 'entry_score') and trade.entry_score:
+            if trade.entry_score.startswith("SHORT"):
+                direction = "SHORT"
+            elif trade.entry_score.startswith("LONG"):
+                direction = "LONG"
+
+        # Live exit if we have a live fill for this match
+        live_tag = "PAPER"
+        if self.cricket_live and self.cricket_live.is_ready and self.cricket_live.has_live_fill(trade.match_id):
+            token_id = trade.selection_id
+            sell_size = self.cricket_live.order_size
+            match_desc = f"{trade.signal_type} R={pnl:+.4f}"
+
+            log.info(
+                "CRICKET_EXECUTION | EXIT TRIGGER | match=%s | dir=%s "
+                "| exit_price=%.4f | reason=%s",
+                trade.match_id, direction, exit_price, trade.exit_reason,
+            )
+
+            result = self.cricket_live.place_exit(
+                token_id=token_id,
+                mid=exit_price,
+                direction=direction,
+                size_usd=sell_size,
+                match_id=trade.match_id,
+                match_info=match_desc,
+            )
+
+            self.cricket_live.record_exit_pnl(
+                entry_size=self.cricket_live.order_size,
+                exit_price=exit_price,
+                entry_price=trade.entry_price,
+            )
+            live_tag = "LIVE SELL" if result.success else f"LIVE SELL FAIL: {result.error}"
+
+        # Telegram notification
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            pnl_emoji = "✅" if pnl > 0 else "❌" if pnl < -0.005 else "➖"
+            if loop.is_running():
+                loop.create_task(self.engine.tg.send(
+                    f"{pnl_emoji} <b>Cricket Exit [{live_tag}]</b>\n"
+                    f"Type: {trade.signal_type}\n"
+                    f"Reason: {trade.exit_reason}\n"
+                    f"Entry: {trade.entry_price:.4f} → Exit: {exit_price:.4f}\n"
+                    f"<b>PnL: {pnl:+.4f}</b>\n"
+                    f"Duration: {trade.duration_seconds:.0f}s\n"
+                    f"Match: {trade.match_title[:40]}"
+                ))
+        except Exception:
+            pass
+
     # ── Cricket helpers (v4.9) ─────────────────────────────────────
 
     @staticmethod
@@ -1917,6 +2011,48 @@ class SportsOrchestrator:
                                     )
                                 except Exception:
                                     pass
+
+                                # ═══ CRICKET LIVE BUY (DLS path) ═══
+                                if self.cricket_live and self.cricket_live.is_ready:
+                                    log.info(
+                                        "CRICKET_EVENT_TRIGGER | path=DLS | %s | "
+                                        "edge=%.4f | mkt=%.4f",
+                                        sig.signal_type, sig.edge, market_price,
+                                    )
+                                    log.info(
+                                        "CRICKET_REGIME | spread=%.4f | age=%.1fs "
+                                        "| state=%s",
+                                        book.spread,
+                                        time.time() - book.timestamp,
+                                        rt_state,
+                                    )
+                                    log.info(
+                                        "CRICKET_DECISION | action=LIVE_BUY "
+                                        "| direction=LONG | mid=%.4f",
+                                        market_price,
+                                    )
+                                    live_result = self.cricket_live.place_order(
+                                        token_id=token_id,
+                                        mid=market_price,
+                                        direction="LONG",
+                                        match_id=match_id,
+                                        match_info=f"DLS {sig.signal_type} | {link.polymarket_title[:40]}",
+                                        regime=CricketLiveExecutor.classify_regime(state),
+                                    )
+                                    if live_result.success:
+                                        try:
+                                            await self.engine.tg.send(
+                                                f"🟢 <b>Cricket LIVE BUY</b>\n"
+                                                f"Type: {sig.signal_type}\n"
+                                                f"Limit: {live_result.avg_price:.4f} "
+                                                f"(mid={market_price:.4f})\n"
+                                                f"Size: ${live_result.filled_size:.2f}\n"
+                                                f"Order: {live_result.order_id}\n"
+                                                f"Match: {link.polymarket_title[:40]}"
+                                            )
+                                        except Exception:
+                                            pass
+
                         # DLS path done — but ALWAYS fall through to tick detector
 
                     # ════════════════════════════════════════════════
@@ -2002,6 +2138,50 @@ class SportsOrchestrator:
                         except Exception:
                             pass
 
+                        # ═══ CRICKET LIVE BUY (tick path) ═══
+                        if self.cricket_live and self.cricket_live.is_ready:
+                            log.info(
+                                "CRICKET_EVENT_TRIGGER | path=TICK | %s %s | "
+                                "edge=%.4f | mkt=%.4f | move=%.4f",
+                                tick_signal.signal_type, tick_signal.direction,
+                                tick_signal.edge, tick_signal.entry_price,
+                                tick_signal.move,
+                            )
+                            log.info(
+                                "CRICKET_REGIME | spread=%.4f | age=%.1fs "
+                                "| state=%s",
+                                tick_signal.spread,
+                                time.time() - book.timestamp,
+                                rt_state,
+                            )
+                            log.info(
+                                "CRICKET_DECISION | action=LIVE_BUY "
+                                "| direction=%s | mid=%.4f",
+                                tick_signal.direction,
+                                tick_signal.entry_price,
+                            )
+                            live_result = self.cricket_live.place_order(
+                                token_id=token_id,
+                                mid=tick_signal.entry_price,
+                                direction=tick_signal.direction,
+                                match_id=match_id,
+                                match_info=f"TICK {tick_signal.signal_type} {tick_signal.direction} | {link.polymarket_title[:40]}",
+                                regime=CricketLiveExecutor.classify_regime(state),
+                            )
+                            if live_result.success:
+                                try:
+                                    await self.engine.tg.send(
+                                        f"🟢 <b>Cricket LIVE {tick_signal.direction}</b>\n"
+                                        f"Type: {tick_signal.signal_type}\n"
+                                        f"Limit: {live_result.avg_price:.4f} "
+                                        f"(mid={tick_signal.entry_price:.4f})\n"
+                                        f"Size: ${live_result.filled_size:.2f}\n"
+                                        f"Order: {live_result.order_id}\n"
+                                        f"Match: {link.polymarket_title[:40]}"
+                                    )
+                                except Exception:
+                                    pass
+
                 # ── Tick detector exit checks ─────────────────────────
                 def _get_cricket_price(mid):
                     lnk = self.cricket_links.get(mid)
@@ -2047,6 +2227,30 @@ class SportsOrchestrator:
                         for mid in self.cricket_exit_mgr.open_trades
                     },
                 )
+
+                # ── Pre-fill validation (v1.1 safety patch) ──────────
+                if self.cricket_live and self.cricket_live.is_ready:
+                    # Derive current regime from any active match state
+                    current_regime = ""
+                    for _mid, _lnk in self.cricket_links.items():
+                        _espn = cricket_espn_map.get(_mid, "")
+                        _st = self.cricket_feed.games.get(_espn) if _espn else None
+                        if _st:
+                            current_regime = CricketLiveExecutor.classify_regime(_st)
+                            break
+
+                    invalidated = self.cricket_live.validate_pending_fills(
+                        books=self.poly_feed.books,
+                        regime=current_regime,
+                    )
+                    for oid in invalidated:
+                        log.info("CRICKET_EXECUTION | PRE_FILL_REJECTED | order=%s", oid)
+
+                # ── GTC order timeout management ────────────────────
+                if self.cricket_live and self.cricket_live.is_ready:
+                    cancelled = self.cricket_live.check_pending_orders()
+                    for oid in cancelled:
+                        log.info("CRICKET_EXECUTION | GTC_EXPIRED | order=%s", oid)
 
                 # Hourly health log
                 now = time.time()
@@ -2276,7 +2480,7 @@ class SportsOrchestrator:
     async def run(self):
         """Main entry point — start all loops."""
         log.info("=" * 60)
-        log.info("  SPORTS MARKET SYSTEM STARTING [v10]")
+        log.info("  SPORTS MARKET SYSTEM STARTING [v10.2]")
         log.info("  Date: %s", self.target_date)
         log.info("  Football source: ESPN (no key required)")
         log.info("  Data dir: %s", DATA_DIR.absolute())

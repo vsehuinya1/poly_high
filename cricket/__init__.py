@@ -28,6 +28,7 @@ from cricket.execution import (
     CricketMatchState,
 )
 from cricket.feeds import CricketFeed, CricketCSVLogger
+from cricket.live_executor import CricketLiveExecutor, CricketOrderResult
 from cricket.health import (
     CricketBookHealthMonitor,
     check_cricket_readiness,
@@ -56,6 +57,8 @@ __all__ = [
     "CricketMatchState",
     "CricketFeed",
     "CricketCSVLogger",
+    "CricketLiveExecutor",
+    "CricketOrderResult",
     "CricketBookHealthMonitor",
     "check_cricket_readiness",
     "ReadinessResult",

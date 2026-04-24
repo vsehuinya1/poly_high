@@ -90,13 +90,14 @@ class CricketExitManager:
     RUNNER_GAIN = 0.15          # enter "runner mode" after +0.15
     RUNNER_TRAIL_PCT = 0.40     # trailing stop at 40% of peak gain
 
-    def __init__(self, data_dir: Path = Path("sports_data")):
+    def __init__(self, data_dir: Path = Path("sports_data"), on_close=None):
         self.open_trades: dict[str, CricketPaperTrade] = {}
         self.closed_trades: list[CricketPaperTrade] = []
         self._csv_path = data_dir / "cricket_paper_trades.csv"
         data_dir.mkdir(parents=True, exist_ok=True)
         self._csv_written_header = self._csv_path.exists()
         self.stats = _CricketExitStats()
+        self._on_close = on_close  # callback(trade) on close
 
     def register_trade(
         self,
@@ -245,6 +246,14 @@ class CricketExitManager:
                  trade.mae, trade.mfe, trade.duration_seconds, trade.match_title[:30])
 
         self._write_csv(trade)
+
+        # Fire callback for live execution (exit sell)
+        if self._on_close:
+            try:
+                self._on_close(trade)
+            except Exception as e:
+                log.error("CRICKET EXIT on_close callback error: %s", e)
+
         return pnl
 
     def _score_str(self, match_states: dict, match_id: str) -> str:
