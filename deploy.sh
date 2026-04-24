@@ -16,7 +16,7 @@ echo "🔄 Deploy + restart (single SSH call)..."
 LOG_FILE="sports_$(date -u +%Y%m%d_%H%M).log"
 
 # Do EVERYTHING in one SSH call to avoid connection drops
-timeout 30 sshpass -p '12345vse' ssh \
+sshpass -p '12345vse' ssh \
   -o ConnectTimeout=10 \
   -o ServerAliveInterval=5 \
   -o StrictHostKeyChecking=no \

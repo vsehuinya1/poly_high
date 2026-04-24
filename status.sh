@@ -2,7 +2,7 @@
 # Quick status check — single SSH call
 # Usage: ./status.sh
 
-timeout 20 sshpass -p '12345vse' ssh \
+sshpass -p '12345vse' ssh \
   -o ConnectTimeout=10 \
   -o ServerAliveInterval=5 \
   -o StrictHostKeyChecking=no \

@@ -7,7 +7,7 @@ VPS_HOST="root@161.97.185.65"
 VPS_PASS="12345vse"
 VPS_DIR="/root/poly_high_sports"
 
-timeout 15 sshpass -p "$VPS_PASS" ssh \
+sshpass -p "$VPS_PASS" ssh \
   -o ConnectTimeout=5 \
   -o ServerAliveInterval=3 \
   -o ServerAliveCountMax=2 \
