@@ -296,8 +296,8 @@ class CricketLiveExecutor:
         try:
             order_args = OrderArgs(
                 token_id=token_id,
-                amount=size_usd,
                 price=limit_price,
+                size=size_usd,
                 side=side,
             )
             signed = self._client.create_order(order_args)
@@ -426,8 +426,8 @@ class CricketLiveExecutor:
         try:
             order_args = OrderArgs(
                 token_id=token_id,
-                amount=size_usd,
                 price=limit_price,
+                size=size_usd,
                 side=side,
             )
             signed = self._client.create_order(order_args)
