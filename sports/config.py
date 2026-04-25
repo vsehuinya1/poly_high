@@ -266,6 +266,11 @@ NBA_TEAM_MAP = {
     "tor": "Toronto Raptors", "uta": "Utah Jazz", "was": "Washington Wizards",
 }
 
+# ── Sportmonks Cricket v1.0.1 ────────────────────────────────────────
+SPORTMONKS_API_TOKEN   = os.getenv("SPORTMONKS_API_TOKEN", "c601bm9fdnWxe94eDVlFvEDK3K9LrsXeEOhlIbBS8mespVG52AU8WPJnrhMA")
+CRICKET_SM_POLL_S      = 5.0       # scoreboard poll interval (seconds)
+CRICKET_SM_LEAGUE_IDS  = [1]       # IPL = league_id 1
+
 # ── Cricket Discovery + Health (v7.0) ────────────────────────────────
 CRICKET_MIN_LIQUIDITY = 50_000          # minimum Gamma liquidity for discovery
 CRICKET_MAX_DISCOVERY_SPREAD = 0.10     # reject during discovery if spread > this

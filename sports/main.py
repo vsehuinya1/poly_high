@@ -78,6 +78,11 @@ from cricket import (
 from cricket.tick_strategy import CricketTickDetector
 from cricket.exit_manager import CricketExitManager
 from cricket.live_executor import CricketLiveExecutor
+# Cricket v1.0.1 — Sportmonks pipeline
+from cricket.sm_feeds import SmCricketFeed
+from cricket.sm_state import SmCricketState
+from cricket.sm_strategy import SmCricketStrategy
+from cricket.sm_mapping import get_mapping, get_all_fixture_ids, add_mapping
 from sports.config import (
     CRICKET_PAPER_ONLY, CRICKET_TRADE_SIZE, CRICKET_MAX_SPREAD,
     CRICKET_MOMENTUM_RR_THRESH, CRICKET_MOMENTUM_EDGE,
@@ -86,6 +91,7 @@ from sports.config import (
     CRICKET_READINESS_CHECK_INTERVAL_S,
     CRICKET_LIVE_MODE, CRICKET_BANKROLL, CRICKET_KELLY_PCT,
     CRICKET_MIN_ORDER_USD, CRICKET_LIMIT_OFFSET,
+    SPORTMONKS_API_TOKEN, CRICKET_SM_POLL_S,
 )
 
 log = logging.getLogger("sports.main")
@@ -465,6 +471,7 @@ class SportsOrchestrator:
         self._MAX_PENDING_LIFETIME = 45
 
         # ── Cricket Engine (Paper + Live) ──────────────────────────
+        # Legacy (kept for backwards compat)
         self.cricket_feed = CricketFeed()
         self.cricket_strategy = CricketStrategy(
             momentum_rr_threshold=CRICKET_MOMENTUM_RR_THRESH,
@@ -495,6 +502,15 @@ class SportsOrchestrator:
         # v7.1: Runtime state tracking (DEAD → ACTIVE activation)
         self._cricket_runtime_state: dict[str, str] = {}     # match_id → DEAD/ACTIVE
         self._cricket_state_log_ts: dict[str, float] = {}    # throttled state logging
+
+        # ── Cricket v1.0.1: Sportmonks Pipeline ─────────────────────
+        self.sm_cricket_feed = SmCricketFeed(
+            api_token=SPORTMONKS_API_TOKEN,
+            poll_interval_s=CRICKET_SM_POLL_S,
+        )
+        self.sm_cricket_state = SmCricketState()
+        self.sm_cricket_strategy = SmCricketStrategy()
+        log.info("CRICKET v1.0.1 | Sportmonks scoreboard mode | poll=%.0fs", CRICKET_SM_POLL_S)
 
         # ── Cricket Live Executor ─────────────────────────────────
         self.cricket_live = None
@@ -1780,6 +1796,203 @@ class SportsOrchestrator:
 
         return signals
 
+    # ═══════════════════════════════════════════════════════════════════
+    #  Cricket v1.0.1: Sportmonks Scoreboard Signal Loop
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def _cricket_sm_signal_loop(self):
+        """Cricket v1.0.1 — Sportmonks scoreboard-based signal loop.
+
+        Polls mapped fixtures via Sportmonks v2 API, derives events
+        from scoreboard deltas, evaluates strategy, and executes
+        trades via the existing live_executor.
+        """
+        log.info("Cricket v1.0.1 Sportmonks signal loop started")
+        await asyncio.sleep(10)  # wait for discovery + WS init
+
+        last_diag_log = time.time()
+
+        async with aiohttp.ClientSession() as sm_session:
+            while not self._shutdown:
+                try:
+                    fixture_ids = get_all_fixture_ids()
+
+                    if not fixture_ids:
+                        # No fixtures mapped — log periodically
+                        now = time.time()
+                        if now - last_diag_log > 300:
+                            log.info(
+                                "CRICKET_SM_IDLE | no fixtures mapped | "
+                                "add via sm_mapping.add_mapping()"
+                            )
+                            last_diag_log = now
+                        await asyncio.sleep(CRICKET_SM_POLL_S)
+                        continue
+
+                    for fid in fixture_ids:
+                        if self._shutdown:
+                            break
+
+                        # ── 1. Poll Sportmonks scoreboard ─────────────
+                        snapshot = await self.sm_cricket_feed.poll_fixture(
+                            sm_session, fid
+                        )
+                        if snapshot is None:
+                            continue
+
+                        # ── 2. Derive events from scoreboard delta ────
+                        event_result = self.sm_cricket_state.update(snapshot)
+                        if event_result is None:
+                            continue
+
+                        # ── 3. Get Polymarket book data ───────────────
+                        mapping = get_mapping(fid)
+                        if not mapping:
+                            log.warning(
+                                "CRICKET_SM_NO_MAPPING | fixture=%d", fid
+                            )
+                            continue
+
+                        token_id = mapping.poly_token_yes
+                        book = self.poly_feed.books.get(token_id)
+
+                        if not book or book.mid <= 0:
+                            log.info(
+                                "CRICKET_SM_NO_BOOK | fixture=%d | "
+                                "token=%s...%s",
+                                fid, token_id[:8],
+                                token_id[-4:] if len(token_id) > 8 else "",
+                            )
+                            continue
+
+                        market_price = book.mid
+                        spread = book.spread
+                        book_age = time.time() - book.timestamp
+
+                        # ── 4. Evaluate strategy ──────────────────────
+                        decision = self.sm_cricket_strategy.evaluate(
+                            event_result=event_result,
+                            market_price=market_price,
+                            spread=spread,
+                            book_age_s=book_age,
+                        )
+
+                        if not decision.should_trade:
+                            continue
+
+                        # ── 5. Execute trade ──────────────────────────
+                        direction = decision.direction
+                        match_info = (
+                            f"SM {decision.reason} | "
+                            f"{mapping.home_team} vs {mapping.away_team}"
+                        )
+
+                        log.info(
+                            "CRICKET_EXECUTION | fixture=%d | %s | "
+                            "dir=%s | mid=%.4f | spread=%.4f | "
+                            "event=%s | regime=%s | pressure=%.2f",
+                            fid, decision.reason, direction,
+                            market_price, spread,
+                            decision.event, decision.regime,
+                            decision.pressure,
+                        )
+
+                        # Paper entry logging
+                        self.cricket_guard.record_entry(str(fid))
+                        self.sm_cricket_strategy.record_entry(fid)
+
+                        # Register with exit manager
+                        self.cricket_exit_mgr.register_trade(
+                            match_id=str(fid),
+                            selection_id=token_id,
+                            signal_type=f"SM_{decision.event}",
+                            entry_price=market_price,
+                            fair_value=market_price,  # no DLS model
+                            edge=0.0,
+                            entry_score=(
+                                f"{decision.regime} {decision.event} → "
+                                f"{direction}"
+                            ),
+                            spread=spread,
+                            match_title=mapping.poly_market_title or match_info,
+                        )
+
+                        # Telegram notification
+                        try:
+                            await self.engine.tg.send(
+                                f"🏏 <b>Cricket SM Signal</b>\n"
+                                f"Event: {decision.event}\n"
+                                f"Regime: {decision.regime}\n"
+                                f"Dir: {direction}\n"
+                                f"Price: {market_price:.3f} | "
+                                f"Spread: {spread:.4f}\n"
+                                f"Reason: {decision.reason}\n"
+                                f"Match: {mapping.home_team} vs "
+                                f"{mapping.away_team}"
+                            )
+                        except Exception:
+                            pass
+
+                        # ═══ LIVE ORDER ═══
+                        if self.cricket_live and self.cricket_live.is_ready:
+                            live_result = self.cricket_live.place_order(
+                                token_id=token_id,
+                                mid=market_price,
+                                direction=direction,
+                                match_id=str(fid),
+                                match_info=match_info,
+                                regime=decision.regime,
+                            )
+                            if live_result.success:
+                                try:
+                                    await self.engine.tg.send(
+                                        f"🟢 <b>Cricket LIVE "
+                                        f"{direction}</b>\n"
+                                        f"Limit: {live_result.avg_price:.4f}"
+                                        f" (mid={market_price:.4f})\n"
+                                        f"Size: ${live_result.filled_size:.2f}"
+                                        f"\nOrder: {live_result.order_id}\n"
+                                        f"Match: {mapping.home_team} vs "
+                                        f"{mapping.away_team}"
+                                    )
+                                except Exception:
+                                    pass
+
+                    # ── GTC order management ───────────────────────────
+                    if self.cricket_live and self.cricket_live.is_ready:
+                        cancelled = self.cricket_live.check_pending_orders()
+                        for oid in cancelled:
+                            log.info(
+                                "CRICKET_SM_GTC_EXPIRED | order=%s", oid
+                            )
+
+                    # ── Exit manager checks ───────────────────────────
+                    self.cricket_exit_mgr.check_all(
+                        books=self.poly_feed.books,
+                        match_states={},  # no ESPN states in v1.0.1
+                    )
+
+                    # ── Periodic diagnostics ──────────────────────────
+                    now = time.time()
+                    if now - last_diag_log >= 300:
+                        last_diag_log = now
+                        for fid_d in fixture_ids:
+                            counts = self.sm_cricket_state.get_event_counts(
+                                fid_d
+                            )
+                            if counts:
+                                log.info(
+                                    "CRICKET_SM_DIAG | fixture=%d | "
+                                    "events=%s | %s",
+                                    fid_d, counts,
+                                    self.sm_cricket_feed.stats_line,
+                                )
+
+                except Exception as e:
+                    log.error("cricket SM signal loop error: %s", e)
+
+                await asyncio.sleep(CRICKET_SM_POLL_S)
+
     async def _cricket_signal_loop(self):
         """Cricket signal processing loop (v4.9).
 
@@ -2548,10 +2761,11 @@ class SportsOrchestrator:
             # Tennis — score polling + signal processing
             asyncio.create_task(self._tennis_score_polling_loop(), name="tennis_scores"),
             asyncio.create_task(self._tennis_signal_loop(), name="tennis_signals"),
-            # Cricket — signal processing
-            asyncio.create_task(self._cricket_signal_loop(), name="cricket_signals"),
-            # Cricket — readiness monitoring (v7.0)
-            asyncio.create_task(self._cricket_readiness_loop(), name="cricket_readiness"),
+            # Cricket v1.0.1 — Sportmonks scoreboard signal loop
+            asyncio.create_task(self._cricket_sm_signal_loop(), name="cricket_sm_signals"),
+            # Legacy cricket — kept but disabled (ESPN-based)
+            # asyncio.create_task(self._cricket_signal_loop(), name="cricket_signals"),
+            # asyncio.create_task(self._cricket_readiness_loop(), name="cricket_readiness"),
         ]
 
         # Graceful shutdown handler
