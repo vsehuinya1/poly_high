@@ -39,17 +39,15 @@ class FixtureMapping:
 #    CRICKET_CANDIDATE | ... | token_id=...
 # ═════════════════════════════════════════════════════════════════════
 
-# Placeholder — must be populated with real token IDs before each match
 IPL_FIXTURE_MAP: dict[int, FixtureMapping] = {
-    # Example entry (replace with real data):
-    # 69629: FixtureMapping(
-    #     fixture_id=69629,
-    #     home_team="Delhi Capitals",
-    #     away_team="Mumbai Indians",
-    #     poly_token_yes="abc123...",
-    #     poly_token_no="def456...",
-    #     poly_market_title="Indian Premier League: Delhi Capitals vs Mumbai Indians",
-    # ),
+    69629: FixtureMapping(
+        fixture_id=69629,
+        home_team="Delhi Capitals",
+        away_team="Punjab Kings",
+        poly_token_yes="50126410203778007142503549338936271387140662701828838552454333525503628755261",
+        poly_token_no="18575430438358390541772074127628816002193416137521174798561427510895122834765",
+        poly_market_title="Indian Premier League: Delhi Capitals vs Punjab Kings",
+    ),
 }
 
 
