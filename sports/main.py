@@ -1593,17 +1593,25 @@ class SportsOrchestrator:
             import asyncio
             loop = asyncio.get_event_loop()
             pnl_emoji = "✅" if pnl > 0 else "❌" if pnl < -0.005 else "➖"
+            r_mult = pnl / trade.entry_price if trade.entry_price > 0 else 0.0
             if loop.is_running():
                 loop.create_task(self.engine.tg.send(
-                    f"{pnl_emoji} <b>Cricket Exit [{live_tag}]</b>\n"
-                    f"Type: {trade.signal_type}\n"
+                    f"📤 <b>Paper Exit</b>\n"
+                    f"Entry: {trade.entry_price:.4f}\n"
+                    f"Exit: {exit_price:.4f}\n"
+                    f"R: {r_mult:+.2f}\n"
                     f"Reason: {trade.exit_reason}\n"
-                    f"Entry: {trade.entry_price:.4f} → Exit: {exit_price:.4f}\n"
-                    f"<b>PnL: {pnl:+.4f}</b>\n"
                     f"Duration: {trade.duration_seconds:.0f}s\n"
                     f"Match: {trade.match_title[:40]}"
                 ))
         except Exception:
+            pass
+
+        # Release position lock so new signals can fire for this fixture
+        try:
+            fid = int(trade.match_id)
+            self.sm_cricket_strategy.record_exit(fid)
+        except (ValueError, AttributeError):
             pass
 
     # ── Cricket helpers (v4.9) ─────────────────────────────────────
@@ -1801,13 +1809,18 @@ class SportsOrchestrator:
     # ═══════════════════════════════════════════════════════════════════
 
     async def _cricket_sm_signal_loop(self):
-        """Cricket v1.0.1 — Sportmonks scoreboard-based signal loop.
+        """Cricket v2.0 — Paper-only Sportmonks scoreboard signal loop.
 
         Polls mapped fixtures via Sportmonks v2 API, derives events
         from scoreboard deltas, evaluates strategy, and executes
-        trades via the existing live_executor.
+        PAPER trades only. Full Telegram notifications.
+
+        No Polymarket API calls for execution.
         """
-        log.info("Cricket v1.0.1 Sportmonks signal loop started")
+        log.info("Cricket v2.0 PAPER-ONLY Sportmonks signal loop started")
+        log.info("CRICKET ACTIVE")
+        log.info("PAPER TRADING ENABLED")
+        log.info("TELEGRAM ACTIVE")
         await asyncio.sleep(10)  # wait for discovery + WS init
 
         last_diag_log = time.time()
@@ -1818,16 +1831,51 @@ class SportsOrchestrator:
                     fixture_ids = get_all_fixture_ids()
 
                     if not fixture_ids:
-                        # No fixtures mapped — log periodically
-                        now = time.time()
-                        if now - last_diag_log > 300:
-                            log.info(
-                                "CRICKET_SM_IDLE | no fixtures mapped | "
-                                "add via sm_mapping.add_mapping()"
-                            )
-                            last_diag_log = now
-                        await asyncio.sleep(CRICKET_SM_POLL_S)
-                        continue
+                        # STEP 9: Auto-discover live IPL fixtures
+                        try:
+                            url = f"{SmCricketFeed.BASE_URL}/livescores"
+                            params = {
+                                "api_token": SPORTMONKS_API_TOKEN,
+                                "filter[league_id]": "1",
+                                "include": "scoreboards",
+                            }
+                            async with sm_session.get(
+                                url, params=params,
+                                timeout=aiohttp.ClientTimeout(total=10),
+                            ) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json()
+                                    for fix in (data.get("data") or []):
+                                        auto_fid = fix.get("id", 0)
+                                        if auto_fid and not get_mapping(auto_fid):
+                                            home = fix.get("localteam", {}).get("name", "Home")
+                                            away = fix.get("visitorteam", {}).get("name", "Away")
+                                            add_mapping(
+                                                fixture_id=auto_fid,
+                                                home_team=home,
+                                                away_team=away,
+                                                poly_token_yes="PAPER_ONLY",
+                                                poly_token_no="PAPER_ONLY",
+                                                poly_market_title=f"{home} vs {away}",
+                                            )
+                                            log.info(
+                                                "CRICKET_AUTO_MAP | fixture=%d | %s vs %s",
+                                                auto_fid, home, away,
+                                            )
+                        except Exception as e:
+                            log.warning("CRICKET_AUTO_MAP_ERR | %s", e)
+
+                        fixture_ids = get_all_fixture_ids()
+                        if not fixture_ids:
+                            now = time.time()
+                            if now - last_diag_log > 300:
+                                log.info(
+                                    "CRICKET_SM_IDLE | no fixtures mapped | "
+                                    "no live IPL fixtures found"
+                                )
+                                last_diag_log = now
+                            await asyncio.sleep(CRICKET_SM_POLL_S)
+                            continue
 
                     for fid in fixture_ids:
                         if self._shutdown:
@@ -1845,7 +1893,7 @@ class SportsOrchestrator:
                         if event_result is None:
                             continue
 
-                        # ── 3. Get Polymarket book data ───────────────
+                        # ── TG: Event firehose ────────────────────────
                         mapping = get_mapping(fid)
                         if not mapping:
                             log.warning(
@@ -1853,42 +1901,73 @@ class SportsOrchestrator:
                             )
                             continue
 
+                        try:
+                            await self.engine.tg.send(
+                                f"🏏 <b>EVENT</b>\n"
+                                f"Type: {event_result.event.value}\n"
+                                f"Score: {snapshot.runs}/{snapshot.wickets}\n"
+                                f"Overs: {snapshot.overs:.1f}\n"
+                                f"Match: {mapping.home_team} vs "
+                                f"{mapping.away_team}"
+                            )
+                        except Exception:
+                            pass
+
+                        # ── 3. Get market data (synthetic fallback) ───
                         token_id = mapping.poly_token_yes
                         book = self.poly_feed.books.get(token_id)
 
-                        if not book or book.mid <= 0:
-                            log.info(
-                                "CRICKET_SM_NO_BOOK | fixture=%d | "
-                                "token=%s...%s",
-                                fid, token_id[:8],
-                                token_id[-4:] if len(token_id) > 8 else "",
-                            )
-                            continue
-
-                        market_price = book.mid
-                        spread = book.spread
-                        book_age = time.time() - book.timestamp
+                        # Paper mode: use book if available, else synthetic
+                        if book and book.mid > 0:
+                            market_price = book.mid
+                            spread = book.spread
+                        else:
+                            market_price = 0.50  # synthetic mid
+                            spread = 0.01        # synthetic spread
 
                         # ── 4. Evaluate strategy ──────────────────────
                         decision = self.sm_cricket_strategy.evaluate(
                             event_result=event_result,
                             market_price=market_price,
                             spread=spread,
-                            book_age_s=book_age,
+                            book_age_s=0.0,  # paper mode: no stale check
                         )
 
                         if not decision.should_trade:
+                            # ── TG: Skip notification ─────────────────
+                            try:
+                                await self.engine.tg.send(
+                                    f"⏭️ <b>Cricket Skip</b>\n"
+                                    f"Reason: {decision.skip_reason}\n"
+                                    f"Event: {decision.event}\n"
+                                    f"Match: {mapping.home_team} vs "
+                                    f"{mapping.away_team}"
+                                )
+                            except Exception:
+                                pass
                             continue
 
-                        # ── 5. Execute trade ──────────────────────────
+                        # ── 5. Paper trade entry ──────────────────────
                         direction = decision.direction
-                        match_info = (
-                            f"SM {decision.reason} | "
+                        match_label = (
                             f"{mapping.home_team} vs {mapping.away_team}"
                         )
 
+                        # ── TG: Trade Decision (WHY) ─────────────────
+                        try:
+                            await self.engine.tg.send(
+                                f"🚨 <b>TRADE DECISION</b>\n"
+                                f"Event: {decision.event}\n"
+                                f"Regime: {decision.regime}\n"
+                                f"Dir: {direction}\n"
+                                f"Price: {market_price:.3f}\n"
+                                f"Reason: {decision.reason}"
+                            )
+                        except Exception:
+                            pass
+
                         log.info(
-                            "CRICKET_EXECUTION | fixture=%d | %s | "
+                            "CRICKET_PAPER_ENTRY | fixture=%d | %s | "
                             "dir=%s | mid=%.4f | spread=%.4f | "
                             "event=%s | regime=%s | pressure=%.2f",
                             fid, decision.reason, direction,
@@ -1897,96 +1976,74 @@ class SportsOrchestrator:
                             decision.pressure,
                         )
 
-                        # Paper entry logging
-                        self.cricket_guard.record_entry(str(fid))
+                        # Record position lock
                         self.sm_cricket_strategy.record_entry(fid)
 
-                        # Register with exit manager
+                        # Register with exit manager (paper)
                         self.cricket_exit_mgr.register_trade(
                             match_id=str(fid),
                             selection_id=token_id,
                             signal_type=f"SM_{decision.event}",
                             entry_price=market_price,
-                            fair_value=market_price,  # no DLS model
+                            fair_value=market_price,
                             edge=0.0,
                             entry_score=(
                                 f"{decision.regime} {decision.event} → "
                                 f"{direction}"
                             ),
                             spread=spread,
-                            match_title=mapping.poly_market_title or match_info,
+                            match_title=mapping.poly_market_title or match_label,
                         )
 
-                        # Telegram notification
+                        # ── TG: Signal detected ───────────────────────
                         try:
                             await self.engine.tg.send(
-                                f"🏏 <b>Cricket SM Signal</b>\n"
+                                f"🏏 <b>Cricket Signal</b>\n"
                                 f"Event: {decision.event}\n"
                                 f"Regime: {decision.regime}\n"
                                 f"Dir: {direction}\n"
-                                f"Price: {market_price:.3f} | "
-                                f"Spread: {spread:.4f}\n"
+                                f"Price: {market_price:.3f}\n"
                                 f"Reason: {decision.reason}\n"
-                                f"Match: {mapping.home_team} vs "
-                                f"{mapping.away_team}"
+                                f"Match: {match_label}"
                             )
                         except Exception:
                             pass
 
-                        # ═══ LIVE ORDER ═══
-                        if self.cricket_live and self.cricket_live.is_ready:
-                            live_result = self.cricket_live.place_order(
-                                token_id=token_id,
-                                mid=market_price,
-                                direction=direction,
-                                match_id=str(fid),
-                                match_info=match_info,
-                                regime=decision.regime,
+                        # ── TG: Paper entry ───────────────────────────
+                        try:
+                            await self.engine.tg.send(
+                                f"📥 <b>Paper Entry</b>\n"
+                                f"Dir: {direction}\n"
+                                f"Entry: {market_price:.4f}\n"
+                                f"Match: {match_label}"
                             )
-                            if live_result.success:
-                                try:
-                                    await self.engine.tg.send(
-                                        f"🟢 <b>Cricket LIVE "
-                                        f"{direction}</b>\n"
-                                        f"Limit: {live_result.avg_price:.4f}"
-                                        f" (mid={market_price:.4f})\n"
-                                        f"Size: ${live_result.filled_size:.2f}"
-                                        f"\nOrder: {live_result.order_id}\n"
-                                        f"Match: {mapping.home_team} vs "
-                                        f"{mapping.away_team}"
-                                    )
-                                except Exception:
-                                    pass
+                        except Exception:
+                            pass
 
-                    # ── GTC order management ───────────────────────────
-                    if self.cricket_live and self.cricket_live.is_ready:
-                        cancelled = self.cricket_live.check_pending_orders()
-                        for oid in cancelled:
-                            log.info(
-                                "CRICKET_SM_GTC_EXPIRED | order=%s", oid
-                            )
+                        # NO LIVE EXECUTION — paper only
 
                     # ── Exit manager checks ───────────────────────────
                     self.cricket_exit_mgr.check_all(
                         books=self.poly_feed.books,
-                        match_states={},  # no ESPN states in v1.0.1
+                        match_states={},
                     )
 
-                    # ── Periodic diagnostics ──────────────────────────
+                    # ── v2.1: Debug counters every 60s ────────────────
                     now = time.time()
-                    if now - last_diag_log >= 300:
+                    if now - last_diag_log >= 60:
                         last_diag_log = now
+                        sig_counts = {}
                         for fid_d in fixture_ids:
-                            counts = self.sm_cricket_state.get_event_counts(
-                                fid_d
-                            )
-                            if counts:
-                                log.info(
-                                    "CRICKET_SM_DIAG | fixture=%d | "
-                                    "events=%s | %s",
-                                    fid_d, counts,
-                                    self.sm_cricket_feed.stats_line,
-                                )
+                            sig_counts[fid_d] = self.sm_cricket_state.get_event_counts(fid_d)
+                        open_trades = len(self.cricket_exit_mgr.open_trades)
+                        closed_trades = len(self.cricket_exit_mgr.closed_trades)
+                        log.info(
+                            "CRICKET_DEBUG | SIGNALS FLOWING | "
+                            "events=%s | open=%d | closed=%d | "
+                            "feeds=%s",
+                            sig_counts, open_trades, closed_trades,
+                            self.sm_cricket_feed.stats_line,
+                        )
 
                 except Exception as e:
                     log.error("cricket SM signal loop error: %s", e)
@@ -2751,21 +2808,19 @@ class SportsOrchestrator:
         log.info("CB_TELEGRAM_CALLBACK_WIRED")
 
         # Phase 4: Start all async loops
+        # v2.0: Football/NBA DISABLED — cricket paper-only mode
         tasks = [
             asyncio.create_task(self.poly_feed.run(), name="polymarket_ws"),
             asyncio.create_task(self.poly_feed.run_book_polling(), name="book_rest_polling"),
-            asyncio.create_task(self._score_polling_loop(), name="score_polling"),
-            asyncio.create_task(self._signal_processing_loop(), name="signal_processing"),
+            # asyncio.create_task(self._score_polling_loop(), name="score_polling"),       # v2.0: OFF (football/NBA)
+            # asyncio.create_task(self._signal_processing_loop(), name="signal_processing"), # v2.0: OFF (football/NBA)
             asyncio.create_task(self._status_printer_loop(), name="status_printer"),
             asyncio.create_task(self._rematching_loop(), name="rematching"),
-            # Tennis — score polling + signal processing
+            # Tennis — score polling + signal processing (UNTOUCHED)
             asyncio.create_task(self._tennis_score_polling_loop(), name="tennis_scores"),
             asyncio.create_task(self._tennis_signal_loop(), name="tennis_signals"),
-            # Cricket v1.0.1 — Sportmonks scoreboard signal loop
+            # Cricket v2.0 — Sportmonks paper-only signal loop
             asyncio.create_task(self._cricket_sm_signal_loop(), name="cricket_sm_signals"),
-            # Legacy cricket — kept but disabled (ESPN-based)
-            # asyncio.create_task(self._cricket_signal_loop(), name="cricket_signals"),
-            # asyncio.create_task(self._cricket_readiness_loop(), name="cricket_readiness"),
         ]
 
         # Graceful shutdown handler

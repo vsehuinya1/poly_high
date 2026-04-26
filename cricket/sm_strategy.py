@@ -30,7 +30,7 @@ log = logging.getLogger("cricket.sm_strategy")
 #  Config
 # ═════════════════════════════════════════════════════════════════════
 
-COOLDOWN_S = 30.0           # minimum seconds between trades per fixture
+COOLDOWN_S = 5.0            # v2.1: relaxed to 1 poll cycle for paper flow
 MIN_RUNS_DELTA = 2          # minimum runs_delta for non-WICKET signals
 GHOST_SPREAD_MAX = 0.04     # skip if spread > this
 GHOST_BOOK_AGE_S = 60.0     # skip if book age > this
@@ -115,17 +115,12 @@ class SmCricketStrategy:
                 f"COOLDOWN ({remaining:.0f}s remaining)",
             )
 
-        # ── 3. Ghost liquidity filter ─────────────────────────────
-        if spread > GHOST_SPREAD_MAX:
-            return self._skip(
-                fid, event_result,
-                f"GHOST_SPREAD ({spread:.4f} > {GHOST_SPREAD_MAX})",
-            )
-        if book_age_s > GHOST_BOOK_AGE_S:
-            return self._skip(
-                fid, event_result,
-                f"STALE_BOOK ({book_age_s:.0f}s > {GHOST_BOOK_AGE_S:.0f}s)",
-            )
+        # ── 3. Ghost liquidity filter (DISABLED v2.0 — paper mode) ─
+        # In paper mode we use synthetic prices; no book-staleness blocking.
+        # if spread > GHOST_SPREAD_MAX:
+        #     return self._skip(fid, event_result, ...)
+        # if book_age_s > GHOST_BOOK_AGE_S:
+        #     return self._skip(fid, event_result, ...)
 
         # ── 4. Minimum signal quality ─────────────────────────────
         if (event_result.event != CricketEvent.WICKET and

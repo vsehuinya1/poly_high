@@ -86,7 +86,7 @@ class CricketExitManager:
 
     # Exit thresholds
     STOP_LOSS_TICKS = 15        # MAE-based stop (15 ticks = 0.15)
-    TIMEOUT_MINUTES = 90.0      # max hold time (cricket overs ~3hrs)
+    TIMEOUT_MINUTES = 12.0      # v2.1: ~2 overs forced exit for paper mode
     RUNNER_GAIN = 0.15          # enter "runner mode" after +0.15
     RUNNER_TRAIL_PCT = 0.40     # trailing stop at 40% of peak gain
 
@@ -113,14 +113,16 @@ class CricketExitManager:
         entry_delay_s: float = 0.0,
     ):
         """Register a new paper trade."""
-        # ═══ GLOBAL EDGE GUARD (v6.1 — inside function, non-bypassable) ═══
-        from sports.guards import validate_trade_execution
-        can_exec, block_reason = validate_trade_execution(
-            edge=edge, price=entry_price, sport="cricket",
-            context=f"{signal_type} | {match_id}",
-        )
-        if not can_exec:
-            return
+        # ═══ GLOBAL EDGE GUARD (DISABLED v2.0 — paper mode, edge=0) ═══
+        # In paper mode edge is always 0.0 (no model), so this guard
+        # blocked every trade. Disabled for paper trading.
+        # from sports.guards import validate_trade_execution
+        # can_exec, block_reason = validate_trade_execution(
+        #     edge=edge, price=entry_price, sport="cricket",
+        #     context=f"{signal_type} | {match_id}",
+        # )
+        # if not can_exec:
+        #     return
 
         trade = CricketPaperTrade(
             match_id=match_id,
@@ -152,10 +154,14 @@ class CricketExitManager:
         to_close = []
         for match_id, trade in self.open_trades.items():
             book = books.get(trade.selection_id)
-            if not book or book.mid <= 0:
-                continue
 
-            mkt = book.mid
+            # STEP 7: Synthetic price fallback for paper mode
+            if book and book.mid > 0:
+                mkt = book.mid
+                exit_spread = book.spread
+            else:
+                mkt = trade.entry_price  # synthetic: use entry price
+                exit_spread = 0.01
             now = time.time()
             elapsed = now - trade.entry_timestamp
 
@@ -191,13 +197,13 @@ class CricketExitManager:
             adverse_ticks = adverse * 100
             if adverse_ticks >= self.STOP_LOSS_TICKS:
                 to_close.append((match_id, mkt, "STOP_LOSS",
-                                 self._score_str(match_states, match_id), book.spread))
+                                 self._score_str(match_states, match_id), exit_spread))
                 continue
 
             # 2. Timeout
             if trade.age_minutes >= self.TIMEOUT_MINUTES:
                 to_close.append((match_id, mkt, "TIMEOUT",
-                                 self._score_str(match_states, match_id), book.spread))
+                                 self._score_str(match_states, match_id), exit_spread))
                 continue
 
             # 3. Runner mode — trailing stop after big gain
@@ -207,7 +213,7 @@ class CricketExitManager:
                     (trade.peak_price - trade.entry_price) * self.RUNNER_TRAIL_PCT)
                 if mkt <= trade.peak_price - trail_distance:
                     to_close.append((match_id, mkt, "RUNNER_TRAIL",
-                                     self._score_str(match_states, match_id), book.spread))
+                                     self._score_str(match_states, match_id), exit_spread))
                     continue
 
         # ── Close trades ──────────────────────────────────────────
