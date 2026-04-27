@@ -40,9 +40,9 @@ class FixtureMapping:
 # ═════════════════════════════════════════════════════════════════════
 
 IPL_FIXTURE_MAP: dict[int, FixtureMapping] = {
-    # April 27: Delhi Capitals vs Royal Challengers Bengaluru
-    69639: FixtureMapping(
-        fixture_id=69639,
+    # April 27: Delhi Capitals vs Royal Challengers Bengaluru (39th Match)
+    69633: FixtureMapping(
+        fixture_id=69633,
         home_team="Delhi Capitals",
         away_team="Royal Challengers Bengaluru",
         poly_token_yes="109682511911087779727834345377492663124053255801388007181934149546406630368131",
