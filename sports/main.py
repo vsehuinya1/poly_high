@@ -405,6 +405,8 @@ class SportsOrchestrator:
         self._shutdown = False
         self._tennis_pending: dict[tuple, dict] = {}  # v4.6: (match_id, token, dir) → pending state
         self._tennis_active: set = set()  # v10: canonical trade_key set for duplicate prevention
+        # v11.3: Lower-band paper trade tracker {match_id: {entry_price, entry_time, player, token, link, state}}
+        self._tennis_lb_paper: dict[str, dict] = {}
         self._session: aiohttp.ClientSession | None = None
 
         # ── Tennis Engine ─────────────────────────────────────────
@@ -1065,15 +1067,45 @@ class SportsOrchestrator:
                         self._pending_store.save(self._tennis_pending)
 
                         # ═══════════════════════════════════════════════
-                        # HARD PRICE BAND GATE (v5.1 — non-bypassable)
-                        # Final check on CURRENT market_price before any
-                        # execution. No trade can pass outside [0.20, 0.80].
+                        # HARD PRICE BAND GATE (v5.1 / v11.3)
+                        # Upper band (>0.80) still rejected.
+                        # Lower band (<0.20) → paper trade instead.
                         # ═══════════════════════════════════════════════
-                        if market_price < 0.20 or market_price > 0.80:
-                            log.info("TENNIS_SIGNAL_REJECTED | %s | match=%s | mkt=%.4f | edge=%.4f | reason=PRICE_FLOOR",
+                        if market_price > 0.80:
+                            log.info("TENNIS_SIGNAL_REJECTED | %s | match=%s | mkt=%.4f | edge=%.4f | reason=PRICE_CEIL",
                                      state.pregame_favorite_id or link.home_team or "?",
                                      match_id, market_price, current_edge)
-                            # v10: Remove from active on rejection
+                            self._tennis_active.discard(pend.get("trade_key", ""))
+                            continue
+                        if market_price < 0.20:
+                            # v11.3: Paper trade the lower band
+                            fav_name_lb = state.pregame_favorite_id or link.home_team or "?"
+                            if match_id not in self._tennis_lb_paper:
+                                self._tennis_lb_paper[match_id] = {
+                                    "entry_price": market_price,
+                                    "entry_time": time.time(),
+                                    "player": fav_name_lb,
+                                    "token": fav_token,
+                                    "link": link,
+                                    "trigger": signal.trigger_type if signal else "DELAYED",
+                                    "edge": current_edge,
+                                    "score": f"{state.sets_a}-{state.sets_b} {state.games_a}-{state.games_b}",
+                                    "peak": market_price,
+                                }
+                                log.info("TENNIS_LB_PAPER_ENTRY | %s | match=%s | mkt=%.4f | edge=%.4f",
+                                         fav_name_lb, match_id, market_price, current_edge)
+                                try:
+                                    await self.engine.tg.send(
+                                        f"🎾📉 <b>Tennis LB Paper Entry</b>\n"
+                                        f"Player: {fav_name_lb}\n"
+                                        f"Price: {market_price:.4f}\n"
+                                        f"Edge: {current_edge:+.4f}\n"
+                                        f"Score: {state.sets_a}-{state.sets_b} | {state.games_a}-{state.games_b}\n"
+                                        f"Match: {link.polymarket_title[:50]}\n"
+                                        f"Tier: {link.tier} | {link.tournament}"
+                                    )
+                                except Exception:
+                                    pass
                             self._tennis_active.discard(pend.get("trade_key", ""))
                             continue
 
@@ -1203,12 +1235,43 @@ class SportsOrchestrator:
 
                     diag["signal_ok"] += 1
 
-                    # ── v5.1: Price band pre-check (before pending) ──
-                    # Block even creating a pending entry for out-of-band prices.
-                    if market_price < 0.20 or market_price > 0.80:
-                        log.info("TENNIS_SIGNAL_REJECTED | %s | match=%s | mkt=%.4f | edge=%.4f | reason=PRICE_FLOOR",
+                    # ── v5.1 / v11.3: Price band pre-check ──
+                    # Upper band (>0.80) still rejected.
+                    if market_price > 0.80:
+                        log.info("TENNIS_SIGNAL_REJECTED | %s | match=%s | mkt=%.4f | edge=%.4f | reason=PRICE_CEIL",
                                  state.pregame_favorite_id or link.home_team or "?",
                                  match_id, market_price, signal.edge if signal else 0.0)
+                        continue
+                    # Lower band (<0.20) → paper trade
+                    if market_price < 0.20:
+                        fav_name_lb = state.pregame_favorite_id or link.home_team or "?"
+                        if match_id not in self._tennis_lb_paper:
+                            self._tennis_lb_paper[match_id] = {
+                                "entry_price": market_price,
+                                "entry_time": time.time(),
+                                "player": fav_name_lb,
+                                "token": fav_token,
+                                "link": link,
+                                "trigger": signal.trigger_type if signal else "?",
+                                "edge": signal.edge if signal else 0.0,
+                                "score": f"{state.sets_a}-{state.sets_b} {state.games_a}-{state.games_b}",
+                                "peak": market_price,
+                            }
+                            log.info("TENNIS_LB_PAPER_ENTRY | %s | match=%s | mkt=%.4f | edge=%.4f",
+                                     fav_name_lb, match_id, market_price, signal.edge)
+                            try:
+                                await self.engine.tg.send(
+                                    f"🎾📉 <b>Tennis LB Paper Entry</b>\n"
+                                    f"Player: {fav_name_lb}\n"
+                                    f"Price: {market_price:.4f}\n"
+                                    f"Edge: {signal.edge:+.4f}\n"
+                                    f"Trigger: {signal.trigger_type}\n"
+                                    f"Score: {state.sets_a}-{state.sets_b} | {state.games_a}-{state.games_b}\n"
+                                    f"Match: {link.polymarket_title[:50]}\n"
+                                    f"Tier: {link.tier} | {link.tournament}"
+                                )
+                            except Exception:
+                                pass
                         continue
 
                     # ── v4.6.5: Create pending entry (first signal tick) ──
@@ -1482,6 +1545,58 @@ class SportsOrchestrator:
             get_score=_get_score,
             is_match_finished=_is_finished,
         )
+
+        # ── v11.3: Lower-band paper trade exit monitoring ──────────
+        lb_to_close = []
+        for mid, lb in list(self._tennis_lb_paper.items()):
+            token_id = lb.get("token", "")
+            book = self.poly_feed.books.get(token_id)
+            if not book or book.mid <= 0:
+                continue
+            mkt = book.mid
+            entry = lb["entry_price"]
+            elapsed = time.time() - lb["entry_time"]
+
+            # Track peak
+            if mkt > lb["peak"]:
+                lb["peak"] = mkt
+
+            # Exit conditions
+            reason = None
+            if mkt >= entry + 0.02:
+                reason = "CONVERGENCE"
+            elif elapsed > 600:
+                reason = "TIMEOUT_10MIN"
+            elif entry > 0.01 and mkt < entry * 0.50:
+                reason = "STOP_LOSS_50PCT"
+
+            if reason:
+                r_mult = (mkt - entry) / entry if entry > 0 else 0
+                lb_to_close.append((mid, mkt, reason, r_mult, elapsed))
+
+        for mid, exit_price, reason, r_mult, dur in lb_to_close:
+            lb = self._tennis_lb_paper.pop(mid, None)
+            if not lb:
+                continue
+            pnl_emoji = "✅" if r_mult > 0 else "❌" if r_mult < -0.05 else "➖"
+            log.info("TENNIS_LB_PAPER_EXIT | %s | match=%s | entry=%.4f exit=%.4f | R=%+.2f | reason=%s | dur=%.0fs",
+                     lb["player"], mid, lb["entry_price"], exit_price, r_mult, reason, dur)
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self.engine.tg.send(
+                        f"{pnl_emoji} <b>Tennis LB Paper Exit</b>\n"
+                        f"Player: {lb['player']}\n"
+                        f"Entry: {lb['entry_price']:.4f} → Exit: {exit_price:.4f}\n"
+                        f"R: {r_mult:+.2f}\n"
+                        f"Peak: {lb['peak']:.4f}\n"
+                        f"Reason: {reason}\n"
+                        f"Duration: {dur:.0f}s\n"
+                        f"Match: {lb['link'].polymarket_title[:50]}"
+                    ))
+            except Exception:
+                pass
 
     def _tennis_live_sell_callback(self, trade):
         """Called by ExitManager when a trade closes — send Telegram + fire live SELL if filled."""
