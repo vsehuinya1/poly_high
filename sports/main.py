@@ -83,7 +83,7 @@ from cricket.live_executor import CricketLiveExecutor
 from cricket.sm_feeds import SmCricketFeed
 from cricket.sm_state import SmCricketState
 from cricket.sm_strategy import SmCricketStrategy
-from cricket.sm_mapping import get_mapping, get_all_fixture_ids, add_mapping
+from cricket.sm_mapping import get_mapping, get_all_fixture_ids, add_mapping, load_sportmonks_fixtures, auto_map_from_polymarket
 from sports.config import (
     CRICKET_PAPER_ONLY, CRICKET_TRADE_SIZE, CRICKET_MAX_SPREAD,
     CRICKET_MOMENTUM_RR_THRESH, CRICKET_MOMENTUM_EDGE,
@@ -694,6 +694,13 @@ class SportsOrchestrator:
 
             # Parse team names from title
             home_name, away_name = self._parse_cricket_teams(cm.title)
+
+            # v2.0: Auto-map to Sportmonks fixture via team name matching
+            auto_map_from_polymarket(
+                poly_title=cm.title,
+                poly_token_yes=home_tid,
+                poly_token_no=away_tid,
+            )
 
             link = GameMarketLink(
                 game_id=cm.event_id,
@@ -1861,58 +1868,62 @@ class SportsOrchestrator:
         await asyncio.sleep(10)  # wait for discovery + WS init
 
         last_diag_log = time.time()
+        _sm_fixtures_loaded = False
 
         async with aiohttp.ClientSession() as sm_session:
             while not self._shutdown:
                 try:
-                    fixture_ids = get_all_fixture_ids()
-
-                    if not fixture_ids:
-                        # STEP 9: Auto-discover live IPL fixtures
+                    # ── v2.0: Pre-load ALL IPL fixtures from Sportmonks ──
+                    if not _sm_fixtures_loaded:
                         try:
-                            url = f"{SmCricketFeed.BASE_URL}/livescores"
+                            url = f"{SmCricketFeed.BASE_URL}/fixtures"
                             params = {
                                 "api_token": SPORTMONKS_API_TOKEN,
                                 "filter[league_id]": "1",
-                                "include": "scoreboards",
+                                "include": "localteam,visitorteam",
+                                "sort": "-starting_at",
+                                "per_page": "100",
                             }
                             async with sm_session.get(
                                 url, params=params,
-                                timeout=aiohttp.ClientTimeout(total=10),
+                                timeout=aiohttp.ClientTimeout(total=15),
                             ) as resp:
                                 if resp.status == 200:
                                     data = await resp.json()
-                                    for fix in (data.get("data") or []):
-                                        auto_fid = fix.get("id", 0)
-                                        if auto_fid and not get_mapping(auto_fid):
-                                            home = fix.get("localteam", {}).get("name", "Home")
-                                            away = fix.get("visitorteam", {}).get("name", "Away")
-                                            add_mapping(
-                                                fixture_id=auto_fid,
-                                                home_team=home,
-                                                away_team=away,
-                                                poly_token_yes="PAPER_ONLY",
-                                                poly_token_no="PAPER_ONLY",
-                                                poly_market_title=f"{home} vs {away}",
+                                    fixtures = data.get("data") or []
+                                    if fixtures:
+                                        load_sportmonks_fixtures(fixtures)
+                                        _sm_fixtures_loaded = True
+                                        log.info(
+                                            "CRICKET_SM_PRELOAD | loaded %d IPL fixtures",
+                                            len(fixtures),
+                                        )
+                                        # Re-run auto-mapping for already discovered markets
+                                        for cm in self.cricket_markets:
+                                            home_tid = cm.outcomes[0].token_id if len(cm.outcomes) >= 1 else ""
+                                            away_tid = cm.outcomes[1].token_id if len(cm.outcomes) >= 2 else ""
+                                            auto_map_from_polymarket(
+                                                poly_title=cm.title,
+                                                poly_token_yes=home_tid,
+                                                poly_token_no=away_tid,
                                             )
-                                            log.info(
-                                                "CRICKET_AUTO_MAP | fixture=%d | %s vs %s",
-                                                auto_fid, home, away,
-                                            )
+                                else:
+                                    log.warning("CRICKET_SM_PRELOAD_FAIL | status=%d", resp.status)
                         except Exception as e:
-                            log.warning("CRICKET_AUTO_MAP_ERR | %s", e)
+                            log.warning("CRICKET_SM_PRELOAD_ERR | %s", e)
 
-                        fixture_ids = get_all_fixture_ids()
-                        if not fixture_ids:
-                            now = time.time()
-                            if now - last_diag_log > 300:
-                                log.info(
-                                    "CRICKET_SM_IDLE | no fixtures mapped | "
-                                    "no live IPL fixtures found"
-                                )
-                                last_diag_log = now
-                            await asyncio.sleep(CRICKET_SM_POLL_S)
-                            continue
+                    fixture_ids = get_all_fixture_ids()
+
+                    if not fixture_ids:
+                        now = time.time()
+                        if now - last_diag_log > 300:
+                            log.info(
+                                "CRICKET_SM_IDLE | no fixtures mapped | "
+                                "waiting for Polymarket discovery + Sportmonks match"
+                            )
+                            last_diag_log = now
+                        await asyncio.sleep(CRICKET_SM_POLL_S)
+                        continue
 
                     for fid in fixture_ids:
                         if self._shutdown:
