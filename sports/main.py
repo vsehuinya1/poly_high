@@ -1852,6 +1852,68 @@ class SportsOrchestrator:
     #  Cricket v1.0.1: Sportmonks Scoreboard Signal Loop
     # ═══════════════════════════════════════════════════════════════════
 
+    async def _cricket_book_poller(self):
+        """High-frequency REST book poller for cricket tokens.
+
+        Polls Polymarket CLOB REST book every 5s for all active cricket tokens.
+        Records ticks to tick_history.db for offline replay and alpha measurement.
+        Only polls when at least one cricket fixture is mapped.
+        """
+        CRICKET_BOOK_POLL_S = 5.0
+        CLOB_URL = "https://clob.polymarket.com"
+        log.info("CRICKET_BOOK_POLLER: started (interval=%.0fs)", CRICKET_BOOK_POLL_S)
+        await asyncio.sleep(15)  # wait for discovery + WS + fixture mapping
+
+        async with aiohttp.ClientSession() as session:
+            while not self._shutdown:
+                try:
+                    # Get all active cricket token IDs
+                    cricket_tids = []
+                    for link in self.cricket_links.values():
+                        cricket_tids.extend(link.all_token_ids)
+
+                    if not cricket_tids:
+                        await asyncio.sleep(30)
+                        continue
+
+                    for tid in cricket_tids:
+                        if self._shutdown:
+                            break
+                        try:
+                            async with session.get(
+                                f"{CLOB_URL}/book",
+                                params={"token_id": tid},
+                                timeout=aiohttp.ClientTimeout(total=5),
+                            ) as resp:
+                                if resp.status != 200:
+                                    continue
+                                data = await resp.json()
+
+                            bids = data.get("bids", [])
+                            asks = data.get("asks", [])
+                            bid = float(bids[0]["price"]) if bids else 0.0
+                            ask = float(asks[0]["price"]) if asks else 0.0
+                            spread = ask - bid if ask > bid else 1.0
+                            mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
+
+                            # Record to tick_history.db
+                            self.tick_recorder.record_tick(
+                                token_id=tid,
+                                best_bid=bid,
+                                best_ask=ask,
+                                mid=mid,
+                                spread=spread,
+                                source="rest_cricket",
+                            )
+                        except Exception:
+                            pass  # silent — don't spam logs
+
+                    await asyncio.sleep(CRICKET_BOOK_POLL_S)
+
+                except Exception as e:
+                    log.warning("CRICKET_BOOK_POLLER_ERR | %s", e)
+                    await asyncio.sleep(10)
+
     async def _cricket_sm_signal_loop(self):
         """Cricket v2.0 — Paper-only Sportmonks scoreboard signal loop.
 
@@ -2869,6 +2931,8 @@ class SportsOrchestrator:
             asyncio.create_task(self._tennis_signal_loop(), name="tennis_signals"),
             # Cricket v2.0 — Sportmonks paper-only signal loop
             asyncio.create_task(self._cricket_sm_signal_loop(), name="cricket_sm_signals"),
+            # Cricket v11.5 — high-frequency REST book poller for tick data
+            asyncio.create_task(self._cricket_book_poller(), name="cricket_book_poller"),
         ]
 
         # Graceful shutdown handler
