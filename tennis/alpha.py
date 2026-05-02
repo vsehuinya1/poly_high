@@ -23,7 +23,7 @@ log = logging.getLogger("tennis.alpha")
 
 # ── Strategy Parameters ────────────────────────────────────────────
 MAX_PRICE = 0.20          # Only enter below this price
-MAX_SPREAD = 0.02         # Only enter when spread is tight
+MAX_SPREAD = 0.03         # Only enter when spread is reasonably tight
 MIN_PRICE = 0.03          # Ignore near-zero (dead markets)
 DEDUP_S = 90.0            # Min seconds between signals on same token
 MAX_CONCURRENT = 10       # Max concurrent paper positions
