@@ -4,7 +4,7 @@ import json
 from collections import defaultdict
 from datetime import datetime, timezone
 
-DB = "sports_data/tick_history.db"
+DB = "/tmp/th.db"
 conn = sqlite3.connect(DB)
 cur = conn.cursor()
 
