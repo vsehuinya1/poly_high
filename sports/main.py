@@ -1091,16 +1091,18 @@ class SportsOrchestrator:
                             # v11.4: Shadow pipeline — filtered lower-band tracking
                             fav_name_lb = state.pregame_favorite_id or link.home_team or "?"
                             _book_ts = fav_book.timestamp if fav_book else 0.0
+                            _spread = fav_book.spread if fav_book else 0.0
                             ok, _reason = self._tennis_lb_shadow.should_track(
                                 str(match_id), fav_name_lb, _book_ts,
-                                state.sets_a, state.sets_b, state.games_a, state.games_b)
+                                state.sets_a, state.sets_b, state.games_a, state.games_b,
+                                spread=_spread)
                             if ok:
                                 self._tennis_lb_shadow.register(
                                     match_id=str(match_id), player=fav_name_lb,
                                     market_price=market_price, edge=current_edge,
                                     tournament=link.tournament,
                                     score=f"{state.sets_a}-{state.sets_b} {state.games_a}-{state.games_b}",
-                                    token_id=fav_token)
+                                    token_id=fav_token, spread=_spread)
                             self._tennis_active.discard(pend.get("trade_key", ""))
                             continue
 
@@ -1241,9 +1243,11 @@ class SportsOrchestrator:
                     if market_price < 0.20:
                         fav_name_lb = state.pregame_favorite_id or link.home_team or "?"
                         _book_ts = fav_book.timestamp if fav_book else 0.0
+                        _spread = fav_book.spread if fav_book else 0.0
                         ok, _reason = self._tennis_lb_shadow.should_track(
                             str(match_id), fav_name_lb, _book_ts,
-                            state.sets_a, state.sets_b, state.games_a, state.games_b)
+                            state.sets_a, state.sets_b, state.games_a, state.games_b,
+                            spread=_spread)
                         if ok:
                             self._tennis_lb_shadow.register(
                                 match_id=str(match_id), player=fav_name_lb,
@@ -1251,7 +1255,7 @@ class SportsOrchestrator:
                                 edge=signal.edge if signal else 0.0,
                                 tournament=link.tournament,
                                 score=f"{state.sets_a}-{state.sets_b} {state.games_a}-{state.games_b}",
-                                token_id=fav_token)
+                                token_id=fav_token, spread=_spread)
                         continue
 
                     # ── v4.6.5: Create pending entry (first signal tick) ──
