@@ -1,8 +1,6 @@
 """Compact tennis alpha scanner — runs against live WAL-mode DB"""
 import sqlite3, time
-conn = sqlite3.connect("sports_data/tick_history.db", timeout=30)
-conn.execute("PRAGMA journal_mode=WAL")
-conn.execute("PRAGMA query_only=ON")
+conn = sqlite3.connect("file:///tmp/th.db?immutable=1", uri=True)
 cur = conn.cursor()
 
 print("=== 1. PRICE DISTRIBUTION ===")
