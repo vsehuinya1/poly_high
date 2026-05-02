@@ -19,8 +19,7 @@ MAX_SPREAD = 0.02
 MIN_PRICE = 0.03
 DEDUP_S = 90.0
 HOLD_S = 600.0
-TRAILING_STOP = 999.0  # disabled
-TAKE_PROFIT = 0.50     # exit at 50% gain
+TRAILING_STOP = 0.02
 
 print("=" * 70)
 print("TSLB HISTORICAL BACKTEST — Kelly Compounding")
@@ -77,10 +76,10 @@ for tid, ts, mid, spread, title in candidates:
             exit_reason = "TRAIL"
             exit_elapsed = dt
             break
-        # Take profit (50% gain)
-        if price >= entry * (1 + TAKE_PROFIT):
+        # 2R hit
+        if price >= entry * 2:
             exit_price = price
-            exit_reason = "TP"
+            exit_reason = "2R"
             exit_elapsed = dt
             break
         # Timeout
