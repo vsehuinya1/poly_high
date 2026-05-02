@@ -27,8 +27,9 @@ MAX_SPREAD = 0.03         # Only enter when spread is reasonably tight
 MIN_PRICE = 0.03          # Ignore near-zero (dead markets)
 DEDUP_S = 90.0            # Min seconds between signals on same token
 MAX_CONCURRENT = 10       # Max concurrent paper positions
-HOLD_TIME_S = 300.0       # Max hold time (5 minutes)
-TRAILING_STOP = 0.02      # Exit if price drops 2c from peak
+HOLD_TIME_S = 600.0       # Max hold time (10 minutes) — sweep optimal
+TRAILING_STOP = 999.0     # DISABLED — sweep shows trailing stop hurts
+TAKE_PROFIT_MULT = 0.50   # Exit at 50% gain (0.5x) — sweep optimal
 MIN_BOOK_AGE_S = 120.0    # Book must have updated within 120s
 
 
@@ -150,17 +151,13 @@ class TennisAlpha:
             # ── EXIT CONDITIONS ──
             exit_reason = ""
 
-            # 1. Trailing stop: price dropped TRAILING_STOP from peak
-            if t.peak_price - mid >= TRAILING_STOP and t.peak_price > t.entry_mid:
-                exit_reason = "TRAIL_STOP"
+            # 1. Take profit: 50% gain (sweep-optimal)
+            if mid >= t.entry_mid * (1 + TAKE_PROFIT_MULT):
+                exit_reason = "TAKE_PROFIT"
 
             # 2. Max hold time
             if elapsed >= HOLD_TIME_S:
                 exit_reason = "TIMEOUT"
-
-            # 3. Big win: price doubled (2R)
-            if mid >= t.entry_mid * 2:
-                exit_reason = "HIT_2R"
 
             if exit_reason:
                 t.exit_price = mid
