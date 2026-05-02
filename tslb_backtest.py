@@ -15,7 +15,7 @@ cur = conn.cursor()
 
 # Strategy params (same as tennis/alpha.py)
 MAX_PRICE = 0.20
-MAX_SPREAD = 0.03
+MAX_SPREAD = 0.02
 MIN_PRICE = 0.03
 DEDUP_S = 90.0
 HOLD_S = 300.0
