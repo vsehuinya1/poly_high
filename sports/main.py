@@ -67,6 +67,7 @@ from tennis.spread_breakout import SpreadBreakoutDetector
 from tennis.signal_snapshots import SignalSnapshotScheduler
 from tennis.pending_store import PendingStore
 from sports.tennis_lb_shadow import TennisLBShadow
+from tennis.alpha import TennisAlpha
 
 # Cricket engine imports
 from cricket import (
@@ -408,6 +409,7 @@ class SportsOrchestrator:
         self._tennis_active: set = set()  # v10: canonical trade_key set for duplicate prevention
         # v11.4: Lower-band shadow trade tracker (compressed pipeline)
         self._tennis_lb_shadow = TennisLBShadow(DATA_DIR)
+        self._tennis_alpha = TennisAlpha(DATA_DIR)
         self._session: aiohttp.ClientSession | None = None
 
         # ── Tennis Engine ─────────────────────────────────────────
@@ -1526,6 +1528,22 @@ class SportsOrchestrator:
 
         # ── v11.4: Lower-band shadow pipeline tick ─────────────────
         self._tennis_lb_shadow.tick(self.poly_feed.books)
+
+        # ── TSLB: Tight-Spread Lower-Band alpha scan ──────────────────
+        # Scan ALL tennis books for microstructure-based entry signals
+        for link in self.tennis_links.values():
+            for tid in link.all_token_ids:
+                book = self.poly_feed.books.get(tid)
+                if not book or book.mid <= 0:
+                    continue
+                book_age = time.time() - book.timestamp if book.timestamp else 999
+                ok, reason = self._tennis_alpha.should_enter(
+                    tid, book.bid, book.ask, book.mid, book.spread, book_age)
+                if ok:
+                    self._tennis_alpha.enter(
+                        tid, book.bid, book.ask, book.mid, book.spread,
+                        link.polymarket_title)
+        self._tennis_alpha.tick(self.poly_feed.books)
 
     def _tennis_live_sell_callback(self, trade):
         """Called by ExitManager when a trade closes — send Telegram + fire live SELL if filled."""
@@ -2799,6 +2817,8 @@ class SportsOrchestrator:
                     summary.get("wins", 0),
                     summary.get("daily_pnl", 0.0),
                 )
+                # TSLB alpha stats
+                log.info("TSLB_STATUS | %s", self._tennis_alpha.stats())
 
                 for game_id, link in self.links.items():
                     game = (
